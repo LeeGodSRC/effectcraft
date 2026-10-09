@@ -200,53 +200,13 @@ fn ftr_blocks(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 // ---------------------------------------------------------------- CC Grid Wipe (transition::grid_wipe)
-// u[0] = (shape, reverse); f[0] = (cx, cy, sin, cos); f[1] = (cell size, max distance,
-// completion, border).
-
-fn ftr_metric(shape: u32, d: vec2<f32>) -> f32 {
-    switch shape {
-        case 0u: {
-            return abs(d.x);
-        }
-        case 2u: {
-            return max(abs(d.x), abs(d.y));
-        }
-        default: {
-            return length(d);
-        }
-    }
-}
-
+// The host supplies f64-evaluated coverage for strict tile boundaries; compositing stays GPU.
 @compute @workgroup_size(16, 16)
 fn ftr_grid(@builtin(global_invocation_id) gid: vec3<u32>) {
     let p = vec2<i32>(gid.xy);
-    if (!ftr_inside(p)) {
-        return;
-    }
-    let px = textureLoad(src, p, 0);
-    let d = ftr_centre(p) - P.f[0].xy;
-    let s = P.f[0].z;
-    let co = P.f[0].w;
-    let q = vec2<f32>(d.x * co + d.y * s, -d.x * s + d.y * co);
-    let cs = P.f[1].x;
-    let cc = (floor(q / cs) + 0.5) * cs;
-    var o = clamp(ftr_metric(P.u[0].x, cc) / P.f[1].y, 0.0, 1.0);
-    if (P.u[0].y != 0u) {
-        o = 1.0 - o;
-    }
-    let spread = 0.25;
-    let pr = clamp((P.f[1].z * (1.0 + spread) - o) / spread, 0.0, 1.0);
-    if (pr <= 0.0) {
-        textureStore(out, p, px);
-        return;
-    }
-    let half = cs * 0.5 * (1.0 - pr);
-    let m = max(abs(q.x - cc.x), abs(q.y - cc.y));
-    var k = select(0.0, 1.0, m < half);
-    if (P.f[1].w > 0.0) {
-        k = clamp((half - m) / P.f[1].w + 0.5, 0.0, 1.0);
-    }
-    textureStore(out, p, px * k);
+    if (!ftr_inside(p)) { return; }
+    let index = gid.y * u32(out_dims().x) + gid.x;
+    textureStore(out, p, textureLoad(src, p, 0) * data[index]);
 }
 
 // ---------------------------------------------------------------- CC Radial ScaleWipe / CC Scale Wipe (transition.rs)

@@ -178,6 +178,11 @@ impl EffectHost for FxHost<'_, '_, '_> {
         }
     }
 
+    fn params_revision(&self) -> u64 {
+        let i = self.index.load(std::sync::atomic::Ordering::Relaxed);
+        self.layer.effects().and_then(|g| g.groups().nth(i)).map(cache::effect_revision).unwrap_or(0)
+    }
+
     fn params_at(&self, layer_time: f64) -> Option<Params> {
         let i = self.index.load(std::sync::atomic::Ordering::Relaxed);
         let g = self.layer.effects()?.groups().nth(i)?;

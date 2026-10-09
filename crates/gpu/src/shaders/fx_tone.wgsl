@@ -363,23 +363,27 @@ fn fxt_point(@builtin(global_invocation_id) gid: vec3<u32>) {
             if (straight_skip) {
                 break;
             }
-            let hsl = rgb_to_hsl(c);
             let dh = f0.x;
             let dl = f0.y;
             let ds = f0.z;
-            var l = hsl.z;
+            var r = c;
+            if (dh != 0.0 || ds != 0.0) {
+                let hsl = rgb_to_hsl(c);
+                var s = hsl.y;
+                if (ds > 0.0) {
+                    s = s + (1.0 - s) * ds;
+                } else {
+                    s = s + s * ds;
+                }
+                r = hsl_to_rgb(hsl.x + dh, clamp(s, 0.0, 1.0), clamp(hsl.z, 0.0, 1.0));
+            }
+            // Fade RGB toward white/black; preserving HSL saturation while scaling L
+            // would recolor pale highlights instead of simply lightening/darkening them.
             if (dl > 0.0) {
-                l = l + (1.0 - l) * dl;
+                r = r + (vec3<f32>(1.0) - r) * dl;
             } else {
-                l = l + l * dl;
+                r = r * (1.0 + dl);
             }
-            var s = hsl.y;
-            if (ds > 0.0) {
-                s = s + (1.0 - s) * ds;
-            } else {
-                s = s + s * ds;
-            }
-            let r = hsl_to_rgb(hsl.x + dh, clamp(s, 0.0, 1.0), clamp(l, 0.0, 1.0));
             o = vec4<f32>(r * a, a);
         }
         case 9u: {

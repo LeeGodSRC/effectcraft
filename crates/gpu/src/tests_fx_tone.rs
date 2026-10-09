@@ -89,6 +89,8 @@ fn broadcast_balance_limiter() {
     effect_case("ec.color.broadcast", &[("locale", e(1)), ("howToMakeSafe", e(1)), ("maxSignal", n(90.0))]);
     effect_case("ec.color.colorbalancehls", &[("hue", n(40.0)), ("lightness", n(-20.0)), ("saturation", n(30.0))]);
     effect_case("ec.color.colorbalancehls", &[("lightness", n(25.0)), ("saturation", n(-50.0))]);
+    effect_case("ec.color.colorbalancehls", &[("lightness", n(-50.0))]);
+    effect_case("ec.color.colorbalancehls", &[("lightness", n(50.0))]);
     effect_case("ec.color.videolimiter", &[("clipLevel", e(0))]);
     effect_case("ec.color.videolimiter", &[("clipLevel", e(1)), ("clipMethod", e(1)), ("compressionBeforeClipping", e(4))]);
     effect_case("ec.color.videolimiter", &[("clipLevel", e(0)), ("clipMethod", e(0)), ("gamutWarning", on())]);

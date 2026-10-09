@@ -1061,53 +1061,247 @@ fn pw_phys(ctx: &EffectCtx) -> Phys {
     }
 }
 
-fn particle_world(ctx: &EffectCtx, b: Buf) -> Buf {
-    match particle_world_plan(ctx, &b) {
-        Some(plan) => plan.finish(b),
-        None => b,
+/// Particle World modes which need sampled layer textures on the CPU.
+pub fn particle_world_textured(ctx: &EffectCtx) -> bool {
+    matches!(ctx.params.e("particle/particleType"), 8..=12) && ctx.params.get("texture/layer").and_then(Value::as_layer).is_some()
+}
+
+fn pw_state(ctx: &EffectCtx, phys: &Phys) -> std::sync::Arc<PState> {
+    let empty = Buf { img: Image::new(0, 0), offset: [0.0; 2], scale: 1.0 };
+    let Some(host) = ctx.env.host else { return simulate(&PW_CACHE, params_key(ctx, &empty, 1), ctx.time, phys) };
+    let Some(initial) = host.params_at(0.0) else {
+        let key = params_key(ctx, &empty, 1);
+        return accelerated(ctx, key, phys).unwrap_or_else(|| simulate(&PW_CACHE, key, ctx.time, phys));
+    };
+    let at_zero = EffectCtx { params: &initial, time: 0.0, layer_size: ctx.layer_size, seed: ctx.seed, adjustment: ctx.adjustment, env: ctx.env };
+    let revision = host.params_revision();
+    let key = params_key(&at_zero, &empty, 1) ^ revision;
+    let run = |cache: &SimCache<PState>| {
+        cache.run(key, steps_at(ctx.time), PState::default, |state, step| {
+            let time = step as f64 / SPS;
+            if let Some(params) = host.params_at(time) {
+                let at = EffectCtx { params: &params, time, layer_size: ctx.layer_size, seed: ctx.seed, adjustment: ctx.adjustment, env: ctx.env };
+                pw_phys(&at).step(state, step);
+            } else {
+                phys.step(state, step)
+            }
+        })
+    };
+    // Unknown expression dependencies must not reuse states after edits.
+    if revision == 0 { run(&SimCache::new(1)) } else { run(&PW_CACHE) }
+}
+
+fn rotate_camera(mut v: [f32; 3], angles: [f32; 3]) -> [f32; 3] {
+    for (axis, angle) in angles.into_iter().enumerate() {
+        let (sin, cos) = (-angle.to_radians()).sin_cos();
+        let (a, b) = match axis {
+            0 => (1, 2),
+            1 => (2, 0),
+            _ => (0, 1),
+        };
+        let va = v.get(a).copied().unwrap_or(0.0);
+        let vb = v.get(b).copied().unwrap_or(0.0);
+        if let Some(x) = v.get_mut(a) {
+            *x = va * cos - vb * sin;
+        }
+        if let Some(x) = v.get_mut(b) {
+            *x = va * sin + vb * cos;
+        }
     }
+    v
+}
+
+fn pw_color(ctx: &EffectCtx, q: &Particle, birth: [f32; 4], death: [f32; 4], opacity: f32) -> [f32; 4] {
+    let u = (q.age / q.life.max(1e-4)).clamp(0.0, 1.0);
+    let mut color = if ctx.params.e("particle/colorMap") == 0 {
+        let stops =
+            ["particle/colorAtBirth", "particle/colorAt25", "particle/colorAt50", "particle/colorAt75", "particle/colorAtDeath"].map(|id| ctx.params.color(id));
+        let t = u * 4.0;
+        let i = (t.floor() as usize).min(3);
+        let f = t - i as f32;
+        let a = stops.get(i).copied().unwrap_or(birth);
+        let b = stops.get(i + 1).copied().unwrap_or(death);
+        std::array::from_fn(|k| a[k] + (b[k] - a[k]) * f)
+    } else {
+        std::array::from_fn(|k| birth[k] + (death[k] - birth[k]) * u)
+    };
+    color[3] = opacity;
+    color
+}
+
+struct WorldSprite {
+    sprite: Sprite,
+    age: f64,
+    id: u32,
+}
+struct WorldPlan {
+    sprites: Vec<WorldSprite>,
+    mode: u32,
+    original: bool,
+}
+impl WorldPlan {
+    fn plain(&self) -> SpritePlan {
+        let mut plan = particle_sprites(self.sprites.iter().map(|p| p.sprite).collect(), self.mode);
+        if !self.original {
+            plan.post = if self.mode == 3 { Post::OverBlack } else { Post::Replace };
+        }
+        plan
+    }
+}
+
+fn particle_world(ctx: &EffectCtx, b: Buf) -> Buf {
+    let Some(layout) = particle_world_layout(ctx, &b) else { return b };
+    if !particle_world_textured(ctx) {
+        return layout.plain().finish(b);
+    }
+    texture_particles(ctx, b, &layout)
 }
 
 /// CC Particle World's sprites (far to near), `None` before anything is born.
 fn particle_world_plan(ctx: &EffectCtx, b: &Buf) -> Option<SpritePlan> {
+    particle_world_layout(ctx, b).map(|p| p.plain())
+}
+
+fn particle_world_layout(ctx: &EffectCtx, b: &Buf) -> Option<WorldPlan> {
     let pr = ctx.params;
     let (lw, lh) = (ctx.layer_size[0] as f32, ctx.layer_size[1] as f32);
-    let phys = pw_phys(ctx);
-    if phys.rate <= 0.0 && ctx.time <= 0.0 {
+    if !(lw > 0.0 && lh > 0.0 && ctx.time.is_finite()) {
         return None;
     }
-    let key = params_key(ctx, &Buf { img: Image::new(0, 0), offset: [0.0; 2], scale: 1.0 }, 1);
-    let st = accelerated(ctx, key, &phys).unwrap_or_else(|| simulate(&PW_CACHE, key, ctx.time, &phys));
+    let phys = pw_phys(ctx);
+    let st = pw_state(ctx, &phys);
     let kind = pr.e("particle/particleType");
     let birth = pr.color("particle/birthColor");
     let death = pr.color("particle/deathColor");
     let (bs, ds) = (pr.f("particle/birthSize") as f32, pr.f("particle/deathSize") as f32);
     let svar = pr.f("particle/sizeVariation") as f32 / 100.0;
     let max_op = pr.f("particle/maxOpacity") as f32 / 100.0;
-    let s = b.scale as f32;
-    // Camera at distance 2 (world units = layer width) looking at the origin (layer centre).
-    let cam = 2.0f32;
-    let mut list: Vec<(f32, Sprite)> = st
+    let scale = b.scale as f32;
+    let cam = pr.get("camera/distance").map(|v| v.as_f64() as f32).unwrap_or(2.0).max(0.01);
+    let fov = pr.get("camera/fov").map(|v| v.as_f64() as f32).unwrap_or(28.072487).clamp(1.0, 179.0);
+    let focal = 0.5 / (fov.to_radians() * 0.5).tan();
+    let angles = [pr.f("camera/rotationX") as f32, pr.f("camera/rotationY") as f32, pr.f("camera/rotationZ") as f32];
+    let initial = pr.f("particle/initialRotation") as f32;
+    let spin = pr.f("particle/rotationSpeed") as f32;
+    let mut list: Vec<(f32, WorldSprite)> = st
         .parts
         .par_iter()
         .filter_map(|q| {
-            let zc = cam + q.p[2];
-            if zc <= 0.05 {
+            let pos = rotate_camera(q.p, angles);
+            let velocity = rotate_camera(q.v, angles);
+            let depth = cam + pos[2];
+            if depth <= 0.05 {
                 return None;
             }
-            let k = cam / zc;
-            let x = lw * 0.5 + q.p[0] * lw * k;
-            let y = lh * 0.5 + q.p[1] * lw * k;
+            let k = focal / depth;
+            let x = lw * 0.5 + pos[0] * lw * k;
+            let y = lh * 0.5 + pos[1] * lw * k;
             let (bx, by) = b.to_px([x as f64, y as f64]);
             let (c, size) = particle_look(q, birth, death, bs, ds, svar, max_op);
-            let r = size * 0.5 * lw * k * s * 0.25;
-            let sp = type_sprite(kind, bx as f32, by as f32, r, c, q.v[0] * lw * k * s, q.v[1] * lw * k * s, (q.id % 628) as f32 * 0.01 + q.age * 2.0);
-            Some((zc, sp))
+            let color = pw_color(ctx, q, birth, death, c[3]);
+            let radius = size * 0.5 * lw * k * scale * 0.25;
+            let mut rotation = (q.rnd * initial + q.age * spin).to_radians();
+            if pr.b("texture/align") {
+                rotation += velocity[1].atan2(velocity[0]);
+            }
+            let sp = type_sprite(kind, bx as f32, by as f32, radius, color, velocity[0] * lw * k * scale, velocity[1] * lw * k * scale, rotation);
+            Some((depth, WorldSprite { sprite: sp, age: q.age as f64, id: q.id }))
         })
         .collect();
     list.sort_by(|a, b| b.0.total_cmp(&a.0));
-    let sprites: Vec<Sprite> = list.into_iter().map(|(_, s)| s).collect();
-    Some(particle_sprites(sprites, pr.e("particle/transferMode")))
+    Some(WorldPlan {
+        sprites: list.into_iter().map(|(_, p)| p).collect(),
+        mode: pr.e("particle/transferMode"),
+        original: pr.get("extras/compositeWithOriginal").is_none_or(Value::as_bool),
+    })
+}
+
+fn texture_particles(ctx: &EffectCtx, mut b: Buf, plan: &WorldPlan) -> Buf {
+    let mut fx = Image::new(b.img.width, b.img.height);
+    let texture_id = ctx.params.get("texture/layer").and_then(Value::as_layer);
+    let Some((host, id)) = ctx.env.host.zip(texture_id) else { return plan.plain().finish(b) };
+    let kind = ctx.params.e("particle/particleType");
+    let time_mode = ctx.params.e("texture/time");
+    let source = ctx.params.get("texture/layerSource").map(Value::as_enum).unwrap_or(2) != 0;
+    let mut frames = std::collections::HashMap::<i64, crate::LayerPixels>::new();
+    let fps = ctx.fps().clamp(1.0, 240.0);
+    for item in &plan.sprites {
+        let time = match time_mode {
+            0 => ctx.env.comp_time - item.age,
+            2 => item.age,
+            _ => ctx.env.comp_time,
+        };
+        let frame = (time * fps).floor() as i64;
+        if !frames.contains_key(&frame)
+            && let Some(pixels) = host.layer_at(id, frame as f64 / fps, source).or_else(|| host.layer(id, source))
+        {
+            while !frames.is_empty()
+                && (frames.len() >= 64 || frames.values().map(|p| p.buf.img.data.len()).sum::<usize>().saturating_add(pixels.buf.img.data.len()) > 16_777_216)
+            {
+                if let Some(old) = frames.keys().next().copied() {
+                    frames.remove(&old);
+                } else {
+                    break;
+                }
+            }
+            frames.insert(frame, pixels);
+        }
+        let Some(texture) = frames.get(&frame) else { continue };
+        // Scatter selects a random crop of the texture, not a different animation frame.
+        let scatter = (ctx.params.f("texture/scatter") * 0.01).clamp(0.0, 1.0);
+        let crop = (1.0 - scatter).max(1e-6);
+        let crop_origin = [h(item.id, 71, ctx.seed) as f64 * scatter, h(item.id, 72, ctx.seed) as f64 * scatter];
+        let sp = item.sprite;
+        let radius = sp.r as f64;
+        if !radius.is_finite() || radius <= 0.0 || !sp.x.is_finite() || !sp.y.is_finite() {
+            continue;
+        }
+        let aspect = if texture.size[0] > 0.0 { texture.size[1] / texture.size[0] } else { 1.0 };
+        let ry = radius * aspect;
+        let bound = radius.hypot(ry) + 1.0;
+        let x0 = (sp.x as f64 - bound).floor().max(0.0) as u32;
+        let x1 = (sp.x as f64 + bound).ceil().clamp(0.0, fx.width as f64) as u32;
+        let y0 = (sp.y as f64 - bound).floor().max(0.0) as u32;
+        let y1 = (sp.y as f64 + bound).ceil().clamp(0.0, fx.height as f64) as u32;
+        let (sin, cos) = (sp.rot as f64).sin_cos();
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let dx = x as f64 + 0.5 - sp.x as f64;
+                let dy = y as f64 + 0.5 - sp.y as f64;
+                let u = (dx * cos + dy * sin) / radius;
+                let v = (-dx * sin + dy * cos) / ry.max(1e-8);
+                if u.abs() > 1.0 || v.abs() > 1.0 || matches!(kind, 11 | 12) && u * u + v * v > 1.0 || kind == 10 && v < 2.0 * u.abs() - 1.0 {
+                    continue;
+                }
+                let (tx, ty) = texture
+                    .buf
+                    .to_px([(crop_origin[0] + (u + 1.0) * 0.5 * crop) * texture.size[0], (crop_origin[1] + (v + 1.0) * 0.5 * crop) * texture.size[1]]);
+                let sample = texture.buf.img.sample_bilinear(tx, ty);
+                let fade = if kind == 12 { (1.0 - u * u - v * v).max(0.0) as f32 } else { 1.0 };
+                let alpha = sp.c[3] * fade;
+                // Polygon textures retain their own colors. Square/disc textures are
+                // multiplied by the particle color map (Cycore's public behavior manual).
+                let tint = if matches!(kind, 9 | 10) { [1.0; 3] } else { [sp.c[0], sp.c[1], sp.c[2]] };
+                let c = [sample[0] * tint[0] * alpha, sample[1] * tint[1] * alpha, sample[2] * tint[2] * alpha, sample[3] * alpha];
+                let d = fx.get(x as i64, y as i64);
+                let out = if plan.mode == 2 {
+                    [d[0] + c[0], d[1] + c[1], d[2] + c[2], (d[3] + c[3]).min(1.0)]
+                } else {
+                    let inv = 1.0 - c[3];
+                    [c[0] + d[0] * inv, c[1] + d[1] * inv, c[2] + d[2] * inv, c[3] + d[3] * inv]
+                };
+                fx.set(x, y, out);
+            }
+        }
+    }
+    b.img = if plan.mode == 3 {
+        combine(&Image::filled(fx.width, fx.height, [0.0, 0.0, 0.0, 1.0]), &fx, 0)
+    } else if plan.original {
+        combine(&b.img, &fx, plan.mode)
+    } else {
+        fx
+    };
+    b
 }
 
 /// The CC particle systems' sprites with their Transfer Mode (Composite, Screen, Add, Black
@@ -1432,7 +1626,26 @@ pub fn specs() -> Vec<EffectSpec> {
                 p("physics/gravityVector/gravityX", "Gravity X", num(0.0), slider(-1.0, 1.0, -1.0, 1.0, 2)),
                 p("physics/gravityVector/gravityY", "Gravity Y", num(1.0), slider(-1.0, 1.0, -1.0, 1.0, 2)),
                 p("physics/gravityVector/gravityZ", "Gravity Z", num(0.0), slider(-1.0, 1.0, -1.0, 1.0, 2)),
-                p("particle/particleType", "Particle Type", Value::Enum(0), popup(PARTICLE_TYPES)),
+                p(
+                    "particle/particleType",
+                    "Particle Type",
+                    Value::Enum(0),
+                    popup(&[
+                        "Line",
+                        "Shaded Sphere",
+                        "Faded Sphere",
+                        "Bubble",
+                        "Star",
+                        "Motion Polygon",
+                        "Tri-Polygon",
+                        "Cube",
+                        "Textured Square",
+                        "Textured QuadPolygon",
+                        "Textured TriPolygon",
+                        "Textured Disc",
+                        "Textured Faded Disc",
+                    ]),
+                ),
                 p("particle/birthSize", "Birth Size", num(0.2), slider(0.0, 10.0, 0.0, 1.0, 3)),
                 p("particle/deathSize", "Death Size", num(0.2), slider(0.0, 10.0, 0.0, 1.0, 3)),
                 p("particle/sizeVariation", "Size Variation", num(0.0), pct()),
@@ -1441,6 +1654,30 @@ pub fn specs() -> Vec<EffectSpec> {
                 p("particle/deathColor", "Death Color", col(0.6, 0.0, 0.0), ParamUi::Color),
                 p("particle/transferMode", "Transfer Mode", Value::Enum(0), popup(&["Composite", "Screen", "Add", "Black Matte"])),
                 p("extras/randomSeed", "Random Seed", num(0.0), slider(0.0, 10_000.0, 0.0, 1000.0, 0)),
+                p("texture/layer", "Texture Layer", Value::Layer(None), ParamUi::Layer),
+                p("texture/time", "Texture Time", Value::Enum(1), popup(&["Birth", "Current", "From Start"])),
+                p("texture/scatter", "Scatter", num(0.0), slider(0.0, 100.0, 0.0, 10.0, 2)),
+                p("texture/align", "Align To Direction", Value::Bool(false), ParamUi::Checkbox),
+                p("particle/initialRotation", "Initial Rotation", num(360.0), ParamUi::Angle),
+                p("particle/rotationSpeed", "Rotation Speed", num(114.591559), ParamUi::Angle),
+                p("particle/rotationAxis", "Rotation Axis", Value::Enum(2), popup(&["X Axis", "Y Axis", "Z Axis", "Any Axis"])),
+                p(
+                    "particle/colorMap",
+                    "Color Map",
+                    Value::Enum(1),
+                    popup(&["Custom", "Birth to Death", "Origin to Death", "Birth to Origin", "Origin Constant"]),
+                ),
+                p("particle/colorAtBirth", "Color At Birth", col(1.0, 1.0, 0.0), ParamUi::Color),
+                p("particle/colorAt25", "Color At 25%", col(1.0, 0.6, 0.0), ParamUi::Color),
+                p("particle/colorAt50", "Color At 50%", col(0.7, 0.3, 0.0), ParamUi::Color),
+                p("particle/colorAt75", "Color At 75%", col(0.5, 0.0, 0.0), ParamUi::Color),
+                p("particle/colorAtDeath", "Color At Death", col(0.0, 0.0, 0.0), ParamUi::Color),
+                p("camera/distance", "Distance", num(2.0), slider(0.01, 100.0, 0.1, 10.0, 2)),
+                p("camera/rotationX", "Rotation X", num(0.0), ParamUi::Angle),
+                p("camera/rotationY", "Rotation Y", num(0.0), ParamUi::Angle),
+                p("camera/rotationZ", "Rotation Z", num(0.0), ParamUi::Angle),
+                p("camera/fov", "FOV", num(28.072487), slider(1.0, 179.0, 10.0, 120.0, 2)),
+                p("extras/compositeWithOriginal", "Composite With Original", Value::Bool(true), ParamUi::Checkbox),
             ],
             particle_world,
         ),
@@ -1743,5 +1980,94 @@ mod tests {
         let half = crate::apply(s, &ctx, Buf { img: grey(20, 20), offset: [0.0; 2], scale: 0.5 });
         let sum = |i: &Image| i.data.iter().map(|p| p[0]).sum::<f32>() / i.data.len() as f32;
         assert!((sum(&full.img) - sum(&half.img)).abs() < 0.05, "{} {}", sum(&full.img), sum(&half.img));
+    }
+    fn pw_params() -> crate::Params {
+        let spec = crate::find("ec.sim.ccparticleworld").unwrap();
+        let mut next = 1;
+        let group = crate::instantiate(spec, &mut effectcraft_project::build::Ids(&mut next), spec.name, [64.0, 64.0]);
+        crate::flatten_params(&group, &mut |p| p.value.clone())
+    }
+    struct WorldHost {
+        params: crate::Params,
+        animated: bool,
+    }
+    impl crate::EffectHost for WorldHost {
+        fn layer(&self, _: u64, _: bool) -> Option<crate::LayerPixels> {
+            Some(crate::LayerPixels { buf: Buf { img: Image::filled(8, 8, [0.0, 1.0, 0.0, 1.0]), offset: [0.0; 2], scale: 1.0 }, size: [8.0, 8.0] })
+        }
+        fn audio(&self, _: u64, _: f64, _: usize, _: u32) -> Option<Vec<f32>> {
+            None
+        }
+        fn params_at(&self, t: f64) -> Option<crate::Params> {
+            let mut p = self.params.clone();
+            if self.animated {
+                p.values.insert("birthRate".into(), num(if t < 0.5 { 1.0 } else { 0.0 }));
+            }
+            Some(p)
+        }
+    }
+    #[test]
+    fn particle_world_uses_birth_history_when_current_birth_rate_is_zero() {
+        let mut params = pw_params();
+        params.values.insert("longevity".into(), num(2.0));
+        params.values.insert("birthRate".into(), num(0.0));
+        let host = WorldHost { params: params.clone(), animated: true };
+        let ctx = EffectCtx {
+            params: &params,
+            time: 1.0,
+            layer_size: [64.0; 2],
+            seed: 7,
+            adjustment: false,
+            env: EffectEnv { host: Some(&host), ..EffectEnv::default() },
+        };
+        let state = pw_state(&ctx, &pw_phys(&ctx));
+        assert!(!state.parts.is_empty());
+        assert!(state.parts.iter().all(|p| p.age >= 0.49));
+    }
+    #[test]
+    fn particle_world_texture_samples_layer_pixels_and_camera_affects_projection() {
+        let mut params = pw_params();
+        for (id, value) in [
+            ("birthRate", num(1.0)),
+            ("longevity", num(2.0)),
+            ("physics/velocity", num(0.0)),
+            ("physics/gravity", num(0.0)),
+            ("particle/birthSize", num(1.0)),
+            ("particle/deathSize", num(1.0)),
+            ("particle/birthColor", col(1.0, 0.0, 0.0)),
+            ("particle/deathColor", col(1.0, 0.0, 0.0)),
+            ("particle/particleType", Value::Enum(9)),
+            ("texture/layer", Value::Layer(Some(42))),
+            ("extras/compositeWithOriginal", Value::Bool(false)),
+        ] {
+            params.values.insert(id.into(), value);
+        }
+        let host = WorldHost { params: params.clone(), animated: false };
+        let mut ctx = EffectCtx {
+            params: &params,
+            time: 0.5,
+            layer_size: [64.0; 2],
+            seed: 1,
+            adjustment: false,
+            env: EffectEnv { host: Some(&host), ..EffectEnv::default() },
+        };
+        let input = Buf { img: Image::new(64, 64), offset: [0.0; 2], scale: 1.0 };
+        let out = particle_world(&ctx, input.clone());
+        let green: f32 = out.img.data.iter().map(|p| p[1]).sum();
+        let red: f32 = out.img.data.iter().map(|p| p[0]).sum();
+        assert!(green > 1.0 && red == 0.0);
+        let mut square = params.clone();
+        square.values.insert("particle/particleType".into(), Value::Enum(8));
+        ctx.params = &square;
+        let tinted = particle_world(&ctx, input.clone());
+        assert!(tinted.img.data.iter().any(|p| p[3] > 0.0));
+        assert!(tinted.img.data.iter().all(|p| p[0] == 0.0 && p[1] == 0.0 && p[2] == 0.0));
+        ctx.params = &params;
+        let near = particle_world_layout(&ctx, &input).unwrap().sprites[0].sprite.r;
+        let mut far = params.clone();
+        far.values.insert("camera/distance".into(), num(8.0));
+        ctx.params = &far;
+        let distant = particle_world_layout(&ctx, &input).unwrap().sprites[0].sprite.r;
+        assert!(distant < near * 0.3);
     }
 }

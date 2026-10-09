@@ -1160,3 +1160,20 @@ fn thousands_of_host_reads_on_one_thread_keep_working() {
         assert_eq!(f.num("function a() { return effect(1)(1); } function b() { return a(); } b() + 1", t), 43.0, "evaluation {i}");
     }
 }
+
+#[test]
+fn separated_position_aliases_resolve_in_imported_expressions() {
+    let mut f = fx();
+    let mut next = f.p.next_id;
+    let mut ids = Ids(&mut next);
+    let channels = [
+        ids.prop("positionX", "X Position", Value::Scalar(25.0)),
+        ids.prop("positionY", "Y Position", Value::Scalar(50.0)),
+        ids.prop("positionZ", "Z Position", Value::Scalar(75.0)),
+    ];
+    f.p.next_id = next;
+    f.layer_mut(f.a).props.sub_mut("transform").unwrap().children.extend(channels.into_iter().map(Into::into));
+    assert_close!(f.num("transform.xPosition + transform.yPosition + transform.zPosition", 0.0), 150.0);
+    let value = f.ev(f.a, "transform/positionX", "(transform.xPosition + time * 1500) % 4000", 0.5).unwrap();
+    assert_close!(value.as_f64(), 775.0);
+}

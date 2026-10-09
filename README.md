@@ -224,8 +224,11 @@ exists, including all of its effects, but existing is not the same as behaving e
 Effects, and we haven't measured that yet. Today it's a good place to try things and to tell us
 what breaks. It isn't yet a replacement for After Effects on client work. In particular:
 
-- **After Effects projects can't be opened.** Projects are saved as `.ecproj`, readable versioned
-  JSON, but EffectCraft can't open `.aep` / `.aepx` files, and After Effects plug-ins don't run.
+- **Experimental After Effects project import (`.aep`):** Opens binary RIFX projects with
+  compositions, folders, layer timing, nested sources, solids, transforms and animation.
+  Missing footage and unsupported content are reported. Save imported projects as `.ecproj`;
+  the original `.aep` is never overwritten. Supported effects, masks, vector contents, text
+  styling and expressions are reconstructed, with rendering fidelity still experimental. `.aepx` is explicitly unsupported.
 - **Behaviour still differs from After Effects in places.** Nothing yet compares our renders with
   After Effects automatically, so please report differences.
 - **macOS is the most tested platform.** Linux and Windows users have hit basic interaction
@@ -307,7 +310,7 @@ stand on its own.
 | <img src="https://raw.githubusercontent.com/storytold/vectorcraft/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.vectorcraft.png" alt="" width="32" height="32"> | **VectorCraft** | Vector illustration | [GitHub](https://github.com/storytold/vectorcraft) | [Website](https://getartcraft.com/apps/vectorcraft) |
 | <img src="https://raw.githubusercontent.com/storytold/filmcraft/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.filmcraft.png" alt="" width="32" height="32"> | **FilmCraft** | Video editing, color and sound | [GitHub](https://github.com/storytold/filmcraft) | [Website](https://getartcraft.com/apps/filmcraft) |
 | <img src="https://raw.githubusercontent.com/storytold/lightcraft/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.lightcraft.png" alt="" width="32" height="32"> | **LightCraft** | Photo library and raw development | [GitHub](https://github.com/storytold/lightcraft) | [Website](https://getartcraft.com/apps/lightcraft) |
-| <img src="https://raw.githubusercontent.com/storytold/pdfcraft/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.pdfcraft.png" alt="" width="32" height="32"> | **PdfCraft** | Reading, organizing and protecting PDFs | [GitHub](https://github.com/storytold/pdfcraft) | [Website](https://getartcraft.com/apps/pdfcraft) |
+| <img src="https://raw.githubusercontent.com/storytold/printcraft/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.printcraft.png" alt="" width="32" height="32"> | **PrintCraft** | Reading, organizing and protecting PDFs | [GitHub](https://github.com/storytold/printcraft) | [Website](https://getartcraft.com/apps/printcraft) |
 | <img src="https://raw.githubusercontent.com/storytold/effectcraft/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.effectcraft.png" alt="" width="32" height="32"> | **EffectCraft** | **Motion graphics and visual effects · you are here** | [GitHub](https://github.com/storytold/effectcraft) | [Website](https://getartcraft.com/apps/effectcraft) |
 | <img src="https://raw.githubusercontent.com/storytold/designcraft/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.designcraft.png" alt="" width="32" height="32"> | **DesignCraft** | Page layout and publishing | [GitHub](https://github.com/storytold/designcraft) | [Website](https://getartcraft.com/apps/designcraft) |
 

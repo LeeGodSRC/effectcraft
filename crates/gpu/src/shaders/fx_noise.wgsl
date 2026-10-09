@@ -14,15 +14,9 @@ fn fxn_pixel(gid: vec3<u32>) -> vec2<i32> {
     return p;
 }
 
-// Refine approximate GPU division with two fma residual corrections before restoring
-// the median's straight colour. Driver float optimisations can still affect rounding;
-// the fixed median levels instead come from a CPU-rounded lookup table.
+// Median threshold comparisons use correctly rounded division on every backend.
 fn fxn_div4(a: vec4<f32>, b: vec4<f32>) -> vec4<f32> {
-    let q = a / b;
-    let r = fma(-q, b, a);
-    let corrected = fma(r, 1.0 / b, q);
-    let residual = fma(-corrected, b, a);
-    return fma(residual, 1.0 / b, corrected);
+    return vec4<f32>(div_rn(a.x,b.x),div_rn(a.y,b.y),div_rn(a.z,b.z),div_rn(a.w,b.w));
 }
 
 // util::unpremul: (straight colour, alpha).

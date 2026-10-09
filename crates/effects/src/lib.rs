@@ -110,7 +110,7 @@ pub use ocio::color_stabilizer_maps;
 // GPU effects, part B (3D Channel, Immersive Video, colour management, simulation render passes).
 pub use channel3d::{CRYPTO_LAYERS, id_color, selection_hashes};
 pub use ocio::{ColorOp, Straight, Tf, color_program};
-pub use sim::{Acc, Blob, Bubble, Post, Shape, Sprite, SpritePlan, Tint, bubble_list, drizzle_drops, mercury_blobs, sprite_plan};
+pub use sim::{Acc, Blob, Bubble, Post, Shape, Sprite, SpritePlan, Tint, bubble_list, drizzle_drops, mercury_blobs, particle_world_textured, sprite_plan};
 pub use sim2::{
     CausticsSetup, FoamDisc, FoamEnv, FoamPlan, Piece, PiecePlan, PieceTex, PixelPlan, WavePlan, Waves, caustics_setup, foam_full_plan, piece_plan, pixel_plan,
     wave_world_plan,
@@ -322,8 +322,11 @@ pub trait EffectHost: Sync {
     fn comp_scene(&self) -> Option<CompScene> {
         None
     }
-    /// The running effect's own parameters evaluated at another **layer time** (Radio Waves'
-    /// Parameters Are Set At: Birth). `None` when unavailable.
+    /// Stable fingerprint of this effect's complete animation, or zero when dependencies are unknown.
+    fn params_revision(&self) -> u64 {
+        0
+    }
+    /// The running effect's parameters at another layer time; `None` when unavailable.
     fn params_at(&self, _layer_time: f64) -> Option<Params> {
         None
     }

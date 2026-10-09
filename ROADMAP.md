@@ -4,6 +4,7 @@
 - 2026-10-08: `effectcraft-cli render --out` resolves a relative path against the working directory, like `--project` (it used the project's folder, which doubled a path that already named it). Render Queue outputs set in a project are unchanged.
 - 2026-10-08: Long-press a grouped toolbar button to choose its tools, including Horizontal/Vertical Type; releasing the hold keeps the menu open. Existing point/paragraph text creation is unchanged.
 
+- 2026-10-10: Experimental binary `.aep` import: composition hierarchy, layer timing, nested sources, solids, animated transforms, supported effects, masks, vector/text contents, missing-media reports and safe `.ecproj` saving. Synthetic parser/session/UI regressions; `.aepx` remains unsupported.
 - 2026-10-06: Settings ▸ General ▸ Language persists English/Japanese menu labels (`general.language`); native UI reuses installed Japanese font fallback, with no bundled CJK font. Dialog and panel contents remain English.
 
 EffectCraft aims to do what After Effects does, with the same panels, menus and behaviour, written
@@ -42,8 +43,9 @@ in [docs/gaps.md](docs/gaps.md).
   a living can do client work in EffectCraft. What holds it back:
   - **Fidelity is unmeasured.** No test compares our output with After Effects itself, and users
     are still finding behaviour bugs in features marked done.
-  - **After Effects projects can't be opened.** EffectCraft can't read `.aep` / `.aepx` files,
-    and third-party After Effects plug-ins can't run.
+  - **After Effects projects:** Experimental `.aep` import reconstructs composition and layer
+    structure with explicit fidelity warnings. Effects, animation and shape/text contents remain
+    incomplete; `.aepx` is unsupported.
   - **Reliability is uneven across platforms.** Early Linux users hit basic problems: viewer
     panning, panel docking, drag-and-drop import. A Windows user found the font menus offered only
     the bundled fonts (fixed 6 October: they list every installed font). Reports of 6 October
@@ -62,7 +64,7 @@ In priority order (details and "done" criteria in [docs/gaps.md](docs/gaps.md)):
 | G1 | Measure fidelity against After Effects: a corpus of test projects rendered and sampled in both apps, scored per feature | Turns every estimate into a measurement; a feature that behaves differently is not done |
 | G2 | Real-user reliability on macOS, Windows and Linux; fix every open user issue | Basic workflows must work everywhere before more features matter |
 | G3 | Stability: a green gate on the current toolchain, fuzzing of every input | A crash loses people's work |
-| G4 | Open After Effects projects (`.aep` / `.aepx`, pending an owner decision on clean-room scope); relinking moved footage | The biggest barrier to switching |
+| G4 | Open After Effects projects (`.aep` experimental; `.aepx` unsupported; expanding expressions and effect fidelity); relinking moved footage | The biggest barrier to switching |
 | G5 | Performance benchmarks at 1080p and 4K on real-world-sized projects | Unknown today |
 | G6 | Media depth: encoder efficiency, camera and phone formats | Files are larger than from mature encoders; camera formats are unverified |
 | G7 | Learned models: Roto Brush (M13.35: MobileSAM) and face tracking (M13.36: MediaPipe Face Landmarker), open source, optional downloads, swappable model module; next, measure them | Quality against After Effects is unmeasured |

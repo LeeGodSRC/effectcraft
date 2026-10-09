@@ -169,6 +169,7 @@ pub fn show(app: &mut EffectcraftApp, ctx: &egui::Context) {
     let t = app.tokens;
     match d {
         Dialog::About => about(app, ctx, &t),
+        Dialog::AepReport => aep_report(app, ctx, &t),
         Dialog::NewComp | Dialog::CompSettings => comp_settings(app, ctx, &t, d == Dialog::CompSettings),
         Dialog::SolidSettings => solid(app, ctx, &t),
         Dialog::CommandPalette => palette(app, ctx, &t),
@@ -304,6 +305,44 @@ fn about_main(app: &mut EffectcraftApp, ui: &mut egui::Ui, t: &Tokens, cmd: &mut
             *cmd = Some(c);
         }
         ui.add_space(4.0);
+    }
+}
+
+fn aep_report(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
+    let report = app.session.last_aep_report.clone().unwrap_or_default();
+    let mut close = false;
+    modal(ctx, "After Effects Import", vec2(580.0, 480.0), t, |ui| {
+        let mut missing = std::collections::BTreeMap::<&str, usize>::new();
+        for path in &report.missing_footage {
+            *missing.entry(path.as_str()).or_default() += 1;
+        }
+        ui.label(format!(
+            "{} compositions; {} effects imported; {} missing media files ({} references)",
+            report.comp_count,
+            report.imported_effect_count,
+            missing.len(),
+            report.missing_footage_count
+        ));
+        egui::ScrollArea::vertical().max_height(350.0).show(ui, |ui| {
+            for warning in &report.warnings {
+                ui.label(warning);
+            }
+            for (path, references) in missing {
+                ui.label(format!("Missing media ({references} references): {path}"));
+            }
+            for font in &report.missing_fonts {
+                ui.label(format!("Missing font: {font}"));
+            }
+            for effect in &report.custom_plugins {
+                ui.label(format!("Skipped effect: {effect}"));
+            }
+        });
+        let r = ui.button(tr("OK"));
+        app.auto.add("dialog.aepReport.ok", r.rect, "OK");
+        close = r.clicked();
+    });
+    if close {
+        app.dialog = None;
     }
 }
 

@@ -607,11 +607,17 @@ fn color_balance_hls(ctx: &EffectCtx, mut b: Buf) -> Buf {
         return b;
     }
     b.img.map_straight(|c| {
-        let (h, s, l) = rgb_to_hsl(c[0], c[1], c[2]);
-        let l = if dl > 0.0 { l + (1.0 - l) * dl } else { l + l * dl };
-        let s = if ds > 0.0 { s + (1.0 - s) * ds } else { s + s * ds };
-        let (r, g, bb) = hsl_to_rgb(h + dh, s.clamp(0.0, 1.0), l.clamp(0.0, 1.0));
-        [r, g, bb]
+        let rgb = if dh == 0.0 && ds == 0.0 {
+            c
+        } else {
+            let (h, s, l) = rgb_to_hsl(c[0], c[1], c[2]);
+            let s = if ds > 0.0 { s + (1.0 - s) * ds } else { s + s * ds };
+            let (r, g, b) = hsl_to_rgb(h + dh, s.clamp(0.0, 1.0), l.clamp(0.0, 1.0));
+            [r, g, b]
+        };
+        // Lightness fades the adjusted RGB toward white or black. Scaling HSL L with
+        // unchanged S instead turns pale highlights into saturated colors as they darken.
+        rgb.map(|v| if dl > 0.0 { v + (1.0 - v) * dl } else { v * (1.0 + dl) })
     });
     b
 }
@@ -1231,6 +1237,22 @@ mod tests {
         let red = Image::filled(1, 1, [1.0, 0.0, 0.0, 1.0]);
         let out = run("ec.color.colorbalancehls", &red, &[("hue", num(120.0))]);
         assert!(out.data[0][1] > 0.99 && out.data[0][0] < 0.01);
+    }
+
+    #[test]
+    fn color_balance_hls_lightness_preserves_highlight_color_and_alpha() {
+        // Straight RGB (1, .9, .8), with partial coverage, is a pale warm highlight.
+        let img = Image::filled(1, 1, [0.5, 0.45, 0.4, 0.5]);
+        for (lightness, expected) in [(-50.0, [0.25, 0.225, 0.2, 0.5]), (50.0, [0.5, 0.475, 0.45, 0.5])] {
+            let out = run("ec.color.colorbalancehls", &img, &[("lightness", num(lightness))]);
+            for (actual, expected) in out.data[0].iter().zip(expected) {
+                assert!((actual - expected).abs() < 1e-6, "lightness {lightness}: {:?}", out.data[0]);
+            }
+        }
+        // An overshooting filtered highlight must not hit the HSL saturation singularity.
+        let hdr = Image::filled(1, 1, [1.1, 1.0, 0.9, 1.0]);
+        let out = run("ec.color.colorbalancehls", &hdr, &[("lightness", num(-50.0))]);
+        assert_eq!(out.data[0], [0.55, 0.5, 0.45, 1.0]);
     }
 
     #[test]

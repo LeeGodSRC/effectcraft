@@ -418,6 +418,16 @@ fn hash_debug(h: &mut KeyHasher, v: &impl std::fmt::Debug) {
     Hasher::write_u8(h, 0xff);
 }
 
+/// Fingerprint the full animation; expressions may depend on external mutable state.
+pub(crate) fn effect_revision(group: &PropGroup) -> u64 {
+    if has_expression(group) {
+        return 0;
+    }
+    let mut h = KeyHasher(0xcbf2_9ce4_8422_2325);
+    hash_debug(&mut h, group);
+    h.finish().max(1)
+}
+
 /// Time-based layer content: does any part of the source/effects read the clock directly
 /// (rather than through property values)?
 fn time_dependent(layer: &Layer) -> bool {

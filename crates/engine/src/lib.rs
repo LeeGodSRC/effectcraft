@@ -10,6 +10,8 @@
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+pub mod aep;
+
 pub mod autosave;
 pub mod camera_track;
 pub mod commands;
@@ -96,6 +98,29 @@ pub type Result<T> = std::result::Result<T, EngineError>;
 /// Host services (file access) injected by the frontend.
 pub trait Services: Send + Sync {
     fn read_file(&self, path: &str) -> std::io::Result<Vec<u8>>;
+    /// Read a project, enforcing the AEP limit even when its extension is missing.
+    /// Memory-backed hosts already hold the bytes; native hosts inspect a small header
+    /// before reading the remainder so a hostile AEP cannot exhaust memory first.
+    fn read_project_file(&self, path: &str) -> std::io::Result<Vec<u8>> {
+        if aep::is_aep_path(path) {
+            return self.read_file_limited(path, aep::MAX_FILE_BYTES);
+        }
+        let data = self.read_file(path)?;
+        if (aep::is_aep(&data) || aep::is_aepx(&data)) && data.len() > aep::MAX_FILE_BYTES {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "file exceeds import size limit"));
+        }
+        Ok(data)
+    }
+    /// Read a bounded import. Native hosts cap reads before allocation; memory-backed hosts
+    /// can use this default to enforce the same format limit.
+    fn read_file_limited(&self, path: &str, limit: usize) -> std::io::Result<Vec<u8>> {
+        let data = self.read_file(path)?;
+        if data.len() > limit {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "file exceeds import size limit"));
+        }
+        Ok(data)
+    }
+
     fn write_file(&self, path: &str, data: &[u8]) -> std::io::Result<()>;
     /// Whether a file exists (the background footage check after open).
     fn exists(&self, path: &str) -> bool {
@@ -128,6 +153,49 @@ pub trait Services: Send + Sync {
 /// Native filesystem.
 pub struct FsServices;
 impl Services for FsServices {
+    fn read_project_file(&self, path: &str) -> std::io::Result<Vec<u8>> {
+        use std::io::Read;
+        let mut file = std::fs::File::open(path)?;
+        let mut data = Vec::new();
+        (&mut file).take(4096).read_to_end(&mut data)?;
+        // A UTF-8 character can straddle the fixed header boundary. Recognition only
+        // needs the XML root, so retain the complete UTF-8 prefix for that check.
+        let text_header = match std::str::from_utf8(&data) {
+            Ok(_) => data.as_slice(),
+            Err(error) => data.get(..error.valid_up_to()).unwrap_or_default(),
+        };
+        if aep::is_aep_path(path) || aep::is_aep(&data) || aep::is_aepx(text_header) {
+            let limit = aep::MAX_FILE_BYTES;
+            if file.metadata()?.len() > limit as u64 {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "file exceeds import size limit"));
+            }
+            // Bound the same open file as well: it may grow after the metadata check.
+            let remaining = limit.saturating_add(1).saturating_sub(data.len());
+            file.take(remaining as u64).read_to_end(&mut data)?;
+            if data.len() > limit {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "file exceeds import size limit"));
+            }
+        } else {
+            // Native projects retain their existing size semantics.
+            file.read_to_end(&mut data)?;
+        }
+        Ok(data)
+    }
+
+    fn read_file_limited(&self, path: &str, limit: usize) -> std::io::Result<Vec<u8>> {
+        use std::io::Read;
+        let file = std::fs::File::open(path)?;
+        if file.metadata()?.len() > limit as u64 {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "file exceeds import size limit"));
+        }
+        let mut data = Vec::new();
+        file.take((limit as u64).saturating_add(1)).read_to_end(&mut data)?;
+        if data.len() > limit {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "file exceeds import size limit"));
+        }
+        Ok(data)
+    }
+
     fn read_file(&self, path: &str) -> std::io::Result<Vec<u8>> {
         std::fs::read(path)
     }
@@ -459,6 +527,10 @@ pub struct Session {
     /// event loop (the desktop app) turn this on; headless sessions run `footage.check` when
     /// they want it.
     pub check_footage_on_open: bool,
+    /// Last report generated when opening an After Effects (`.aep` / `.aepx`) project.
+    pub last_aep_report: Option<crate::aep::AepReport>,
+    /// Original AEP sources remain write-protected even after dismissing or replacing a report.
+    pub protected_aep_sources: Vec<String>,
 }
 
 /// A thumbnail render ([`Session::thumbnail_job`]): (width, height, RGBA8).
@@ -544,6 +616,8 @@ impl Default for Session {
             next_task_id: 1,
             learn: None,
             check_footage_on_open: false,
+            last_aep_report: None,
+            protected_aep_sources: Vec::new(),
         }
     }
 }
@@ -934,6 +1008,8 @@ impl Session {
         self.drop_tasks();
         p.fix_next_id();
         upgrade_effects(&mut p);
+        self.last_aep_report = None;
+        self.protected_aep_sources.clear();
         self.project = Arc::new(p);
         self.history = History::default();
         self.state = EditorState { snapping: true, view_layout: 1, ..Default::default() };

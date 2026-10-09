@@ -35,14 +35,9 @@ fn fxs_smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
     return t * t * (3.0 - 2.0 * t);
 }
 
-// x / a rounded like the CPU's IEEE division (GPU division may be off by an ulp, which flips
-// thresholds on 8 / 16 bpc colours that sit exactly on them): one residual correction.
+// Threshold decisions must use the CPU's rounded quotient, independent of GPU fast math.
 fn fxs_qdiv(x: vec3<f32>, a: f32) -> vec3<f32> {
-    let q = x / a;
-    let r = fma(-q, vec3<f32>(a), x);
-    // `q + r / a`, written as an fma so drivers (NVIDIA Vulkan) can't contract it another way
-    // and round differently from the CPU.
-    return fma(r / a, vec3<f32>(1.0), q);
+    return vec3<f32>(div_rn(x.x,a),div_rn(x.y,a),div_rn(x.z,a));
 }
 
 fn fxs_rem2(i: i32) -> i32 {

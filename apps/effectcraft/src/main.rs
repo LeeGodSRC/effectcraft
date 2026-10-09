@@ -143,7 +143,11 @@ fn main() -> eframe::Result {
             }
             session.load_settings();
             let recovery = if control_port.is_none() { session.begin_recovery() } else { None };
-            let project = files.iter().find(|f| f.ends_with(".ecproj")).cloned();
+            let is_proj = |f: &str| {
+                let l = f.to_ascii_lowercase();
+                l.ends_with(".ecproj") || l.ends_with(".ecprojx") || l.ends_with(".aep") || l.ends_with(".aepx")
+            };
+            let project = files.iter().find(|f| is_proj(f)).cloned();
             if let Some(p) = project {
                 if let Err(e) = session.execute("file.open", json!({"path": p})) {
                     eprintln!("effectcraft: {e}");
@@ -151,7 +155,7 @@ fn main() -> eframe::Result {
             } else if demo {
                 let _ = session.execute("file.openDemoProject", json!({}));
             }
-            let media: Vec<String> = files.iter().filter(|f| !f.ends_with(".ecproj")).cloned().collect();
+            let media: Vec<String> = files.iter().filter(|f| !is_proj(f)).cloned().collect();
             if !media.is_empty()
                 && let Err(e) = session.execute("file.import", json!({"paths": media}))
             {
@@ -167,6 +171,9 @@ fn main() -> eframe::Result {
             if let Some(n) = notice {
                 app.ui.status = n;
             }
+            if app.session.last_aep_report.as_ref().is_some_and(|r| r.has_issues()) {
+                app.dialog = Some(effectcraft_ui_egui::Dialog::AepReport);
+            }
             if let Some(r) = recovery {
                 app.offer_recovery(r);
             }
@@ -177,7 +184,12 @@ fn main() -> eframe::Result {
                 rfd::FileDialog::new().add_filter("EffectCraft Project", &["ecproj"]).set_file_name(name).save_file().map(|p| p.to_string_lossy().to_string())
             }));
             app.hooks.pick_open_project = Some(Box::new(|| {
-                rfd::FileDialog::new().add_filter("EffectCraft Project", &["ecproj", "ecprojx"]).pick_file().map(|p| p.to_string_lossy().to_string())
+                rfd::FileDialog::new()
+                    .add_filter("All Projects", &["ecproj", "ecprojx", "aep", "aepx"])
+                    .add_filter("After Effects Project", &["aep", "aepx"])
+                    .add_filter("EffectCraft Project", &["ecproj", "ecprojx"])
+                    .pick_file()
+                    .map(|p| p.to_string_lossy().to_string())
             }));
             app.hooks.audio_device = Some(Box::new(audio_out::open));
             app.hooks.audio_devices = Some(Box::new(audio_out::devices));

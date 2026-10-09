@@ -652,9 +652,11 @@ fn fp2_hextile(@builtin(global_invocation_id) gid: vec3<u32>) {
     let ddx = abs(rx - q);
     let ddy = abs(ry - ccy);
     let ddz = abs(rz - rr);
-    if (ddx > ddy && ddx > ddz) {
+    // Match the CPU's canonical z/y/x choice at equal cube residuals.
+    let tie = 0.00000095367431640625 * max(1.0, max(abs(q), abs(rr)));
+    if (ddx > ddy + tie && ddx > ddz + tie) {
         rx = -ry - rz;
-    } else if (ddy <= ddz) {
+    } else if (ddy <= ddz + tie) {
         rz = -rx - ry;
     }
     let hx = r * 1.7320508075688772 * (rx + rz / 2.0);

@@ -217,11 +217,39 @@ fn grid_wipe(e: &mut Enc, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
         _ => dx.hypot(dy),
     };
     let maxd = max_corner_dist(&b, c, |dx, dy| metric(dx * co + dy * s, -dx * s + dy * co));
-    let mut p = Params::default();
-    p.u[0] = [shape, pr.b("reverse") as u32, 0, 0];
-    p.f[0] = f4([c.0, c.1, s, co]);
-    p.f[1] = f4([cs, maxd, done, border]);
-    run(e, "ftr_grid", &p, b, None, None)
+    // Grid ownership and the shrinking tile's strict edge comparison are discontinuous.
+    // Prepare coverage in the CPU effect's f64 geometry (as other wrap kernels do), then
+    // apply it to the resident pixels on the GPU. f32 cancellation at half resolution
+    // otherwise removes a whole row when its cell is exactly on the progress boundary.
+    let count = (b.img.width as usize).checked_mul(b.img.height as usize)?;
+    let mut coverage = Vec::new();
+    coverage.try_reserve_exact(count).ok()?;
+    for y in 0..b.img.height {
+        for x in 0..b.img.width {
+            let (dx, dy) = (x as f64 + 0.5 - c.0, y as f64 + 0.5 - c.1);
+            let (qx, qy) = (dx * co + dy * s, -dx * s + dy * co);
+            let (cx, cy) = (((qx / cs).floor() + 0.5) * cs, ((qy / cs).floor() + 0.5) * cs);
+            let mut order = (metric(cx, cy) / maxd).clamp(0.0, 1.0);
+            if pr.b("reverse") {
+                order = 1.0 - order;
+            }
+            let progress = ((done * 1.25 - order) / 0.25).clamp(0.0, 1.0);
+            let half = cs * 0.5 * (1.0 - progress);
+            let distance = (qx - cx).abs().max((qy - cy).abs());
+            let alpha = if progress <= 0.0 {
+                1.0
+            } else if border > 0.0 {
+                ((half - distance) / border + 0.5).clamp(0.0, 1.0)
+            } else if distance < half {
+                1.0
+            } else {
+                0.0
+            };
+            coverage.push(alpha as f32);
+        }
+    }
+    let data = e.data(&coverage);
+    run(e, "ftr_grid", &Params::default(), b, None, Some(&data))
 }
 
 fn radial_scale_wipe(e: &mut Enc, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
