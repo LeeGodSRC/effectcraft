@@ -357,6 +357,8 @@ pub struct EffectEnv<'a> {
     pub host: Option<&'a dyn EffectHost>,
     /// Composition time in seconds.
     pub comp_time: f64,
+    /// The effect layer's in point in composition seconds (texture animations may start here).
+    pub layer_in_point: f64,
     /// Composition frame rate (0 when unknown).
     pub frame_rate: f64,
     /// Index of the running effect in its layer's stack (for [`EffectHost::self_at`]).

@@ -1293,8 +1293,10 @@ fn particle_world_layout(ctx: &EffectCtx, b: &Buf) -> Option<WorldPlan> {
             let (c, size) = particle_look(q, birth, death, bs, ds, svar, max_op);
             let color = pw_color(ctx, q, birth, death, c[3], textured);
             let radius = size * 0.5 * lw * k * scale * quad;
-            let mut rotation = (q.rnd * initial + q.age * spin).to_radians();
-            if pr.b("texture/align") {
+            // Cycore's public manual: Textured Square has no individual rotation.
+            // Its texture stays facing the camera, unlike the rotating polygon types.
+            let mut rotation = if kind == 8 { 0.0 } else { (q.rnd * initial + q.age * spin).to_radians() };
+            if kind != 8 && pr.b("texture/align") {
                 rotation += v[1].atan2(v[0]);
             }
             let sp = if kind == 0 {
@@ -1394,7 +1396,9 @@ fn texture_particles(ctx: &EffectCtx, mut b: Buf, plan: &WorldPlan) -> Buf {
     for item in &plan.sprites {
         let time = match time_mode {
             0 => ctx.env.comp_time - item.age,
-            2 => item.age,
+            // Cycore's Texture Time / From Start is anchored to the effect layer's
+            // in point, not composition zero or the texture layer's own start time.
+            2 => ctx.env.layer_in_point + item.age,
             _ => ctx.env.comp_time,
         };
         let frame = (time * fps).floor() as i64;
@@ -2318,6 +2322,64 @@ mod tests {
         assert!(!state.parts.is_empty());
         assert!(state.parts.iter().all(|p| p.age >= 0.49));
     }
+    #[test]
+    fn particle_texture_from_start_uses_effect_in_point() {
+        struct SampleTimes(std::sync::Mutex<Vec<f64>>);
+        impl crate::EffectHost for SampleTimes {
+            fn layer(&self, _: u64, _: bool) -> Option<crate::LayerPixels> {
+                None
+            }
+            fn audio(&self, _: u64, _: f64, _: usize, _: u32) -> Option<Vec<f32>> {
+                None
+            }
+            fn layer_at(&self, _: u64, time: f64, _: bool) -> Option<crate::LayerPixels> {
+                self.0.lock().unwrap().push(time);
+                Some(crate::LayerPixels { buf: Buf { img: Image::filled(8, 8, [1.0; 4]), offset: [0.0; 2], scale: 1.0 }, size: [8.0; 2] })
+            }
+        }
+        let mut params = pw_params();
+        params.values.insert("texture/layer".into(), Value::Layer(Some(42)));
+        params.values.insert("particle/particleType".into(), Value::Enum(8));
+        let plan = WorldPlan {
+            sprites: vec![WorldSprite { sprite: type_sprite(8, 4.0, 4.0, 2.0, [1.0; 4], 0.0, 0.0, 0.0), age: 0.25, id: 1 }],
+            mode: 0,
+            original: false,
+        };
+        for (mode, expected) in [(0, 1.75), (1, 2.0), (2, -0.75)] {
+            params.values.insert("texture/time".into(), Value::Enum(mode));
+            let host = SampleTimes(Default::default());
+            let ctx = EffectCtx {
+                params: &params,
+                time: 3.0,
+                layer_size: [8.0; 2],
+                seed: 1,
+                adjustment: false,
+                env: EffectEnv { host: Some(&host), comp_time: 2.0, layer_in_point: -1.0, frame_rate: 24.0, ..Default::default() },
+            };
+            texture_particles(&ctx, Buf { img: Image::new(8, 8), offset: [0.0; 2], scale: 1.0 }, &plan);
+            assert_eq!(*host.0.lock().unwrap(), vec![expected]);
+        }
+    }
+
+    #[test]
+    fn particle_world_textured_square_ignores_individual_rotation() {
+        let mut params = pw_params();
+        params.values.insert("particle/particleType".into(), Value::Enum(8));
+        params.values.insert("particle/initialRotation".into(), num(360.0));
+        params.values.insert("particle/rotationSpeed".into(), num(180.0));
+        params.values.insert("texture/align".into(), Value::Bool(true));
+        let mut ctx = EffectCtx { params: &params, time: 0.5, layer_size: [64.0; 2], seed: 7, adjustment: false, env: EffectEnv::default() };
+        let input = Buf { img: Image::new(64, 64), offset: [0.0; 2], scale: 1.0 };
+        let square = particle_world_layout(&ctx, &input).unwrap();
+        assert!(!square.sprites.is_empty());
+        assert!(square.sprites.iter().all(|p| p.sprite.rot == 0.0));
+        let mut polygon = params.clone();
+        polygon.values.insert("particle/particleType".into(), Value::Enum(9));
+        ctx.params = &polygon;
+        let polygon = particle_world_layout(&ctx, &input).unwrap();
+        assert!(polygon.sprites.iter().any(|p| p.sprite.rot.abs() > 0.01));
+    }
+
     #[test]
     fn particle_world_texture_samples_layer_pixels_and_camera_affects_projection() {
         let mut params = pw_params();

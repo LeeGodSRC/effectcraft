@@ -192,6 +192,37 @@ fn particle_world_scene(pan: f64) -> (Project, ItemId) {
     (p, cid)
 }
 
+#[test]
+fn particle_texture_animation_starts_at_effect_layer_in_point() {
+    let (mut p, cid, comp) = setup();
+    let mut texture = solid(&mut p, &comp, [1.0; 3], 16, 16);
+    texture.switches.video = false;
+    add_effect(&mut p, &mut texture, "ec.color.tint", [16.0; 2], &[]);
+    texture.props.prop_mut("effects/#1/white").unwrap().keys =
+        vec![Keyframe::new(Tick::from_seconds_f64(-0.5), Value::Color([0.0, 1.0, 0.0, 1.0])), Keyframe::new(Tick::ZERO, Value::Color([1.0, 0.0, 0.0, 1.0]))];
+    let mut emitter = solid(&mut p, &comp, [0.0; 3], 200, 100);
+    // Trimmed: in point differs from both composition zero and the layer start.
+    emitter.start_time = Tick::from_seconds_f64(-2.0);
+    emitter.in_point = Tick::from_seconds_f64(-1.0);
+    let vals = [
+        ("birthRate", Value::Scalar(2.0)),
+        ("longevity", Value::Scalar(0.2)),
+        ("particle/particleType", Value::Enum(8)),
+        ("particle/birthSize", Value::Scalar(1.0)),
+        ("particle/deathSize", Value::Scalar(1.0)),
+        ("particle/birthColor", Value::Color([1.0; 4])),
+        ("particle/deathColor", Value::Color([1.0; 4])),
+        ("texture/layer", Value::Layer(Some(texture.id.0))),
+        ("texture/time", Value::Enum(2)),
+        ("extras/compositeWithOriginal", Value::Bool(false)),
+    ];
+    add_effect(&mut p, &mut emitter, "ec.sim.ccparticleworld", [200.0, 100.0], &vals);
+    p.comp_mut(cid).unwrap().layers = vec![emitter, texture];
+    let img = render_frame(&p, cid, Tick::from_seconds_f64(-0.5), 1.0);
+    assert!(img.data.iter().map(|p| p[1]).sum::<f32>() > 1.0);
+    assert!(img.data.iter().all(|p| p[0] == 0.0));
+}
+
 /// The red-weighted centre of the particles (x).
 fn particles_x(img: &crate::Image) -> f32 {
     let (mut m, mut sx) = (0.0, 0.0);

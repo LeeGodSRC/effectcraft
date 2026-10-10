@@ -1020,6 +1020,7 @@ impl<'a> Renderer<'a> {
             masks: &mask_shapes,
             host: Some(&host),
             comp_time: ctx.time.seconds(),
+            layer_in_point: layer.in_point.seconds(),
             frame_rate: ctx.comp.frame_rate.as_f64(),
             effect_index: 0,
             working_space: self.pipe.space,
