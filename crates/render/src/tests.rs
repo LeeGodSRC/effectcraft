@@ -57,6 +57,28 @@ fn opacity_and_blend_modes() {
 }
 
 #[test]
+fn clipping_layers_recolor_without_increasing_underlying_alpha() {
+    for three_d in [false, true] {
+        for opacity in [0.0, 50.0, 100.0] {
+            let (mut p, cid, comp) = setup();
+            let mut bottom = solid(&mut p, &comp, [1.0, 0.0, 0.0], 200, 100);
+            bottom.props.prop_mut("transform/opacity").unwrap().value = Value::Scalar(25.0);
+            bottom.switches.three_d = three_d;
+            let mut top = solid(&mut p, &comp, [0.0, 1.0, 0.0], 200, 100);
+            top.preserve_transparency = true;
+            top.switches.three_d = three_d;
+            top.props.prop_mut("transform/opacity").unwrap().value = Value::Scalar(opacity);
+            p.comp_mut(cid).unwrap().layers = vec![top, bottom];
+            let img = render_frame(&p, cid, Tick::ZERO, 1.0);
+            let actual = img.get(100, 50);
+            let f = opacity as f32 / 100.0;
+            let expected = [0.25 * (1.0 - f), 0.25 * f, 0.0, 0.25];
+            assert!(actual.iter().zip(expected).all(|(a, b)| (a - b).abs() < 1e-5), "3d={three_d}, {opacity}: {actual:?}");
+        }
+    }
+}
+
+#[test]
 fn half_resolution() {
     let (mut p, cid, comp) = setup();
     let l = solid(&mut p, &comp, [1.0, 1.0, 1.0], 200, 100);

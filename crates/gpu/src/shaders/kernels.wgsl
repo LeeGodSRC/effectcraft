@@ -123,7 +123,7 @@ fn matte(@builtin(global_invocation_id) gid: vec3<u32>) {
     textureStore(out, p, textureLoad(src, p, 0) * k);
 }
 
-// Preserve Transparency: `src` × alpha of `aux`.
+// Preserve Transparency: blend within the coverage of `aux`.
 @compute @workgroup_size(16, 16)
 fn preserve(@builtin(global_invocation_id) gid: vec3<u32>) {
     let dims = out_dims();
@@ -131,7 +131,13 @@ fn preserve(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (p.x >= dims.x || p.y >= dims.y) {
         return;
     }
-    textureStore(out, p, textureLoad(src, p, 0) * textureLoad(aux, p, 0).w);
+    let mode = P.u[0].x;
+    var n = 0.5;
+    if (mode == 1u || mode == 2u) {
+        n = hash_noise(gid.x, gid.y, P.u[0].z);
+    }
+    let result = preserve_pixel(mode, textureLoad(aux, p, 0), textureLoad(src, p, 0) * P.f[0].x, n);
+    store_q(p, result, P.f[0].y, P.f[0].z);
 }
 
 // Knockout: `src` × (1 − alpha of `aux`).
