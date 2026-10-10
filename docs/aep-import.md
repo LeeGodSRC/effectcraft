@@ -15,6 +15,18 @@ search near the project can relink available files. Missing media stays identifi
 Numeric animation preserves keyframe times, temporal interpolation/easing, spatial tangents and
 expressions, including disabled expressions and separated position dimensions. The importer also
 reconstructs vector groups, paths, masks, text documents/styles and supported text animators.
+Character runs preserve their fonts, sizes, fill/stroke, faux bold/italic, tracking, baseline
+shift, horizontal/vertical scale, leading and All Caps/Small Caps without rewriting the source
+string. Paragraph alignment and spacing are retained per paragraph. Font warnings refer to
+the imported character styles, excluding unused editing defaults in the file's font tables.
+Range selectors preserve percent/index units, Based On, Mode, Amount, shape, easing,
+smoothness, enabled state and randomization controls. Animator keys remain in layer time,
+including layers with negative start times and reversed playback. Randomize Order uses
+EffectCraft's deterministic permutation; it does not reproduce After Effects' private RNG,
+so individual letters can enter and leave in a different order.
+Selector easing profiles and character-blur kernels are approximations; preserving their
+controls does not imply pixel parity with After Effects. Missing fonts also change glyph
+shapes and advances even when the imported sizes, tracking and positions are correct.
 Layered PSD footage retains its source-layer selection. Supported effects are instantiated with
 stored parameters and animation; unsupported effects and parameters are reported explicitly.
 

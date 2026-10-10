@@ -309,6 +309,11 @@ fn apply_style(root: &Entry, style: &Entry, doc: &mut TextDoc) {
     doc.v_scale = style.get("7").and_then(Entry::number).unwrap_or(1.0) * 100.0;
     doc.tracking = style.get("8").and_then(Entry::number).unwrap_or(0.0);
     doc.baseline_shift = style.get("9").and_then(Entry::number).unwrap_or(0.0);
+    // The character case enum belongs to each run, not to the source string. Keep the
+    // original spelling so editing text and character-indexed animators still see it.
+    let caps = style.get("12").and_then(Entry::number).unwrap_or(0.0);
+    doc.small_caps = caps == 1.0;
+    doc.all_caps = caps == 2.0;
     doc.fill = style.get("53").and_then(paint).unwrap_or([1.0; 4]);
     doc.stroke = style.get("54").and_then(paint).unwrap_or([0.0, 0.0, 0.0, 1.0]);
     doc.apply_fill = style.get("56").and_then(Entry::boolean).unwrap_or(true);
@@ -320,6 +325,34 @@ fn apply_style(root: &Entry, style: &Entry, doc: &mut TextDoc) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn character_case_and_mixed_styles_survive_import() {
+        let blob = br"/0 << /1 << /0 [ << /0 << /0 << /0 (Inter) >> >> >> << /0 << /0 << /0 (NotoSerif-Regular) >> >> >> ] >> >>
+            /1 << /1 [ << /0 << /0 (Ab cd\r)
+            /6 << /0 [
+                << /0 << /0 << /6 << /0 0 /1 40 /2 true /3 true /8 120 /9 7 /12 2 >> >> >> /1 3 >>
+                << /0 << /0 << /6 << /0 1 /1 20 /12 1 >> >> >> /1 3 >>
+            ] >> /5 << /0 [ << /0 << /0 << /5 << /0 2 >> >> >> /1 6 >> ] >> >> >> ] >>";
+        let doc = decode_blob(blob).unwrap();
+        assert_eq!(doc.text, "Ab cd");
+        assert!(doc.all_caps && !doc.small_caps);
+        assert_eq!(doc.justify, Justify::Center);
+        assert_eq!(doc.runs.len(), 2);
+        let first = &doc.runs[0];
+        assert_eq!(first.len, 3);
+        assert_eq!(first.style.font, "Inter");
+        assert_eq!(first.style.size, 40.0);
+        assert!(first.style.all_caps && first.style.faux_bold && first.style.faux_italic);
+        assert_eq!((first.style.tracking, first.style.baseline_shift), (120.0, 7.0));
+        let second = &doc.runs[1];
+        assert_eq!(second.len, 2);
+        assert_eq!(second.style.font, "NotoSerif-Regular");
+        assert_eq!(second.style.size, 20.0);
+        assert!(second.style.small_caps && !second.style.all_caps);
+        let layout = effectcraft_text::layout_doc(&doc);
+        let capitalized = TextDoc { text: "AB cd".into(), ..doc.clone() };
+        assert_eq!(layout.layout.bounds, effectcraft_text::layout_doc(&capitalized).layout.bounds);
+    }
     #[test]
     fn text_dictionary_preserves_escaped_unicode_and_style() {
         let blob = b"/0 << /1 << /0 [ << /0 << /0 << /0 (OriginalFont) >> >> >> ] >> >> /1 << /1 [ << /0 << /0 (Hello \\(world\\)\\r) /6 << /0 [ << /0 << /0 << /6 << /0 0 /1 48 /53 << /0 << /1 [ 1 0.2 0.4 0.6 ] >> >> >> >> >> >> ] >> /5 << /0 [ << /0 << /0 << /5 << /0 2 >> >> >> >> ] >> >> >> ] >>";
