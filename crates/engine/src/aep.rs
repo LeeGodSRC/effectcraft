@@ -907,6 +907,7 @@ fn build_project(
                 missing,
                 sequence: Vec::new(),
                 color_profile: None,
+                preserve_rgb: false,
                 layer: dfoot.source_layer,
                 fields: Default::default(),
                 invert_alpha: false,

@@ -265,7 +265,7 @@ fn native_param<'a>(effect: &str, p: &DecodedParam, spec: &'a effectcraft_effect
         ("CC Particle World", "0008") => Some("producer/producerY"),
         ("CC Particle World", "0009") => Some("producer/producerZ"),
         ("CC Particle World", "0045") => Some("texture/layer"),
-        ("CC Particle World", "0033") => Some("camera/distance"),
+        ("CC Particle World", "0033") => Some("extras/effectCamera/distance"),
         ("CC Particle World", "0083") => Some("depthCue/distance"),
         _ => None,
     };

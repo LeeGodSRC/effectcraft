@@ -126,6 +126,19 @@ fn find_fx(s: &Session, p: &Value, cmd: &str) -> Result<(effectcraft_project::It
     Ok((cid, lid, g.uid))
 }
 
+/// `effect.warning`: what Effect Controls warns about an effect (a custom OCIO config it can't
+/// read, or transforms it passes through), `null` when it renders as asked.
+fn warning(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "effect.warning";
+    let (cid, lid, uid) = find_fx(s, p, cmd)?;
+    let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
+    let layer = comp.layer(lid).ok_or(EngineError::NoComp)?;
+    let g = layer.effects().and_then(|fx| fx.groups().find(|g| g.uid == uid)).ok_or_else(|| bad(cmd, "no such effect"))?;
+    let t = super::time_p(s, p, Some(comp));
+    let ctx = effectcraft_render::EvalCtx { project: &s.project, comp_id: cid, comp, time: t, expr: s.expr.as_deref(), footage: None };
+    Ok(json!({"effect": uid, "warning": effectcraft_effects::warning(g, &mut |pr| ctx.value(layer, pr))}))
+}
+
 /// A colour parameter's eyedropper on a keyer (Effect Controls): the colour of the effect's input
 /// (the layer's pixels before this effect, so a keyed screen can still be picked) at a
 /// layer-space point, set on the parameter. `average` takes the 5 × 5 pixels around it.
@@ -457,6 +470,12 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!("effect.paste", "Paste Effects", [], None, "{layers?} — adds the copied effects to the layers", has_layers, paste),
         cmd!("effect.reset", "Reset Effect", [], None, "{layer?, effect}", has_layers, reset),
         crate::query!("effect.list", "List Effects", "{filter?}", list),
+        crate::query!(
+            "effect.warning",
+            "Effect Warning",
+            "{layer?, effect?: index|uid|name (default: the selected effect), time?} → {effect, warning: string|null} — what Effect Controls warns about (an OCIO config it can't read, transforms it passes through)",
+            warning
+        ),
         crate::query!(
             "effect.plugins.list",
             "List Effect Plug-ins",
