@@ -35,7 +35,7 @@ fn gaussian(ctx: &EffectCtx, mut b: Buf) -> Buf {
     if !repeat && !ctx.adjustment {
         b.pad((s * 3.0).ceil() as u32);
     }
-    b.img = gaussian_blur(&b.img, s * kx, s * ky, repeat || ctx.adjustment);
+    b.img = effectcraft_raster::gaussian_blur_owned(std::mem::take(&mut b.img), s * kx, s * ky, repeat || ctx.adjustment);
     b
 }
 
@@ -50,7 +50,7 @@ fn box_blur(ctx: &EffectCtx, mut b: Buf) -> Buf {
     if !repeat && !ctx.adjustment {
         b.pad((r * it) as u32 + 1);
     }
-    b.img = effectcraft_raster::box_blur(&b.img, r * kx as usize, r * ky as usize, it, repeat || ctx.adjustment);
+    b.img = effectcraft_raster::box_blur_owned(std::mem::take(&mut b.img), r * kx as usize, r * ky as usize, it, repeat || ctx.adjustment);
     b
 }
 
@@ -196,7 +196,7 @@ fn glow(ctx: &EffectCtx, mut b: Buf) -> Buf {
         }
     });
     let s = (radius / 2.0).max(0.5);
-    let blurred = gaussian_blur(&bright, s * kx, s * ky, false);
+    let blurred = effectcraft_raster::gaussian_blur_owned(bright, s * kx, s * ky, false);
     let mode = ctx.params.e("operation");
     b.img.data.par_iter_mut().zip(blurred.data.par_iter()).for_each(|(o, g)| {
         let g = g.map(|v| v * intensity);
