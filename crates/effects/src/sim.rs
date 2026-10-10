@@ -1092,6 +1092,7 @@ fn pw_phys(ctx: &EffectCtx) -> Phys {
         rate: pr.f("birthRate").max(0.0)
             * match pr.e("particle/particleType") {
                 0 => 6_000.0,
+                8 if pw_point_fallback(ctx) => 6_000.0,
                 4 => 30.0,
                 _ => 120.0,
             },
@@ -1122,6 +1123,14 @@ fn pw_phys(ctx: &EffectCtx) -> Phys {
 /// Particle World modes which need sampled layer textures on the CPU.
 pub fn particle_world_textured(ctx: &EffectCtx) -> bool {
     matches!(ctx.params.e("particle/particleType"), 8..=12) && ctx.params.get("texture/layer").and_then(Value::as_layer).is_some()
+}
+
+/// An unassigned Textured Square renders a field of small points, rather than
+/// layer-sized opaque quads. The fallback's 6000 births/second and 1%-of-width
+/// diameter per Size unit are inferred from reference output, not specified by
+/// Cycore's manual. Assigned textures retain their independent calibration.
+fn pw_point_fallback(ctx: &EffectCtx) -> bool {
+    ctx.params.e("particle/particleType") == 8 && !particle_world_textured(ctx)
 }
 
 fn pw_state(ctx: &EffectCtx, phys: &Phys) -> std::sync::Arc<PState> {
@@ -1375,7 +1384,14 @@ fn particle_world_layout(ctx: &EffectCtx, b: &Buf) -> Option<WorldPlan> {
     // and variation: 0.09 leaves both too small, 0.18 oversizes the largest crosses.
     // Sprite primitives retain their independent 0.25 scale (Star compensates its
     // doubled tips below). These are fits, not units specified in the manual.
-    let quad = if particle_world_textured(ctx) { 0.15 } else { 0.25 };
+    let point = pw_point_fallback(ctx);
+    let quad = if particle_world_textured(ctx) {
+        0.15
+    } else if point {
+        0.01
+    } else {
+        0.25
+    };
     let initial = pr.f("particle/initialRotation") as f32;
     let spin = pr.f("particle/rotationSpeed") as f32;
     let mut list: Vec<(f32, WorldSprite)> = st
@@ -1402,7 +1418,9 @@ fn particle_world_layout(ctx: &EffectCtx, b: &Buf) -> Option<WorldPlan> {
             if kind == 4 {
                 rotation = 0.0;
             }
-            let sp = if kind == 0 {
+            let sp = if point {
+                Sprite::new(x, y, radius, color, Shape::Faded)
+            } else if kind == 0 {
                 pw_line_sprite(x, y, radius, color, v[0] * lw * k * scale, v[1] * lw * k * scale, scale)
             } else {
                 type_sprite(kind, x, y, radius, color, v[0] * lw * k * scale, v[1] * lw * k * scale, rotation)
@@ -1505,8 +1523,12 @@ fn texture_particles(ctx: &EffectCtx, mut b: Buf, plan: &WorldPlan) -> Buf {
             _ => ctx.env.comp_time,
         };
         let frame = (time * fps).floor() as i64;
+        // A missing temporal sample is transparent. Falling back to the current
+        // frame gives pre-roll particles a texture that did not exist at birth,
+        // or revives an animation after its source composition has ended.
+        let pixels = || host.layer_at(id, frame as f64 / fps, source).or_else(|| (time_mode == 1).then(|| host.layer(id, source)).flatten());
         if !frames.contains_key(&frame)
-            && let Some(pixels) = host.layer_at(id, frame as f64 / fps, source).or_else(|| host.layer(id, source))
+            && let Some(pixels) = pixels()
         {
             let full = |frames: &std::collections::HashMap<i64, crate::LayerPixels>| {
                 !frames.is_empty()
@@ -2142,11 +2164,39 @@ mod tests {
         params.values.insert("particle/particleType".into(), Value::Enum(0));
         let ctx = EffectCtx { params: &params, time: 1.0, layer_size: [64.0; 2], seed: 1, adjustment: false, env: EffectEnv::default() };
         assert!((pw_phys(&ctx).rate - 60.0).abs() < 1e-9);
+        params.values.insert("texture/layer".into(), Value::Layer(Some(42)));
         for kind in [1, 8, 9, 10, 12] {
             params.values.insert("particle/particleType".into(), Value::Enum(kind));
             let ctx = EffectCtx { params: &params, time: 1.0, layer_size: [64.0; 2], seed: 1, adjustment: false, env: EffectEnv::default() };
             assert!((pw_phys(&ctx).rate - 1.2).abs() < 1e-9);
         }
+    }
+
+    #[test]
+    fn particle_world_unassigned_square_uses_small_points_without_changing_textures() {
+        let mut params = pw_params();
+        for (id, value) in [
+            ("particle/particleType", Value::Enum(8)),
+            ("birthRate", num(0.05)),
+            ("longevity", num(10.0)),
+            ("physics/velocity", num(0.0)),
+            ("physics/gravity", num(0.0)),
+            ("particle/birthSize", num(1.0)),
+            ("particle/deathSize", num(1.0)),
+            ("particle/sizeVariation", num(0.0)),
+        ] {
+            params.values.insert(id.into(), value);
+        }
+        let input = Buf { img: Image::new(200, 100), offset: [0.0; 2], scale: 1.0 };
+        let ctx = EffectCtx { params: &params, time: 17.5, layer_size: [200.0, 100.0], seed: 1, adjustment: false, env: EffectEnv::default() };
+        let points = particle_world_layout(&ctx, &input).unwrap();
+        assert!(points.sprites.len() > 2900, "pre-roll reaches steady-state density");
+        assert!(points.sprites.iter().all(|s| matches!(s.sprite.shape, Shape::Faded) && s.sprite.r < 2.0));
+        params.values.insert("texture/layer".into(), Value::Layer(Some(42)));
+        let ctx = EffectCtx { params: &params, time: 17.5, layer_size: [200.0, 100.0], seed: 1, adjustment: false, env: EffectEnv::default() };
+        let textures = particle_world_layout(&ctx, &input).unwrap();
+        assert!(textures.sprites.len() <= 61);
+        assert!(textures.sprites.iter().all(|s| matches!(s.sprite.shape, Shape::Square) && s.sprite.r > 10.0));
     }
 
     #[test]
@@ -2661,6 +2711,43 @@ mod tests {
             };
             texture_particles(&ctx, Buf { img: Image::new(8, 8), offset: [0.0; 2], scale: 1.0 }, &plan);
             assert_eq!(*host.0.lock().unwrap(), vec![expected]);
+        }
+    }
+
+    #[test]
+    fn particle_texture_missing_birth_frame_does_not_use_current_frame() {
+        struct LimitedTexture;
+        impl crate::EffectHost for LimitedTexture {
+            fn layer(&self, _: u64, _: bool) -> Option<crate::LayerPixels> {
+                Some(crate::LayerPixels { buf: Buf { img: Image::filled(8, 8, [1.0; 4]), offset: [0.0; 2], scale: 1.0 }, size: [8.0; 2] })
+            }
+            fn layer_at(&self, id: u64, time: f64, effects: bool) -> Option<crate::LayerPixels> {
+                (0.0..1.0).contains(&time).then(|| self.layer(id, effects)).flatten()
+            }
+            fn audio(&self, _: u64, _: f64, _: usize, _: u32) -> Option<Vec<f32>> {
+                None
+            }
+        }
+        let mut params = pw_params();
+        params.values.insert("texture/layer".into(), Value::Layer(Some(42)));
+        params.values.insert("particle/particleType".into(), Value::Enum(8));
+        let plan = WorldPlan {
+            sprites: vec![WorldSprite { sprite: type_sprite(8, 4.0, 4.0, 2.0, [1.0; 4], 0.0, 0.0, 0.0), age: 0.5, id: 1 }],
+            mode: 0,
+            original: false,
+        };
+        for (mode, time, in_point, visible) in [(0, 0.0, 0.0, false), (0, 0.75, 0.0, true), (2, 0.0, 0.75, false), (1, 0.0, 0.0, true)] {
+            params.values.insert("texture/time".into(), Value::Enum(mode));
+            let ctx = EffectCtx {
+                params: &params,
+                time: 2.0,
+                layer_size: [8.0; 2],
+                seed: 1,
+                adjustment: false,
+                env: EffectEnv { host: Some(&LimitedTexture), comp_time: time, layer_in_point: in_point, frame_rate: 24.0, ..Default::default() },
+            };
+            let out = texture_particles(&ctx, Buf { img: Image::new(8, 8), offset: [0.0; 2], scale: 1.0 }, &plan);
+            assert_eq!(out.img.data.iter().any(|p| p[3] > 0.0), visible, "texture mode {mode}, comp time {time}");
         }
     }
 
