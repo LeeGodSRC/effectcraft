@@ -179,7 +179,7 @@ fn bevel_edges(e: &mut Enc, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
 // ---------------------------------------------------------------- Gaussian Blur (Legacy) (obsolete.rs)
 
 fn gaussian_legacy(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
-    let s = ctx.params.f("blurriness").max(0.0) * 0.5 * b.scale;
+    let s = ctx.params.f("blurriness").max(0.0) * 0.375 * b.scale;
     if s <= 0.0 {
         return Some(b);
     }

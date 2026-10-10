@@ -638,6 +638,9 @@ fn fxn_fractal(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (kind == 7u) {
         raw = best;
     }
+    if (P.u[1].z != 0u) {
+        raw = 1.0 - raw;
+    }
     var val = (raw - 0.5) * P.f[1].x + 0.5 + P.f[1].y;
     let ov = P.u[1].w;
     if (ov == 0u) {
@@ -647,9 +650,6 @@ fn fxn_fractal(@builtin(global_invocation_id) gid: vec3<u32>) {
     } else if (ov == 2u) {
         let t = val - 2.0 * floor(val / 2.0);
         val = select(t, 2.0 - t, t > 1.0);
-    }
-    if (P.u[1].z != 0u) {
-        val = 1.0 - val;
     }
     let op = P.f[1].z;
     let s = vec4<f32>(vec3<f32>(val * op), op);
