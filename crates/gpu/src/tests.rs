@@ -745,3 +745,182 @@ fn within_memory_returns_the_work_when_there_is_room() {
     let img = g.within_memory(|| g.ctx.image(64, 32)).expect("room for a 64×32 texture");
     assert_eq!((img.width, img.height), (64, 32));
 }
+
+/// A device of its own, so pool counters and a destroyed device stay out of the shared one.
+#[cfg(not(target_arch = "wasm32"))]
+fn own_gpu() -> Option<Gpu> {
+    hold_gpu_lock();
+    let g = Gpu::headless();
+    if g.is_none() {
+        eprintln!("effectcraft-gpu tests: no GPU adapter, skipping");
+    }
+    g
+}
+
+/// A long run of passes reuses the textures it releases instead of allocating a new one per
+/// pass until its encoder is submitted: that took 30 GB of video memory for one 1080p frame of
+/// a heavy comp and lost the device (and with it the app's window).
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_long_run_of_passes_reuses_its_textures() {
+    use crate::context::Enc;
+    let Some(g) = own_gpu() else { return };
+    let mut e = Enc::new(&g.ctx);
+    let mut img = e.image(1024, 1024);
+    // 64 passes of 16 MB each: 1 GB if none were reused.
+    for i in 0..64 {
+        img = crate::ops::quantize(&mut e, &img, if i % 2 == 0 { 255.0 } else { 65535.0 });
+    }
+    let out = e.download(&img).expect("readback");
+    assert_eq!((out.width, out.height), (1024, 1024));
+    let u = g.ctx.pool_usage();
+    assert!(u.peak_bytes < 512 << 20, "peak working textures: {} MB", u.peak_bytes >> 20);
+    assert!(u.hits > 32, "released textures were reused: {u:?}");
+    assert!(!g.ctx.memory_pressure());
+    drop((img, e));
+    let u = g.ctx.pool_usage();
+    assert_eq!(u.waiting_bytes, 0, "nothing waits once every encoder is submitted or dropped");
+    assert!(u.live_bytes <= 768 << 20, "only the free pool stays: {u:?}");
+}
+
+/// An encoder left open while other work runs (the comp walk waiting for a layer's pixels,
+/// whose effect chains have encoders of their own) pins what that work releases; parked, it
+/// does not.
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_parked_encoder_does_not_pin_nested_work() {
+    use crate::context::Enc;
+    let run = |park: bool| -> Option<usize> {
+        let g = own_gpu()?;
+        let mut outer = Enc::new(&g.ctx);
+        let canvas = outer.image(64, 64);
+        let canvas = crate::ops::quantize(&mut outer, &canvas, 255.0);
+        if park {
+            outer.park();
+        }
+        {
+            let mut inner = Enc::new(&g.ctx);
+            let mut img = inner.image(1024, 1024);
+            for i in 0..64 {
+                img = crate::ops::quantize(&mut inner, &img, if i % 2 == 0 { 255.0 } else { 65535.0 });
+            }
+            inner.download(&img)?;
+        }
+        outer.download(&canvas)?;
+        Some(g.ctx.pool_usage().peak_bytes)
+    };
+    let (Some(pinned), Some(parked)) = (run(false), run(true)) else { return };
+    assert!(parked < 512 << 20, "parked: {} MB", parked >> 20);
+    assert!(pinned > parked, "an open outer encoder pins nested work: {} MB vs {} MB", pinned >> 20, parked >> 20);
+}
+
+/// The oldest free textures make room for newly released ones, so the pool holds the sizes in
+/// use now, and its accounting follows what it drops.
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn the_free_pool_keeps_the_newest_sizes_within_its_budget() {
+    use crate::context::Enc;
+    let Some(g) = own_gpu() else { return };
+    // 2048² is 64 MB: 16 of them overflow the 768 MB pool.
+    let sizes: Vec<u32> = (0..16).map(|i| 2048 + i).collect();
+    for s in &sizes {
+        let mut e = Enc::new(&g.ctx);
+        drop(e.image(*s, 2048));
+    }
+    let u = g.ctx.pool_usage();
+    assert!(u.live_bytes <= 768 << 20, "{u:?}");
+    assert_eq!(u.misses, 16);
+    // The newest size is still there; the oldest was dropped.
+    let mut e = Enc::new(&g.ctx);
+    drop(e.scratch(2048 + 15, 2048));
+    assert_eq!(g.ctx.pool_usage().hits, 1);
+    drop(e.scratch(2048, 2048));
+    assert_eq!(g.ctx.pool_usage().hits, 1, "the oldest size made room");
+    drop(e);
+    g.ctx.clear_uploads();
+    assert_eq!(g.ctx.pool_usage().live_bytes, 0);
+}
+
+/// After its device is lost the compositor stops instead of panicking: `create_buffer_init`
+/// panics on a lost device ("Failed to get mapped range for buffer created with
+/// mapped_at_creation"), which every frame thread hit about twenty times after a device loss.
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_lost_device_stops_the_compositor_without_panicking() {
+    use crate::context::Enc;
+    let Some(g) = own_gpu() else { return };
+    let mut e = Enc::new(&g.ctx);
+    let img = e.image(64, 64);
+    let img = crate::ops::quantize(&mut e, &img, 255.0);
+    assert!(e.download(&img).is_some());
+    assert!(!g.ctx.is_retired());
+    g.ctx.device.destroy();
+    let _ = g.ctx.device.poll(wgpu::PollType::Poll);
+    assert!(g.ctx.is_retired(), "the device-lost callback retires the context");
+    assert!(g.ctx.check_health().is_err_and(|e| e.contains("lost")));
+    // Work in progress keeps going through the same calls: none of them may panic.
+    let after = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let next = crate::ops::quantize(&mut e, &img, 65535.0);
+        let _ = e.data(&[1.0, 2.0, 3.0]);
+        let _ = e.bytes(vec![1, 2, 3]);
+        let _ = g.ctx.buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: &[0; 64], usage: wgpu::BufferUsages::UNIFORM });
+        e.submit();
+        e.download(&next)
+    }));
+    assert!(matches!(after, Ok(None)), "no panic and no pixels from a lost device");
+    assert!(g.within_memory(|| ()).is_err());
+    let scene = Scene::new(BitDepth::default());
+    let r = Renderer::new(&scene.p, &Pattern, RenderOpts::default());
+    assert!(g.render(&r, scene.cid, Tick::ZERO).is_none(), "the CPU renders the frame");
+    assert!(g.render_display(&r, scene.cid, Tick::ZERO).is_none());
+}
+
+/// Running out of video memory abandons the work in progress (its frames render on the CPU)
+/// and leaves the compositor usable, instead of recording passes on a texture the device
+/// refused: those were validation errors, which retire the compositor for good.
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn running_out_of_video_memory_abandons_the_work_in_progress() {
+    use crate::context::Enc;
+    let Some(g) = own_gpu() else { return };
+    let scene = Scene::new(BitDepth::default());
+    let r = Renderer::new(&scene.p, &Pattern, RenderOpts::default());
+    let failed = g.within_memory(|| {
+        let mut e = Enc::new(&g.ctx);
+        let img = e.image(64, 64);
+        assert!(!e.dead());
+        // What `GpuContext::texture` does when the device refuses an allocation.
+        g.ctx.out_of_memory("synthetic");
+        assert!(e.dead());
+        let next = crate::ops::quantize(&mut e, &img, 255.0);
+        e.download(&next)
+    });
+    assert_eq!(failed.err().as_deref(), Some("out of video memory"));
+    assert!(g.ctx.check_health().is_ok(), "the device is fine: only that work was abandoned");
+    assert!(g.ctx.pool_usage().live_bytes < 1 << 20, "what was kept for reuse was released");
+    // The next frame renders on the GPU again.
+    assert!(g.within_memory(|| g.render(&r, scene.cid, Tick::ZERO)).is_ok_and(|f| f.is_some()));
+}
+
+/// Frames are admitted to the GPU while the working textures have room for them; the rest
+/// render on the CPU (frame threads start up to sixteen at once).
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn frames_are_admitted_within_the_working_budget() {
+    use crate::context::Enc;
+    let Some(g) = own_gpu() else { return };
+    // Nothing allocated yet: each frame reserves 512 MB of the 3 GB budget.
+    let mut slots: Vec<_> = (0..16).map_while(|_| g.ctx.admit_frame()).collect();
+    assert_eq!(slots.len(), 7);
+    assert!(g.ctx.admit_frame().is_none());
+    slots.pop();
+    assert!(g.ctx.admit_frame().is_some(), "a finished frame makes room");
+    slots.clear();
+    // A frame holding 1 GB of working textures leaves room for fewer.
+    let mut e = Enc::new(&g.ctx);
+    let held: Vec<_> = (0..16).map(|_| e.image(2048, 2048)).collect();
+    assert_eq!(g.ctx.pool_usage().live_bytes, 16 * 2048 * 2048 * 16);
+    let slots: Vec<_> = (0..16).map_while(|_| g.ctx.admit_frame()).collect();
+    assert_eq!(slots.len(), 5);
+    drop((held, e, slots));
+}

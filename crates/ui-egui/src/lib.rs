@@ -113,6 +113,11 @@ pub struct Hooks {
     /// Application actions the OS performs (`app.hide`, `app.hideOthers`, `app.showAll` on
     /// macOS). Returns false when the host doesn't handle the id.
     pub app_action: Option<Box<dyn Fn(&str) -> bool>>,
+    /// The window's graphics device was lost: nothing can be drawn any more, and eframe's
+    /// renderer panics on the next paint (it cannot recreate the device). Called once, before
+    /// that paint, after the recovery copy was written. The desktop app restarts itself (or
+    /// exits with a message) from here instead of returning to a paint that aborts the process.
+    pub presentation_lost: Option<Box<dyn Fn(&gpu_failure::PresentationLost)>>,
 }
 
 impl Hooks {
@@ -253,6 +258,8 @@ pub struct EffectcraftApp {
     gpu_checked: bool,
     gpu_failures: Option<gpu_failure::GpuFailureBridge>,
     gpu_failure_applied: Option<bool>,
+    /// The document as of the last frame, for the recovery copy of a lost graphics device.
+    recovery_slot: gpu_failure::RecoverySlot,
     /// Commands from the native menu bar.
     pub command_inbox: Option<Receiver<String>>,
     /// Pointer position in comp pixels (Info panel).
@@ -327,6 +334,7 @@ impl EffectcraftApp {
             gpu_checked: false,
             gpu_failures: None,
             gpu_failure_applied: None,
+            recovery_slot: Default::default(),
             command_inbox: None,
             pointer_comp: None,
             dialog_state: Default::default(),
@@ -520,7 +528,29 @@ impl EffectcraftApp {
         self.gpu_failures = Some(bridge);
     }
 
+    /// The document snapshot a recovery copy is written from (shared with the host's panic
+    /// hook, for a device loss that lands in the middle of a paint).
+    pub fn recovery_slot(&self) -> gpu_failure::RecoverySlot {
+        self.recovery_slot.clone()
+    }
+
+    /// Keep the GPU compositor off for this session (everything composites on the CPU): the
+    /// launch after a lost graphics device, which the compositor may have caused.
+    pub fn disable_gpu_compositor(&mut self, reason: &str) {
+        self.gpu_checked = true;
+        self.gpu = None;
+        self.session.accel = None;
+        self.session.accel_note = Some(reason.to_string());
+    }
+
+    /// React to a device failure reported since the last call. Hosts call this once more
+    /// after the frame's UI, so a device lost during it is handled before the paint.
+    pub fn poll_gpu_failure(&mut self, ctx: &egui::Context) {
+        self.apply_gpu_failure(ctx);
+    }
+
     fn apply_gpu_failure(&mut self, ctx: &egui::Context) {
+        self.recovery_slot.update(&self.session);
         let Some(bridge) = &self.gpu_failures else { return };
         // Readback deadlines can retire the compositor without a host device notification.
         if let Some(gpu) = &self.gpu
@@ -564,6 +594,22 @@ impl EffectcraftApp {
         };
         log::warn!("GPU preview retired: {}", failure.reason);
         ctx.request_repaint();
+        if failure.presentation_lost {
+            // The next paint goes through the lost device and panics inside eframe: keep the
+            // work first, then let the host leave before that paint.
+            let recovery = self.recovery_slot.write();
+            match &recovery {
+                Some(Ok(path)) => {
+                    log::error!("graphics device lost; recovery copy saved to {path}");
+                    self.ui.status = format!("Graphics device lost. A recovery copy was saved to {path}; presentation requires restarting the application.");
+                }
+                Some(Err(e)) => log::error!("graphics device lost; {e}"),
+                None => log::error!("graphics device lost; the project had no unsaved changes"),
+            }
+            if let Some(hook) = &self.hooks.presentation_lost {
+                hook(&gpu_failure::PresentationLost { reason: failure.reason.clone(), project: self.session.path.clone(), recovery });
+            }
+        }
     }
 
     /// Set up the GPU compositor on egui-wgpu's device (once). Without an adapter that runs
@@ -1679,6 +1725,57 @@ mod fit_window_tests {
 #[cfg(test)]
 mod gpu_failure_tests {
     use super::*;
+
+    /// A lost window device: the recovery copy is on disk before the host is told, and the
+    /// host is told exactly once (the desktop app leaves from that call, before eframe paints
+    /// through the lost device, which aborted the process).
+    #[test]
+    fn a_lost_presentation_device_saves_a_recovery_copy_then_tells_the_host() {
+        let d = std::env::temp_dir().join(format!("ec-presentation-lost-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let mut session = Session::default();
+        session.execute("comp.new", json!({"name": "Work", "width": 4, "height": 4, "duration": 1})).unwrap();
+        let project = d.join("Film.ecproj").to_string_lossy().to_string();
+        session.execute("file.saveAs", json!({"path": project})).unwrap();
+        session.execute("layer.newNull", json!({"name": "unsaved work"})).unwrap();
+        let mut app = EffectcraftApp::new(session);
+        let ctx = egui::Context::default();
+        let bridge = gpu_failure::GpuFailureBridge::new(&ctx);
+        app.set_gpu_failure_bridge(bridge.clone());
+        let told: Arc<std::sync::Mutex<Vec<(gpu_failure::PresentationLost, bool)>>> = Arc::default();
+        let seen = told.clone();
+        app.hooks.presentation_lost = Some(Box::new(move |lost| {
+            let on_disk = lost.recovery.as_ref().is_some_and(|r| r.as_ref().is_ok_and(|p| std::path::Path::new(p).is_file()));
+            seen.lock().unwrap().push((lost.clone(), on_disk));
+        }));
+        // A compositor failure alone keeps the window: the host is not told.
+        bridge.report("uncaptured GPU error", false);
+        app.poll_gpu_failure(&ctx);
+        assert!(told.lock().unwrap().is_empty());
+        bridge.report("GPU device lost (Unknown): Device is lost", true);
+        app.poll_gpu_failure(&ctx);
+        app.poll_gpu_failure(&ctx);
+        let told = told.lock().unwrap();
+        assert_eq!(told.len(), 1, "told once");
+        let (lost, on_disk) = &told[0];
+        assert!(on_disk, "the copy was written before the host was told: {lost:?}");
+        assert_eq!(lost.project.as_deref(), Some(project.as_str()));
+        let copy = lost.recovery.clone().unwrap().unwrap();
+        assert!(copy.ends_with("Film auto-save 1.ecproj"), "{copy}");
+        assert!(app.ui.status.contains(&copy), "{}", app.ui.status);
+        assert!(app.session.is_dirty(), "the document is untouched");
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    /// The launch after a lost device keeps the GPU compositor off.
+    #[test]
+    fn a_disabled_gpu_compositor_is_not_set_up() {
+        let mut app = EffectcraftApp::new(Session::default());
+        app.disable_gpu_compositor("off after a lost graphics device");
+        assert!(app.gpu_checked && app.gpu.is_none() && app.session.accel.is_none());
+        assert_eq!(app.session.accel_note.as_deref(), Some("off after a lost graphics device"));
+    }
 
     #[test]
     fn host_failure_preserves_document_undo_and_cpu_pixels_and_detaches_late_readbacks() {

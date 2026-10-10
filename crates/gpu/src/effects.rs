@@ -67,6 +67,9 @@ pub(crate) fn run_chain(e: &mut Enc, chain: &[FxStep], buf: &Buf, levels: Option
     let misses = deferred.as_ref().map(|d| d.misses());
     let mut b = GBuf { img: e.g.upload_image(&buf.img)?, offset: buf.offset, scale: buf.scale };
     for step in chain {
+        if e.dead() {
+            return None;
+        }
         b = apply(e, step.spec.id, &step.ctx, b)?;
         if let Some(l) = levels {
             b.img = ops::quantize(e, &b.img, l);

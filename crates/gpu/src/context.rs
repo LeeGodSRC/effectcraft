@@ -47,6 +47,33 @@ const UPLOAD_BUDGET: usize = 1536 << 20;
 /// Working textures kept for reuse once their last image is dropped (bytes).
 const POOL_BUDGET: usize = 768 << 20;
 
+/// Video memory a frame is assumed to need before it has allocated anything, when admitting
+/// several at once ([`GpuContext::admit_frame`]).
+const FRAME_RESERVE: usize = 512 << 20;
+
+/// The share of the driver's memory budget (percent) above which the device refuses new
+/// textures and buffers with an out-of-memory error, for the instance descriptor of every
+/// device the compositor runs on (`wgpu::MemoryBudgetThresholds::for_resource_creation`).
+/// Past the budget itself the driver fails command submission instead, which loses the device.
+pub const MEMORY_BUDGET_PERCENT: u8 = 80;
+
+/// Readback staging buffers kept for reuse (bytes).
+const STAGING_BUDGET: u64 = 512 << 20;
+
+/// Released working textures waiting for open encoders (bytes) above which every encoder is
+/// submitted as soon as it has recorded something, so the waiting textures become reusable. A
+/// released texture waits for every encoder open at its release ([`Pool`]); with a comp walk
+/// and two dozen effect chains (the CPU renderer runs layers in parallel) holding encoders open
+/// across each other's work, nothing was ever reused: one 1080p frame of a heavy comp
+/// allocated 1250 working textures, 30 GB alive at once, which filled video memory, spilled
+/// 20 GB into system memory and lost the device.
+const RECLAIM_BYTES: usize = 256 << 20;
+
+/// Working textures alive at once (leased, waiting or free) above which the compositor reports
+/// [`GpuContext::memory_pressure`]: callers render further frames on the CPU instead of
+/// starting more GPU work (bytes).
+const WORK_BUDGET: usize = 3 << 30;
+
 /// A GPU image: premultiplied RGBA f32 in a texture (cheap to clone; immutable once written).
 /// Working images come from the context's texture pool and go back to it when the last clone
 /// is dropped.
@@ -100,15 +127,38 @@ impl Drop for Lease {
 #[derive(Default)]
 pub(crate) struct Pool {
     free: HashMap<(u32, u32), Vec<wgpu::Texture>>,
+    /// The sizes of the free textures, oldest first: over budget the oldest go, so the pool
+    /// holds the sizes the current work uses rather than whichever filled it first.
+    free_order: std::collections::VecDeque<(u32, u32)>,
     /// (texture, newest encoder open at its release).
     released: Vec<(wgpu::Texture, u64)>,
     /// Encoders with recorded, unsubmitted work.
     open: BTreeSet<u64>,
     next: u64,
     bytes: usize,
+    /// Bytes of the textures in `released`.
+    released_bytes: usize,
+    /// Bytes of every working texture this pool handed out and has not dropped (leased,
+    /// released or free), and the most that was ever alive.
+    live_bytes: usize,
+    peak_bytes: usize,
     /// Working textures reused / newly allocated (diagnostics, tests).
     hits: u64,
     misses: u64,
+}
+
+/// A snapshot of the working-texture pool ([`GpuContext::pool_usage`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PoolUsage {
+    /// Working textures alive now (leased, waiting for a submission, or free), in bytes.
+    pub live_bytes: usize,
+    /// The most that was alive at once.
+    pub peak_bytes: usize,
+    /// Of `live_bytes`: released, waiting for an open encoder's submission.
+    pub waiting_bytes: usize,
+    /// Working textures reused / newly allocated.
+    pub hits: u64,
+    pub misses: u64,
 }
 
 /// Counts of uploads (CPU → GPU) and readbacks (GPU → CPU).
@@ -145,18 +195,32 @@ fn tex_bytes(t: &wgpu::Texture) -> usize {
 impl Pool {
     fn release(&mut self, t: wgpu::Texture) {
         match self.open.last() {
-            Some(&newest) => self.released.push((t, newest)),
+            Some(&newest) => {
+                self.released_bytes = self.released_bytes.saturating_add(tex_bytes(&t));
+                self.released.push((t, newest));
+            }
             None => self.make_free(t),
         }
     }
 
     fn make_free(&mut self, t: wgpu::Texture) {
         let b = tex_bytes(&t);
-        if self.bytes + b > POOL_BUDGET {
+        if b > POOL_BUDGET {
+            // Dropped: the device frees it once the submissions using it have completed.
+            self.live_bytes = self.live_bytes.saturating_sub(b);
             return;
         }
+        while self.bytes + b > POOL_BUDGET {
+            let Some(key) = self.free_order.pop_front() else { break };
+            let Some(v) = self.free.get_mut(&key).filter(|v| !v.is_empty()) else { continue };
+            let old = tex_bytes(&v.remove(0));
+            self.bytes = self.bytes.saturating_sub(old);
+            self.live_bytes = self.live_bytes.saturating_sub(old);
+        }
         self.bytes += b;
-        self.free.entry((t.width(), t.height())).or_default().push(t);
+        let key = (t.width(), t.height());
+        self.free.entry(key).or_default().push(t);
+        self.free_order.push_back(key);
     }
 
     fn open(&mut self) -> u64 {
@@ -175,16 +239,33 @@ impl Pool {
         let (ready, wait): (Vec<_>, Vec<_>) = std::mem::take(&mut self.released).into_iter().partition(|(_, w)| *w < oldest);
         self.released = wait;
         for (t, _) in ready {
+            self.released_bytes = self.released_bytes.saturating_sub(tex_bytes(&t));
             self.make_free(t);
         }
+    }
+
+    /// A working texture was newly allocated.
+    fn allocated(&mut self, bytes: usize) {
+        self.live_bytes = self.live_bytes.saturating_add(bytes);
+        self.peak_bytes = self.peak_bytes.max(self.live_bytes);
+    }
+
+    /// More than [`RECLAIM_BYTES`] of released textures wait for open encoders: every
+    /// encoder is then submitted as soon as it has recorded something, so that none stays
+    /// open across CPU work and the waiting textures become reusable.
+    fn under_pressure(&self) -> bool {
+        self.released_bytes > RECLAIM_BYTES
     }
 
     fn take(&mut self, w: u32, h: u32) -> Option<wgpu::Texture> {
         let t = self.free.get_mut(&(w, h)).and_then(Vec::pop);
         match &t {
             Some(t) => {
-                self.bytes -= tex_bytes(t);
+                self.bytes = self.bytes.saturating_sub(tex_bytes(t));
                 self.hits += 1;
+                if let Some(i) = self.free_order.iter().rposition(|k| *k == (w, h)) {
+                    self.free_order.remove(i);
+                }
             }
             None => self.misses += 1,
         }
@@ -193,7 +274,20 @@ impl Pool {
 
     fn clear(&mut self) {
         self.free.clear();
+        self.free_order.clear();
+        self.live_bytes = self.live_bytes.saturating_sub(self.bytes);
         self.bytes = 0;
+    }
+}
+
+/// One frame rendering on the GPU ([`GpuContext::admit_frame`]), until dropped.
+pub struct FrameSlot {
+    frames: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Drop for FrameSlot {
+    fn drop(&mut self) {
+        self.frames.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
 }
 
@@ -255,6 +349,11 @@ pub struct GpuContext {
     pool: Arc<Mutex<Pool>>,
     /// CPU ↔ GPU traffic (diagnostics: `bench --gpu`).
     pub(crate) transfers: Transfers,
+    /// Counts the times the device refused a working texture for lack of memory: work recorded
+    /// across such a refusal is abandoned ([`Enc::dead`], [`crate::Gpu::within_memory`]).
+    oom_epoch: std::sync::atomic::AtomicU64,
+    /// Frames rendering now ([`GpuContext::admit_frame`]).
+    frames: Arc<std::sync::atomic::AtomicUsize>,
     /// Readback staging buffers by size.
     staging: Mutex<HashMap<u64, Vec<wgpu::Buffer>>>,
     /// Transparent read-only images by size (see [`Enc::zeros`]).
@@ -555,6 +654,8 @@ impl GpuContext {
             dummy_buf,
             uploads: Mutex::new(Uploads::default()),
             pool: Default::default(),
+            oom_epoch: Default::default(),
+            frames: Default::default(),
             staging: Default::default(),
             transfers: Default::default(),
             zeros: Default::default(),
@@ -583,6 +684,44 @@ impl GpuContext {
     /// without host forwarding, readbacks rely on poll errors and their deadlines.
     pub fn device_failure_notifier(&self) -> impl Fn(String) + Send + Sync + 'static {
         crate::readback::failure_notifier(&self.readbacks)
+    }
+
+    /// The context is retired: its device failed or was lost, or a readback timed out. Work in
+    /// progress stops recording (a lost device rejects everything, and `create_buffer_init`
+    /// panics on it) and the frame renders on the CPU.
+    pub fn is_retired(&self) -> bool {
+        self.readbacks.is_retired()
+    }
+
+    /// A buffer holding `contents`, like `wgpu::util::DeviceExt::create_buffer_init`, which
+    /// maps the buffer it creates and panics when the device has been lost meanwhile (every
+    /// frame thread did, after a device loss). Here a lost device reports an error instead.
+    pub(crate) fn buffer_init(&self, d: &wgpu::util::BufferInitDescriptor) -> wgpu::Buffer {
+        let len = d.contents.len() as u64;
+        // The same size as `create_buffer_init`: padded to the copy alignment, never empty
+        // unless the contents are.
+        let align = wgpu::COPY_BUFFER_ALIGNMENT;
+        let size = if len == 0 { 0 } else { len.div_ceil(align).saturating_mul(align).max(align) };
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: d.label,
+            size,
+            usage: d.usage | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        if self.is_retired() {
+            // The buffer of a lost device is invalid: writing it is one more error to report.
+            return buffer;
+        }
+        if len == size {
+            if len > 0 {
+                self.queue.write_buffer(&buffer, 0, d.contents);
+            }
+        } else {
+            let mut padded = d.contents.to_vec();
+            padded.resize(size as usize, 0);
+            self.queue.write_buffer(&buffer, 0, &padded);
+        }
+        buffer
     }
 
     /// All device polling routes through this failure bridge.
@@ -686,6 +825,7 @@ impl GpuContext {
             // Match eframe's backend override so CLI and headless acceptance tests
             // exercise the backend requested for the native viewer.
             desc.backends = wgpu::Backends::from_env().unwrap_or(desc.backends);
+            desc.memory_budget_thresholds.for_resource_creation = Some(MEMORY_BUDGET_PERCENT);
         }
         #[cfg(target_arch = "wasm32")]
         {
@@ -737,10 +877,48 @@ impl GpuContext {
 
     /// A new (zeroed) texture of its own (not pooled).
     pub(crate) fn image(&self, w: u32, h: u32) -> GpuImage {
-        GpuImage::new(self.texture(w, h), w, h)
+        GpuImage::new(self.texture(w, h).0, w, h)
     }
 
-    fn texture(&self, w: u32, h: u32) -> wgpu::Texture {
+    /// How often the device has refused a working texture for lack of memory.
+    pub(crate) fn oom_epoch(&self) -> u64 {
+        self.oom_epoch.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// The device refused an allocation: everything kept for reuse goes, and work in progress
+    /// is abandoned (its frames render on the CPU) instead of recording passes on a texture
+    /// that does not exist.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))] // the browser reports it to the host
+    pub(crate) fn out_of_memory(&self, error: &str) {
+        self.oom_epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        log::warn!("gpu: out of video memory ({error}); frames in progress render on the CPU");
+        self.clear_uploads();
+    }
+
+    /// A working texture, and whether the device made it (`false`: out of video memory; the
+    /// handle is then invalid and must not be used or pooled).
+    ///
+    /// Natively the allocation runs in an out-of-memory error scope of its own (thread-local
+    /// and immediately ready, see [`init_resource`]), so running out is noticed here rather
+    /// than as validation errors from every later pass. The browser reports it to the host.
+    fn texture(&self, w: u32, h: u32) -> (wgpu::Texture, bool) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let scope = self.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+            let t = self.texture_unchecked(w, h);
+            match pollster::block_on(scope.pop()) {
+                Some(e) => {
+                    self.out_of_memory(&e.to_string());
+                    (t, false)
+                }
+                None => (t, true),
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        (self.texture_unchecked(w, h), true)
+    }
+
+    fn texture_unchecked(&self, w: u32, h: u32) -> wgpu::Texture {
         self.device.create_texture(&wgpu::TextureDescriptor {
             label: None,
             size: wgpu::Extent3d { width: w.max(1), height: h.max(1), depth_or_array_layers: 1 },
@@ -759,7 +937,20 @@ impl GpuContext {
         let (w, h) = (w.max(1), h.max(1));
         let reused = self.pool.lock().ok().and_then(|mut p| p.take(w, h));
         let was_reused = reused.is_some();
-        let texture = reused.unwrap_or_else(|| self.texture(w, h));
+        let texture = match reused {
+            Some(t) => t,
+            None => {
+                let (t, made) = self.texture(w, h);
+                if !made {
+                    // Never pooled: the caller's work is abandoned ([`Enc::dead`]).
+                    return (GpuImage::new(t, w, h), false);
+                }
+                if let Ok(mut p) = self.pool.lock() {
+                    p.allocated(tex_bytes(&t));
+                }
+                t
+            }
+        };
         let lease = Arc::new(Lease { texture: texture.clone(), pool: Arc::downgrade(&self.pool) });
         (GpuImage { texture, width: w, height: h, _lease: Some(lease), levels: None }, was_reused)
     }
@@ -781,13 +972,46 @@ impl GpuContext {
         self.pool.lock().map(|p| (p.hits, p.misses)).unwrap_or_default()
     }
 
+    /// How much video memory the working textures hold (diagnostics, [`Self::memory_pressure`]).
+    pub fn pool_usage(&self) -> PoolUsage {
+        self.pool
+            .lock()
+            .map(|p| PoolUsage { live_bytes: p.live_bytes, peak_bytes: p.peak_bytes, waiting_bytes: p.released_bytes, hits: p.hits, misses: p.misses })
+            .unwrap_or_default()
+    }
+
+    /// The working textures alive right now exceed the compositor's budget: frames being
+    /// rendered hold more video memory than is safe to add to. Callers render the next frame
+    /// on the CPU rather than starting more GPU work, which would exhaust video memory (the
+    /// driver then loses the device, and with it the window).
+    pub fn memory_pressure(&self) -> bool {
+        self.pool.lock().map(|p| p.live_bytes > WORK_BUDGET).unwrap_or(false)
+    }
+
+    /// Reserve room for one more frame on the GPU; `None` when the frames rendering now already
+    /// hold (or, having just started, are expected to take) the compositor's working budget.
+    /// The caller renders that frame on the CPU. Frame threads start many frames at once, and
+    /// a heavy comp's frame alone takes gigabytes: all of them on the GPU exhausted video
+    /// memory, the driver failed command submission, and the device (and the window) was lost.
+    pub fn admit_frame(&self) -> Option<FrameSlot> {
+        use std::sync::atomic::Ordering;
+        let others = self.frames.fetch_add(1, Ordering::AcqRel);
+        let slot = FrameSlot { frames: self.frames.clone() };
+        let live = self.pool.lock().map(|p| p.live_bytes).unwrap_or(0);
+        (live.saturating_add(others.saturating_mul(FRAME_RESERVE)) <= WORK_BUDGET).then_some(slot)
+    }
+
     /// Upload a CPU image (`None` when it does not fit the device).
     pub fn upload_image(&self, img: &Image) -> Option<GpuImage> {
         if !self.fits(img.width, img.height) {
             return None;
         }
         self.transfers.count(true, img.data.len() * 16);
-        let g = self.image(img.width, img.height);
+        let (texture, made) = self.texture(img.width, img.height);
+        if !made {
+            return None;
+        }
+        let g = GpuImage::new(texture, img.width, img.height);
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo { texture: &g.texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
             bytemuck::cast_slice(&img.data),
@@ -859,6 +1083,8 @@ pub(crate) struct Enc<'g> {
     /// The open command encoder and its id in the texture pool.
     enc: Option<(wgpu::CommandEncoder, u64)>,
     pending: usize,
+    /// [`GpuContext::oom_epoch`] when this work started.
+    epoch: u64,
 }
 
 impl Drop for Enc<'_> {
@@ -874,7 +1100,14 @@ impl Drop for Enc<'_> {
 
 impl<'g> Enc<'g> {
     pub fn new(g: &'g GpuContext) -> Enc<'g> {
-        Enc { g, enc: None, pending: 0 }
+        Enc { g, enc: None, pending: 0, epoch: g.oom_epoch() }
+    }
+
+    /// This work cannot finish: the device failed or was lost, or ran out of video memory
+    /// since it started (some texture of it may not exist). Nothing more is recorded and
+    /// nothing is read back; the caller's result is `None` and the CPU renders instead.
+    pub fn dead(&self) -> bool {
+        self.g.is_retired() || self.g.oom_epoch() != self.epoch
     }
 
     pub(crate) fn encoder(&mut self) -> &mut wgpu::CommandEncoder {
@@ -888,8 +1121,38 @@ impl<'g> Enc<'g> {
             .0
     }
 
+    /// Submit the recorded work early while released textures pile up (see [`RECLAIM_BYTES`]),
+    /// so the pool can reuse them instead of allocating a new one for every pass.
+    fn reclaim(&mut self) {
+        if self.enc.is_some() && self.g.pool.lock().is_ok_and(|p| p.under_pressure()) {
+            self.submit();
+        }
+    }
+
+    /// One more pass or copy was recorded. Command buffers (and the transient textures they
+    /// hold) stay bounded: submitted every 256 records, or at once while released textures
+    /// pile up behind open encoders (other threads' effect chains run next to this one).
+    fn recorded(&mut self) {
+        self.pending += 1;
+        if self.pending >= 256 {
+            self.submit();
+        } else {
+            self.reclaim();
+        }
+    }
+
+    /// Submit the recorded work before handing control to the CPU renderer for layer content.
+    /// That can take seconds and run nested GPU work (effect chains, precomps) with encoders
+    /// of its own; an open encoder here would keep every texture they release from being
+    /// reused until it is submitted (see [`Pool`]), so each of their passes allocated a new
+    /// one: 30 GB of working textures for one 1080p frame of a deep precomp tree.
+    pub fn park(&mut self) {
+        self.submit();
+    }
+
     /// A new zeroed image (pooled; a reused texture is cleared by a kernel).
     pub fn image(&mut self, w: u32, h: u32) -> GpuImage {
+        self.reclaim();
         let (img, reused) = self.g.pooled(w, h);
         if reused {
             self.fill(&img, 0.0);
@@ -900,6 +1163,7 @@ impl<'g> Enc<'g> {
     /// A new image for a kernel that writes every pixel of it (pooled; contents undefined).
     /// Under test it starts out as NaNs, so a kernel that skips pixels fails the CPU oracle.
     pub fn scratch(&mut self, w: u32, h: u32) -> GpuImage {
+        self.reclaim();
         let (img, _) = self.g.pooled(w, h);
         if cfg!(test) {
             self.fill(&img, f32::NAN);
@@ -914,7 +1178,16 @@ impl<'g> Enc<'g> {
         if z.len() > 8 && !z.contains_key(&(w, h)) {
             z.clear();
         }
-        z.entry((w, h)).or_insert_with(|| self.g.image(w, h)).clone()
+        if let Some(img) = z.get(&(w, h)) {
+            return img.clone();
+        }
+        let (texture, made) = self.g.texture(w, h);
+        let img = GpuImage::new(texture, w, h);
+        // A texture the device refused is not kept (the work using it is abandoned).
+        if made {
+            z.insert((w, h), img.clone());
+        }
+        img
     }
 
     /// Set every pixel of `img` to `v`.
@@ -957,7 +1230,12 @@ impl<'g> Enc<'g> {
             log::error!("gpu: no kernel {entry}");
             return;
         };
-        let ub = g.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: &p.bytes(), usage: wgpu::BufferUsages::UNIFORM });
+        // A lost device rejects everything, and after running out of memory a texture here
+        // may not exist: stop recording (the caller's result is then `None`).
+        if self.dead() {
+            return;
+        }
+        let ub = g.buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: &p.bytes(), usage: wgpu::BufferUsages::UNIFORM });
         let sv = src.texture.create_view(&Default::default());
         let av = aux.map(|a| a.texture.create_view(&Default::default()));
         let ov = out.texture.create_view(&Default::default());
@@ -994,11 +1272,7 @@ impl<'g> Enc<'g> {
             }
             pass.dispatch_workgroups(groups.0.max(1), groups.1.max(1), 1);
         }
-        self.pending += 1;
-        // Keep command buffers (and the transient textures they hold) bounded.
-        if self.pending >= 256 {
-            self.submit();
-        }
+        self.recorded();
     }
 
     /// Per-pixel kernel over `out`'s size (16×16 workgroups).
@@ -1009,12 +1283,16 @@ impl<'g> Enc<'g> {
 
     /// Copy `src` into a larger zeroed image at (`x`, `y`) (Buf::pad).
     pub fn copy_into(&mut self, src: &GpuImage, dst: &GpuImage, x: u32, y: u32) {
+        if self.dead() {
+            return;
+        }
         let enc = self.encoder();
         enc.copy_texture_to_texture(
             wgpu::TexelCopyTextureInfo { texture: &src.texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
             wgpu::TexelCopyTextureInfo { texture: &dst.texture, mip_level: 0, origin: wgpu::Origin3d { x, y, z: 0 }, aspect: wgpu::TextureAspect::All },
             wgpu::Extent3d { width: src.width, height: src.height, depth_or_array_layers: 1 },
         );
+        self.recorded();
     }
 
     /// Submit recorded work.
@@ -1055,7 +1333,7 @@ impl<'g> Enc<'g> {
 
     /// [`Enc::read_texture`] into `out` (`w × bpp × h` bytes), through a reused staging buffer.
     fn read_texture_into(&mut self, texture: &wgpu::Texture, w: u32, h: u32, bpp: u32, out: &mut [u8]) -> Option<()> {
-        if !self.g.can_wait() {
+        if !self.g.can_wait() || self.dead() {
             return None;
         }
         self.g.transfers.count(false, out.len());
@@ -1090,6 +1368,11 @@ impl<'g> Enc<'g> {
         out.copy_from_slice(&bytes);
         // Keep a few staging buffers per size (frames read back at the same size every time).
         if let Ok(mut s) = self.g.staging.lock() {
+            // …and not for every size a heavy frame's effect chains read back at: bounded.
+            let held: u64 = s.iter().map(|(size, v)| size.saturating_mul(v.len() as u64)).sum();
+            if held.saturating_add(size) > STAGING_BUDGET {
+                s.clear();
+            }
             let v = s.entry(size).or_default();
             if v.len() < 2 && size <= 256 << 20 {
                 v.push(buf);
@@ -1105,6 +1388,10 @@ impl<'g> Enc<'g> {
         if let Err(e) = self.g.readbacks.check() {
             log::error!("gpu readback: {e}");
             crate::readback::reject(done, e);
+            return;
+        }
+        if self.dead() {
+            crate::readback::reject(done, "out of video memory".into());
             return;
         }
         let layout = match crate::readback::Layout::new(w, h, bpp, self.g.device.limits().max_buffer_size) {
@@ -1168,6 +1455,9 @@ impl<'g> Enc<'g> {
     /// through `data`: (buffer, row length in pixels).
     pub fn image_rows(&mut self, img: &GpuImage) -> (wgpu::Buffer, u32) {
         let row = (img.width * 16).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        if self.dead() {
+            return (self.g.dummy_buf.clone(), row / 16);
+        }
         let buf = self.g.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("image rows"),
             size: row as u64 * img.height as u64,
@@ -1190,7 +1480,7 @@ impl<'g> Enc<'g> {
         while bytes.len() < 16 || !bytes.len().is_multiple_of(4) {
             bytes.push(0);
         }
-        self.g.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("data"), contents: &bytes, usage: wgpu::BufferUsages::STORAGE })
+        self.g.buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("data"), contents: &bytes, usage: wgpu::BufferUsages::STORAGE })
     }
 
     /// Convert to the viewer's premultiplied RGBA8 texture (egui-wgpu's native texture format),

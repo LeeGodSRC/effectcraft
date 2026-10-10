@@ -15,7 +15,6 @@
 use effectcraft_render::three_d::Dof;
 use effectcraft_render::three_d::adv::{Prepared, Rendered, Scene, Target};
 use effectcraft_render::three_d::bokeh;
-use wgpu::util::DeviceExt;
 
 use crate::context::{Enc, GpuContext, GpuImage};
 
@@ -443,13 +442,13 @@ fn raster_into(e: &mut Enc, s: &Scene) -> Option<(wgpu::Texture, wgpu::Texture)>
             b
         })
         .collect();
-    let vbuf = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("adv3d vertices"), contents: &vb, usage: wgpu::BufferUsages::VERTEX });
+    let vbuf = g.buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("adv3d vertices"), contents: &vb, usage: wgpu::BufferUsages::VERTEX });
     let ib: Vec<u8> = s.indices.iter().flat_map(|i| i.to_le_bytes()).collect();
-    let ibuf = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("adv3d indices"), contents: &ib, usage: wgpu::BufferUsages::INDEX });
-    let ub = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("adv3d globals"), contents: &bufs[0], usage: wgpu::BufferUsages::UNIFORM });
+    let ibuf = g.buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("adv3d indices"), contents: &ib, usage: wgpu::BufferUsages::INDEX });
+    let ub = g.buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("adv3d globals"), contents: &bufs[0], usage: wgpu::BufferUsages::UNIFORM });
     let sbs: Vec<wgpu::Buffer> = bufs[1..]
         .iter()
-        .map(|b| dev.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("adv3d data"), contents: b, usage: wgpu::BufferUsages::STORAGE }))
+        .map(|b| g.buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("adv3d data"), contents: b, usage: wgpu::BufferUsages::STORAGE }))
         .collect();
     let mut entries = vec![wgpu::BindGroupEntry { binding: 0, resource: ub.as_entire_binding() }];
     for (i, b) in sbs.iter().enumerate() {
@@ -736,7 +735,7 @@ fn dispatch(e: &mut Enc, kernel: &str, u0: [u32; 4], f0: [f32; 4], b: Binds, gro
     let g = e.g;
     let post = &pipes(g).post;
     let Some((_, pipe)) = post.kernels.iter().find(|(k, _)| *k == kernel) else { return };
-    let ub = g.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: &params(u0, f0), usage: wgpu::BufferUsages::UNIFORM });
+    let ub = g.buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: &params(u0, f0), usage: wgpu::BufferUsages::UNIFORM });
     let mut entries = vec![
         wgpu::BindGroupEntry { binding: 0, resource: ub.as_entire_binding() },
         wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(b.color.unwrap_or(&post.dummy_color)) },
@@ -859,7 +858,7 @@ fn depth_of_field(e: &mut Enc, acc: &wgpu::Buffer, depth: &wgpu::Buffer, (w, h):
     for v in [f32::INFINITY.to_bits(), 0, 0, 0] {
         init.extend_from_slice(&v.to_le_bytes());
     }
-    let range = g.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+    let range = g.buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("adv3d radius range"),
         contents: &init,
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,

@@ -21,8 +21,9 @@ struct State {
     #[cfg(target_arch = "wasm32")]
     timer_armed: bool,
 }
+/// The state, and whether the context is retired (read without the lock on hot paths).
 #[derive(Default)]
-pub(crate) struct Readbacks(Mutex<State>);
+pub(crate) struct Readbacks(Mutex<State>, std::sync::atomic::AtomicBool);
 pub(crate) struct Ticket {
     owner: Weak<Readbacks>,
     id: u64,
@@ -63,6 +64,11 @@ impl Readbacks {
                 .map_err(|e| format!("starting GPU readback deadline worker: {e}"))?;
         }
         Ok(me)
+    }
+
+    /// The context is retired (a device failure or a readback timeout): cheap, lock-free.
+    pub(crate) fn is_retired(&self) -> bool {
+        self.1.load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub(crate) fn check(&self) -> Result<(), Error> {
@@ -128,6 +134,7 @@ impl Readbacks {
                 return;
             }
             s.retired = Some(error.clone());
+            self.1.store(true, std::sync::atomic::Ordering::Release);
             std::mem::take(&mut s.pending)
         };
         for (_, entry) in pending {
@@ -155,6 +162,7 @@ impl Readbacks {
                 return;
             }
             s.retired = Some(error.clone());
+            self.1.store(true, std::sync::atomic::Ordering::Release);
             std::mem::take(&mut s.pending)
         };
         for (_, entry) in pending {

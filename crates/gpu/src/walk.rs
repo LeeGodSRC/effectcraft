@@ -73,6 +73,10 @@ fn draw_comp<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, canvas: &mut 
     let levels = r.pipe().levels;
     let mut i = 0;
     while i < visible.len() {
+        // The device failed or was lost meanwhile: the CPU renders the frame.
+        if e.dead() {
+            return None;
+        }
         if visible[i].is_3d() {
             let mut j = i;
             while j < visible.len() && visible[j].is_3d() {
@@ -119,6 +123,7 @@ fn draw_3d<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, run: &[&'a Laye
         return Some(());
     }
     // Advanced 3D: rendered and composited on the GPU (`adv3d`).
+    e.park();
     if let Some(prep) = r.prepare_adv_run(ctx, run, (canvas.width, canvas.height)) {
         match crate::adv3d::draw_run(e, &prep, canvas) {
             Some(img) => *canvas = img,
@@ -214,6 +219,7 @@ fn draw_layer(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &
     if opacity <= 0.0 {
         return Some(());
     }
+    e.park();
     let Some(st) = r.styled_layer(ctx, layer) else { return Some(()) };
     if st.plain {
         return composite_layer(e, r, ctx, layer, &st.body, canvas, opacity);
@@ -248,6 +254,7 @@ fn draw_layer(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &
 /// replaces the canvas inside the layer's footprint × opacity. `None` = draw it on the CPU.
 fn draw_adjustment(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &mut GpuImage) -> Option<()> {
     let opacity = r.layer_opacity(ctx, layer);
+    e.park();
     let Some(foot) = r.adjustment_footprint(ctx, layer) else { return Some(()) };
     let (w, h) = (canvas.width, canvas.height);
     let matte = place(e, r, ctx, layer, &foot, &e.zeros(w, h), BlendMode::Normal, 1.0, None)?;
@@ -307,7 +314,10 @@ fn composite_iso_with(
             None => {
                 let mut mimg = e.zeros(canvas.width, canvas.height);
                 if m.is_active_at(ctx.time)
-                    && let Some(mb) = r.layer_buf(ctx, m)
+                    && let Some(mb) = {
+                        e.park();
+                        r.layer_buf(ctx, m)
+                    }
                 {
                     let mo = ctx.opacity(m) as f32;
                     mimg = place(e, r, ctx, m, &mb, &mimg, BlendMode::Normal, mo, None)?;

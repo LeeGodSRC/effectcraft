@@ -86,7 +86,7 @@ mod walk;
 
 use std::sync::Arc;
 
-pub use context::{GpuContext, GpuImage, TransferStats};
+pub use context::{FrameSlot, GpuContext, GpuImage, MEMORY_BUDGET_PERCENT, PoolUsage, TransferStats};
 use effectcraft_effects::Buf;
 use effectcraft_project::ItemId;
 use effectcraft_raster::Image;
@@ -188,6 +188,9 @@ impl Gpu {
         self.ctx.check_health().map_err(|e| log::error!("gpu display: {e}")).ok()?;
         let mut e = Enc::new(&self.ctx);
         let img = walk::render(&mut e, r, comp, t)?;
+        if e.dead() {
+            return None;
+        }
         let texture = e.display(&img);
         e.submit();
         // Reject failures observed during rendering/submission before publishing the frame.
@@ -268,6 +271,10 @@ impl Gpu {
     /// of blocking their event loop on an error-scope future.
     pub fn within_memory<T>(&self, f: impl FnOnce() -> T) -> Result<T, String> {
         self.ctx.check_health()?;
+        // A working texture the device refused is noticed where it is allocated (on whichever
+        // thread), not in this scope.
+        let epoch = self.ctx.oom_epoch();
+        let refused = |out: T| if self.ctx.oom_epoch() == epoch { Ok(out) } else { Err("out of video memory".to_string()) };
         #[cfg(not(target_arch = "wasm32"))]
         {
             let scope = self.ctx.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
@@ -277,13 +284,13 @@ impl Gpu {
                     self.ctx.clear_uploads();
                     Err(e.to_string())
                 }
-                None => self.ctx.check_health().map(|()| out),
+                None => self.ctx.check_health().and_then(|()| refused(out)),
             }
         }
         #[cfg(target_arch = "wasm32")]
         {
             let out = f();
-            self.ctx.check_health().map(|()| out)
+            self.ctx.check_health().and_then(|()| refused(out))
         }
     }
 

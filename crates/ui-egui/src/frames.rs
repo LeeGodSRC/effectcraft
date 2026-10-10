@@ -982,6 +982,7 @@ impl Worker {
             return None;
         }
         let g = job.src.gpu.as_ref()?;
+        let _slot = g.context().admit_frame()?;
         let mut r = Renderer::new(&job.src.project, job.src.footage.as_ref(), job.opts);
         r.expr = job.src.expr.as_deref();
         r.cache = Some(&job.src.layer_cache);
@@ -1004,7 +1005,12 @@ impl Worker {
         // A failed GPU attempt may have populated intermediate entries before its scope
         // reported failure. The CPU retry must compute its own pixels from the snapshot.
         r.cache = gpu_allowed.then_some(job.src.layer_cache.as_ref());
-        let gpu = job.src.gpu.as_ref().filter(|_| gpu_allowed);
+        // Frame threads start many frames at once and a heavy comp's frame holds gigabytes of
+        // working textures: the compositor admits what its video-memory budget has room for
+        // and the rest render on the CPU, instead of exhausting video memory together (the
+        // driver then fails command submission and the device, and the window, is lost).
+        let slot = job.src.gpu.as_ref().filter(|_| gpu_allowed).and_then(|g| g.context().admit_frame());
+        let gpu = job.src.gpu.as_ref().filter(|_| slot.is_some());
         r.accel = gpu.map(|g| g as &dyn effectcraft_engine::render::Accelerator);
         // The GPU leaves the frame in a texture for the viewer; otherwise (Software Only, no
         // adapter, or a frame the GPU cannot finish here) the CPU renders it.
@@ -1127,6 +1133,50 @@ mod tests {
         assert!(frames.is_cached(&next), "CPU retry can still publish");
         assert_eq!(frames.inflight(), 0);
         assert!(frames.queue.lock().unwrap().running.is_empty());
+    }
+
+    /// A frame the GPU compositor has no room for renders on the CPU, without touching the
+    /// device: sixteen frame threads each starting a heavy comp's frame on the GPU exhausted
+    /// video memory, which lost the device and with it the window.
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn a_frame_the_gpu_has_no_room_for_renders_on_the_cpu() {
+        use effectcraft_engine::Session;
+        use serde_json::json;
+        let Some(gpu) = Gpu::headless() else {
+            eprintln!("no GPU adapter: skipping");
+            return;
+        };
+        let mut s = Session::default();
+        let cid = ItemId(s.execute("comp.new", json!({"name": "A", "width": 16, "height": 16, "duration": 1})).unwrap()["comp"].as_u64().unwrap());
+        s.execute("layer.newSolid", json!({"comp": cid.0, "color": "#ff0000"})).unwrap();
+        let src = RenderSource {
+            project: s.project.clone(),
+            footage: Arc::new(effectcraft_engine::render::NoFootage),
+            expr: None,
+            layer_cache: Arc::default(),
+            gpu: Some(gpu.clone()),
+            gpu_display: false,
+            disk: None,
+        };
+        let frames = Frames::default();
+        let worker = frames.worker();
+        let opts = RenderOpts { backend: effectcraft_engine::render::Backend::Gpu, ..Default::default() };
+        let job = Job { key: key(1, 0, 0), src, comp: cid, t: Tick::ZERO, opts, urgent: false, seq: 0 };
+        let uploads = || gpu.context().transfer_stats().uploads + gpu.context().transfer_stats().readbacks;
+        // Room: the GPU composites (an upload and a readback).
+        let FrameImage::Cpu(on_gpu) = worker.render_job(&job, true) else { panic!("read back") };
+        let used = uploads();
+        assert!(used > 0, "the GPU composited the frame");
+        // No room (other frames hold the whole budget): the same pixels from the CPU.
+        let held: Vec<_> = (0..16).map_while(|_| gpu.context().admit_frame()).collect();
+        assert!(gpu.context().admit_frame().is_none());
+        let FrameImage::Cpu(on_cpu) = worker.render_job(&job, true) else { panic!("a CPU frame") };
+        assert_eq!(uploads(), used, "the device was not used");
+        assert_eq!(on_cpu.pixels, on_gpu.pixels);
+        drop(held);
+        let _ = worker.render_job(&job, true);
+        assert!(uploads() > used, "room again: back on the GPU");
     }
 
     fn key(content: u64, frame: i64, opts: u64) -> FrameKey {

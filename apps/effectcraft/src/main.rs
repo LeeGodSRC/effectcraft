@@ -15,6 +15,7 @@
 mod appimage;
 mod audio_out;
 mod control_server;
+mod device_loss;
 mod launch_guard;
 #[cfg(target_os = "macos")]
 mod native_menu;
@@ -125,6 +126,7 @@ fn main() -> eframe::Result {
                 rs.device.set_device_lost_callback(move |reason, message| {
                     lost.report(&format!("GPU device lost ({reason:?}): {message}"), true);
                 });
+                device_loss::simulate_from_env(&rs.device, &cc.egui_ctx);
             }
             let mut session = effectcraft_host::session();
             // Lazy open and non-blocking auto-save: footage is checked and auto-saves are
@@ -166,9 +168,20 @@ fn main() -> eframe::Result {
             // reported in a toast and forgotten).
             let _ = session.execute("window.restoreScriptPanels", json!({}));
             let mut app = EffectcraftApp::new(session);
+            // A lost device can't be recreated under eframe, whose next paint aborts the
+            // process: the frontend saves a recovery copy and the app restarts from here.
+            let leave = device_loss::Leave::new(app.recovery_slot(), gpu_failures.clone(), control_port);
+            leave.install_panic_hook();
+            app.hooks.presentation_lost = Some(Box::new(move |lost| leave.now(&lost.reason, lost.project.as_deref(), lost.recovery.as_ref())));
             app.set_gpu_failure_bridge(gpu_failures);
             app.ui.start_screen = show_home;
             if let Some(n) = notice {
+                app.ui.status = n;
+            }
+            // Restarted after a lost device: compositing on the GPU may be what lost it.
+            if let Some(n) = device_loss::notice_from_env() {
+                log::warn!("{n}");
+                app.disable_gpu_compositor("GPU compositing is off for this session: the graphics device was lost");
                 app.ui.status = n;
             }
             if app.session.last_aep_report.as_ref().is_some_and(|r| r.has_issues()) {
@@ -248,6 +261,9 @@ fn wgpu_options(backends: Option<eframe::wgpu::Backends>) -> eframe::WgpuConfigu
         if let Some(b) = backends {
             setup.instance_descriptor.backends = b;
         }
+        // Refuse new textures and buffers with an error near the driver's memory budget; past
+        // it the driver fails command submission, which loses the device and the window.
+        setup.instance_descriptor.memory_budget_thresholds.for_resource_creation = Some(effectcraft_ui_egui::gpu_failure::MEMORY_BUDGET_PERCENT);
         setup.device_descriptor = std::sync::Arc::new(|adapter| eframe::wgpu::DeviceDescriptor {
             label: Some("EffectCraft device"),
             required_limits: device_limits(adapter.limits()),
@@ -300,6 +316,8 @@ impl eframe::App for Desktop {
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         self.app.ui(ui, frame);
+        // A device lost during this frame: leave before eframe paints through it.
+        self.app.poll_gpu_failure(ui.ctx());
         if !self.drawn {
             self.drawn = true;
             self.launch.drawn();
