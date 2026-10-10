@@ -31,14 +31,15 @@ pub(super) fn effect_id(name: &str) -> Option<&'static str> {
         "ADBE Glo2" => "ec.stylize.glow",
         "CC Particle World" => "ec.sim.ccparticleworld",
         "ADBE CurvesCustom" => "ec.color.curves",
-        "ADBE Gaussian Blur" | "ADBE Gaussian Blur 2" => "ec.blur.gaussian",
+        "ADBE Gaussian Blur" => "ec.obsolete.gaussianlegacy",
+        "ADBE Gaussian Blur 2" => "ec.blur.gaussian",
         "ADBE Color Balance (HLS)" => "ec.color.colorbalancehls",
         "ADBE Mirror" => "ec.distort.mirror",
         "ADBE Offset" => "ec.distort.offset",
         "APC Colorama" => "ec.color.colorama",
         "ADBE Fractal Noise" => "ec.noise.fractal",
         "ADBE Mosaic" => "ec.stylize.mosaic",
-        "ADBE Fast Blur" => "ec.blur.gaussian",
+        "ADBE Fast Blur" => "ec.obsolete.fastblur",
         "ADBE Stroke" => "ec.generate.stroke",
         "ADBE Point3D Control" => "ec.control.point3d",
         "ADBE Motion Blur" => "ec.blur.directional",
@@ -331,6 +332,12 @@ pub(super) fn instantiate(
             continue;
         };
         let mut group = effectcraft_effects::instantiate(spec, ids, &effect.name, size);
+        if effect.match_name == "ADBE Gaussian Blur" {
+            // The previous adapter instantiated modern Gaussian's extra Repeat Edge
+            // Pixels property. Retire its id without shifting later effect ids: those
+            // also seed procedural noise/particles, so a blur fix must not reseed them.
+            *ids.0 = ids.0.checked_add(1).ok_or("AEP property id space exhausted")?;
+        }
         group.enabled = effect.enabled;
         for p in &effect.params {
             if p.kind == 11 {
@@ -516,6 +523,41 @@ mod tests {
             assert_eq!(groups[0].prop(field).unwrap().value, Value::Scalar(value));
             assert_eq!(groups[1].prop(field).unwrap().value, Value::Scalar(later));
         }
+    }
+
+    #[test]
+    fn legacy_blurs_preserve_effect_identity_and_edge_options() {
+        assert_eq!(effect_id("ADBE Gaussian Blur"), Some("ec.obsolete.gaussianlegacy"));
+        assert_eq!(effect_id("ADBE Gaussian Blur 2"), Some("ec.blur.gaussian"));
+        let fast = build(
+            "ADBE Fast Blur",
+            vec![
+                param("ADBE Fast Blur-0001", "Blurriness", 2, Value::Scalar(50.0)),
+                param("ADBE Fast Blur-0002", "Blur Dimensions", 7, Value::Scalar(2.0)),
+                param("ADBE Fast Blur-0003", "Repeat Edge Pixels", 4, Value::Scalar(1.0)),
+            ],
+        );
+        assert_eq!(fast.match_id, "ec.obsolete.fastblur");
+        assert_eq!(fast.prop("blurriness").unwrap().value, Value::Scalar(50.0));
+        assert_eq!(fast.prop("blurDimensions").unwrap().value, Value::Enum(1));
+        assert_eq!(fast.prop("repeatEdge").unwrap().value, Value::Bool(true));
+    }
+
+    #[test]
+    fn legacy_gaussian_mapping_preserves_downstream_procedural_seeds() {
+        let build_pair = |blur: &str| {
+            let mut next = 100;
+            let effects = [blur, "ADBE Fractal Noise"].map(|name| DecodedEffect { name: name.into(), match_name: name.into(), enabled: true, params: vec![] });
+            let (groups, _) = instantiate(&effects, &mut Ids(&mut next), [64.0; 2], &HashMap::new()).unwrap();
+            (groups, next)
+        };
+        // Modern Gaussian is the three-control schema the old legacy adapter used.
+        let (old, old_next) = build_pair("ADBE Gaussian Blur 2");
+        let (legacy, legacy_next) = build_pair("ADBE Gaussian Blur");
+        assert_eq!(legacy[0].uid, old[0].uid);
+        assert_eq!(legacy[1].uid, old[1].uid, "the following noise must keep its seed");
+        assert_eq!(legacy_next, old_next);
+        assert!(legacy[0].prop("repeatEdge").is_none(), "retire the slot, not a fake legacy control");
     }
 
     #[test]

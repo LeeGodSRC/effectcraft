@@ -243,14 +243,17 @@ fn half(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (p.x >= dims.x || p.y >= dims.y) {
         return;
     }
-    let sx = 2 * p.x;
-    let sy = 2 * p.y;
+    let step_x = i32(P.u[0].x);
+    let step_y = i32(P.u[0].y);
+    let sx = step_x * p.x;
+    let sy = step_y * p.y;
     var acc = vec4<f32>(0.0);
-    acc += tex_get_clamped(src, sx, sy);
-    acc += tex_get_clamped(src, sx + 1, sy);
-    acc += tex_get_clamped(src, sx, sy + 1);
-    acc += tex_get_clamped(src, sx + 1, sy + 1);
-    textureStore(out, p, acc * 0.25);
+    for (var dy = 0; dy < step_y; dy++) {
+        for (var dx = 0; dx < step_x; dx++) {
+            acc += tex_get_clamped(src, sx + dx, sy + dy);
+        }
+    }
+    textureStore(out, p, acc / f32(step_x * step_y));
 }
 
 // ---------------------------------------------------------------- blurs (raster::blur)
@@ -843,6 +846,9 @@ fn pointwise(@builtin(global_invocation_id) gid: vec3<u32>) {
                 f *= fmul;
             }
             var val = sum / max(norm, 1e-6);
+            if (P.u[1].x != 0u) {
+                val = 1.0 - val;
+            }
             val = (val - 0.5) * contrast + 0.5 + brightness;
             // Overflow: Clip, Soft Clamp, Wrap Back, Allow HDR Results.
             let ov = P.u[1].y;
@@ -853,9 +859,6 @@ fn pointwise(@builtin(global_invocation_id) gid: vec3<u32>) {
             } else if (ov == 2u) {
                 let t = val - 2.0 * floor(val / 2.0);
                 val = select(t, 2.0 - t, t > 1.0);
-            }
-            if (P.u[1].x != 0u) {
-                val = 1.0 - val;
             }
             let op = P.f[2].z;
             if (P.u[1].z == 1u) {
