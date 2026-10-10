@@ -54,6 +54,28 @@ fn fxc_pixel(gid: vec3<u32>) -> vec2<i32> {
 
 // ---------------------------------------------------------------- per-pixel colour effects
 
+// Colorama's Output Cycle at phase `ph` (color_fx::ColoramaPalette::eval, interpolated): `n`
+// stops in `data`, five floats each (position, r, g, b, a), sorted by position.
+fn fxc_colorama_palette(ph: f32, n: u32) -> vec4<f32> {
+    var k = n - 1u;
+    for (var i = 0u; i < n; i++) {
+        if (data[i * 5u] <= ph) {
+            k = i;
+        }
+    }
+    let p0 = data[k * 5u];
+    let c0 = vec4<f32>(data[k * 5u + 1u], data[k * 5u + 2u], data[k * 5u + 3u], data[k * 5u + 4u]);
+    if (n == 1u) {
+        return c0;
+    }
+    let j = (k + 1u) % n;
+    let p1 = data[j * 5u];
+    let c1 = vec4<f32>(data[j * 5u + 1u], data[j * 5u + 2u], data[j * 5u + 3u], data[j * 5u + 4u]);
+    let span = max(fract_euclid(p1 - p0), 1e-6);
+    let t = clamp(fract_euclid(ph - p0) / span, 0.0, 1.0);
+    return c0 + (c1 - c0) * t;
+}
+
 // Colorama's input phase (color_fx::colorama_phase).
 fn fxc_colorama_phase(c: vec3<f32>, a: f32, mode: u32) -> f32 {
     var v: f32;
@@ -183,8 +205,20 @@ fn fxc_point(@builtin(global_invocation_id) gid: vec3<u32>) {
                 if (P.u[0].z == 0u) {
                     ph = floor(ph * 6.0) / 6.0;
                 }
-                let o = fxc_mix(c, fxc_hsv_to_rgb(ph, 1.0, 1.0), P.f[0].z);
-                px = vec4<f32>(o * a, a);
+                if (P.u[1].x > 0u) {
+                    // A palette given as stops; Modify Alpha takes the palette's alpha too.
+                    let pc = fxc_colorama_palette(ph, P.u[1].x);
+                    let o = fxc_mix(c, pc.xyz, P.f[0].z);
+                    var na = a;
+                    if (P.u[1].y != 0u) {
+                        na = pc.w;
+                    }
+                    let oa = a + (na - a) * P.f[0].z;
+                    px = vec4<f32>(o * oa, clamp(oa, 0.0, 1.0));
+                } else {
+                    let o = fxc_mix(c, fxc_hsv_to_rgb(ph, 1.0, 1.0), P.f[0].z);
+                    px = vec4<f32>(o * a, a);
+                }
             }
         }
         case 6u: {

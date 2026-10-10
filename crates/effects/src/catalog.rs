@@ -66,7 +66,14 @@ const CPU_ONLY_CONTROLS: &[(&str, &[&str])] = &[
     ("ec.color.lumetri", &["highDynamicRange", "curves/rgbCurves/", "curves/hueSaturationCurves/", "hslSecondary/"]),
     (
         "ec.color.colorama",
-        &["inputPhase/addPhase", "outputCycle/usePresetPalette", "modify/", "pixelSelection/matchingMode", "masking/maskingMode", "masking/compositeOverLayer"],
+        &[
+            "inputPhase/addPhase",
+            "modify/modify",
+            "modify/changeEmptyPixels",
+            "pixelSelection/matchingMode",
+            "masking/maskingMode",
+            "masking/compositeOverLayer",
+        ],
     ),
     (
         "ec.keying.keylight",
