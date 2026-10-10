@@ -12,6 +12,7 @@
 
 // Built everywhere so its tests run on every platform; only Linux AppImages use it.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod allocator;
 mod appimage;
 mod audio_out;
 mod control_server;
@@ -67,6 +68,8 @@ fn parse_args(args: impl IntoIterator<Item = String>, env_port: Option<String>) 
 }
 
 fn main() -> eframe::Result {
+    // Before anything is opened: this may start the program again (see the module).
+    allocator::tune();
     // Help ▸ Enable Logging writes through this logger; warnings feed the compatibility report.
     effectcraft_engine::logging::install();
     effectcraft_engine::logging::install_panic_hook();
