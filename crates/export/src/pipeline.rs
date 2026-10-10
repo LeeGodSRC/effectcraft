@@ -75,7 +75,9 @@ impl<'a> Cx<'a> {
         let mut project = job.project.clone();
         apply_overrides(&mut project, job);
         let frame_times = (job.options.log == RenderLog::PlusPerFrameInfo).then(|| Mutex::new(Vec::new()));
-        let cache = LayerCache::default();
+        // What every frame shares (still layers, still precomps) has to fit, or the frames take
+        // turns evicting and rendering it again: a tenth of the available memory, 1 to 3 GB.
+        let cache = LayerCache::new(job.options.available_memory.map_or(1 << 30, |m| (m / 10).clamp(1 << 30, 3 << 30) as usize));
         // With deferred readbacks, buffers computed from a missed pass's placeholders are not kept.
         cache.set_gate(job.accel.and_then(|a| a.miss_gate()));
         Cx { job, project, cache, frame_times, overflowed: Mutex::new(vec![]), written: Mutex::new(vec![]), warm: std::sync::atomic::AtomicBool::new(false) }
