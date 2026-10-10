@@ -63,3 +63,36 @@ fn time_remap_picks_the_source_frame() {
     assert!(img.get(90, 50)[3] > 0.99, "frozen at the end position");
     assert!(img.get(10, 50)[3] < 0.01);
 }
+
+#[test]
+fn time_remap_at_the_precomp_duration_is_empty() {
+    for collapse in [false, true] {
+        for preserve_frame_rate in [false, true] {
+            let mut p = Project::default();
+            let outer = Comp::new(96, 32, FrameRate::FPS_30, s(4.0));
+            let mut inner = Comp::new(32, 32, FrameRate::FPS_24, s(1.0));
+            inner.preserve_frame_rate = preserve_frame_rate;
+            let sid = p.add_item("Solid", Label::Red, None, ItemKind::Solid(Solid { color: [1.0; 3], width: 32, height: 32, pixel_aspect: 1.0 }));
+            let mut solid = build::layer(&mut p, &inner, "Solid", LayerSource::Solid { item: sid }, (32, 32), None);
+            solid.out_point = s(4.0);
+            inner.layers.push(solid);
+            let iid = p.add_item("Inner", Label::Sandstone, None, ItemKind::Comp(inner.into()));
+            let cid = p.add_item("Outer", Label::Sandstone, None, ItemKind::Comp(outer.clone().into()));
+            // Shared source, three different remapped times: last frame, exact end,
+            // and beyond the end. The outer layers themselves are still in range.
+            for (index, time) in [23.0 / 24.0, 1.0, 1.5].into_iter().enumerate() {
+                let mut pre = build::layer(&mut p, &outer, "Remapped", LayerSource::Comp { item: iid }, (32, 32), None);
+                pre.out_point = s(4.0);
+                pre.switches.collapse = collapse;
+                pre.props.prop_mut("transform/position").unwrap().value = Value::Vec3([16.0 + index as f64 * 32.0, 16.0, 0.0]);
+                let remap = Ids(&mut p.next_id).prop("timeRemap", "Time Remap", Value::Scalar(time));
+                pre.props.children.push(Node::Prop(remap));
+                p.comp_mut(cid).unwrap().layers.push(pre);
+            }
+            let image = render_frame(&p, cid, s(2.0), 1.0);
+            assert!(image.get(16, 16)[3] > 0.99, "last frame, collapse={collapse}, preserve={preserve_frame_rate}");
+            assert_eq!(image.get(48, 16)[3], 0.0, "exact end, collapse={collapse}, preserve={preserve_frame_rate}");
+            assert_eq!(image.get(80, 16)[3], 0.0, "past end, collapse={collapse}, preserve={preserve_frame_rate}");
+        }
+    }
+}
