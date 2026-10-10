@@ -1092,7 +1092,7 @@ fn pw_phys(ctx: &EffectCtx) -> Phys {
         rate: pr.f("birthRate").max(0.0)
             * match pr.e("particle/particleType") {
                 0 => 6_000.0,
-                8 if pw_point_fallback(ctx) => 6_000.0,
+                8 if pw_point_fallback(ctx) => 8_000.0,
                 4 => 30.0,
                 _ => 120.0,
             },
@@ -1126,9 +1126,9 @@ pub fn particle_world_textured(ctx: &EffectCtx) -> bool {
 }
 
 /// An unassigned Textured Square renders a field of small points, rather than
-/// layer-sized opaque quads. The fallback's 6000 births/second and 1%-of-width
-/// diameter per Size unit are inferred from reference output, not specified by
-/// Cycore's manual. Assigned textures retain their independent calibration.
+/// layer-sized opaque quads. The soft core, 8000 births/second per Birth Rate and
+/// 1%-of-width diameter per Size unit are fitted to point counts and brightness in
+/// reference output, not specified by Cycore's manual.
 fn pw_point_fallback(ctx: &EffectCtx) -> bool {
     ctx.params.e("particle/particleType") == 8 && !particle_world_textured(ctx)
 }
@@ -1298,6 +1298,24 @@ struct PwSeen {
 }
 
 impl PwCamera {
+    /// Empirical diameter in layer widths per Size unit. The legacy screen-facing
+    /// Textured Square needs a separate fit under a composition camera: the 0.15
+    /// Effect Camera calibration makes a distant star texture visibly cross-shaped.
+    /// This distinction is inferred from the two reference camera configurations,
+    /// not a published Cycore equation. Rotating textured polygons and primitives
+    /// keep their existing calibrations, as do Effect Camera's assigned squares.
+    fn diameter_unit(&self, kind: u32, textured: bool, point: bool) -> f32 {
+        if kind == 8 && textured && matches!(self, Self::Comp(_)) {
+            0.018
+        } else if textured {
+            0.15
+        } else if point {
+            0.01
+        } else {
+            0.25
+        }
+    }
+
     fn new(ctx: &EffectCtx, b: &Buf) -> PwCamera {
         let [lw, lh] = ctx.layer_size;
         if let Some(cam) = ctx.env.host.and_then(|h| h.comp_scene()).filter(|sc| sc.camera_layer).and_then(|sc| sc.camera) {
@@ -1379,19 +1397,8 @@ fn particle_world_layout(ctx: &EffectCtx, b: &Buf) -> Option<WorldPlan> {
     let scale = b.scale as f32;
     let cam = PwCamera::new(ctx, b);
     let textured = matches!(kind, 9 | 10) && particle_world_textured(ctx);
-    // Empirical diameter in layer widths per Size unit. Refit textures jointly
-    // against outlined notes and the large cross burst after correcting the lens
-    // and variation: 0.09 leaves both too small, 0.18 oversizes the largest crosses.
-    // Sprite primitives retain their independent 0.25 scale (Star compensates its
-    // doubled tips below). These are fits, not units specified in the manual.
     let point = pw_point_fallback(ctx);
-    let quad = if particle_world_textured(ctx) {
-        0.15
-    } else if point {
-        0.01
-    } else {
-        0.25
-    };
+    let quad = cam.diameter_unit(kind, particle_world_textured(ctx), point);
     let initial = pr.f("particle/initialRotation") as f32;
     let spin = pr.f("particle/rotationSpeed") as f32;
     let mut list: Vec<(f32, WorldSprite)> = st
@@ -1419,7 +1426,7 @@ fn particle_world_layout(ctx: &EffectCtx, b: &Buf) -> Option<WorldPlan> {
                 rotation = 0.0;
             }
             let sp = if point {
-                Sprite::new(x, y, radius, color, Shape::Faded)
+                Sprite::new(x, y, radius, color, Shape::Soft)
             } else if kind == 0 {
                 pw_line_sprite(x, y, radius, color, v[0] * lw * k * scale, v[1] * lw * k * scale, scale)
             } else {
@@ -2190,8 +2197,8 @@ mod tests {
         let input = Buf { img: Image::new(200, 100), offset: [0.0; 2], scale: 1.0 };
         let ctx = EffectCtx { params: &params, time: 17.5, layer_size: [200.0, 100.0], seed: 1, adjustment: false, env: EffectEnv::default() };
         let points = particle_world_layout(&ctx, &input).unwrap();
-        assert!(points.sprites.len() > 2900, "pre-roll reaches steady-state density");
-        assert!(points.sprites.iter().all(|s| matches!(s.sprite.shape, Shape::Faded) && s.sprite.r < 2.0));
+        assert!(points.sprites.len() > 3900, "pre-roll reaches steady-state density");
+        assert!(points.sprites.iter().all(|s| matches!(s.sprite.shape, Shape::Soft) && s.sprite.r < 2.0));
         params.values.insert("texture/layer".into(), Value::Layer(Some(42)));
         let ctx = EffectCtx { params: &params, time: 17.5, layer_size: [200.0, 100.0], seed: 1, adjustment: false, env: EffectEnv::default() };
         let textures = particle_world_layout(&ctx, &input).unwrap();
@@ -2497,6 +2504,55 @@ mod tests {
 
     fn pw_in(comp: &Comp, vals: &[(&str, Value)]) -> Image {
         run_fx("ec.sim.ccparticleworld", vals, Image::new(48, 48), 1.0, EffectEnv { host: Some(comp), ..Default::default() }).img
+    }
+
+    #[test]
+    fn particle_world_comp_camera_square_footprint_tracks_size_depth_and_resolution() {
+        let mut params = pw_params();
+        for (id, value) in [
+            ("particle/particleType", Value::Enum(8)),
+            ("texture/layer", Value::Layer(Some(42))),
+            ("particle/birthSize", num(1.0)),
+            ("particle/deathSize", num(1.0)),
+            ("particle/sizeVariation", num(0.0)),
+            ("physics/velocity", num(0.0)),
+            ("physics/gravity", num(0.0)),
+            ("producer/radiusX", num(0.0)),
+            ("producer/radiusY", num(0.0)),
+            ("producer/radiusZ", num(0.0)),
+            ("producer/producerZ", num(1.0)),
+        ] {
+            params.values.insert(id.into(), value);
+        }
+        let host = Comp { camera: cam([960.0, 540.0], 1080.0, 0.0, 1.0), layer: true };
+        let diameter = |params: &crate::Params, scale, host: &Comp| {
+            let ctx = EffectCtx {
+                params,
+                time: 1.0,
+                layer_size: [1920.0, 1080.0],
+                seed: 7,
+                adjustment: false,
+                env: EffectEnv { host: Some(host), ..Default::default() },
+            };
+            let b = Buf { img: Image::new(0, 0), offset: [0.0; 2], scale };
+            let plan = particle_world_layout(&ctx, &b).unwrap();
+            plan.sprites.first().unwrap().sprite.r * 2.0
+        };
+        let d = diameter(&params, 1.0, &host);
+        assert!((10.0..15.0).contains(&d), "distant square footprint: {d}");
+        assert!((diameter(&params, 0.5, &host) - d * 0.5).abs() < 1e-5);
+        params.values.insert("particle/birthSize".into(), num(2.0));
+        params.values.insert("particle/deathSize".into(), num(2.0));
+        assert!((diameter(&params, 1.0, &host) - d * 2.0).abs() < 1e-5);
+        params.values.insert("producer/producerZ".into(), num(0.0));
+        assert!(diameter(&params, 1.0, &host) > d * 4.0);
+        // The established Effect Camera footprint is shared with rotating textured
+        // polygons. This correction must not shrink their outlined-note textures.
+        let effect = Comp { layer: false, ..host };
+        let square = diameter(&params, 1.0, &effect);
+        params.values.insert("particle/particleType".into(), Value::Enum(9));
+        assert_eq!(diameter(&params, 1.0, &effect), square);
+        assert!(diameter(&params, 1.0, &host) > d * 10.0);
     }
 
     fn finite(img: &Image) -> bool {
