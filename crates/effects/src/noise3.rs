@@ -324,11 +324,12 @@ impl Fractal {
         if self.kind == 7 { best } else { sum / norm.max(1e-6) }
     }
 
-    /// Final grey value: contrast, brightness, overflow and invert applied.
+    /// Final grey value: invert the noise before contrast, brightness and overflow.
     pub(crate) fn value(&self, x: f32, y: f32) -> f32 {
-        let v = (self.raw(x, y) - 0.5) * self.contrast + 0.5 + self.brightness;
-        let v = overflow(v, self.overflow);
-        if self.invert { 1.0 - v } else { v }
+        let raw = self.raw(x, y);
+        let raw = if self.invert { 1.0 - raw } else { raw };
+        // Brightness retains its sign with Invert enabled: dark noise remains dark.
+        overflow((raw - 0.5) * self.contrast + 0.5 + self.brightness, self.overflow)
     }
 }
 
@@ -545,6 +546,36 @@ mod tests {
             }
         }
         assert!(dh < dv * 0.5, "{dh} {dv}");
+    }
+
+    #[test]
+    fn invert_preserves_brightness_direction_before_overflow() {
+        // Invert swaps the noise's peaks and troughs; negative Brightness must still
+        // darken it. Inverting the finished image instead turned dark noise white.
+        for id in ["ec.noise.fractal", "ec.noise.turbulent"] {
+            for mode in 0..4 {
+                let settings = [
+                    ("invert", Value::Bool(true)),
+                    ("contrast", num(0.0)),
+                    ("brightness", num(-25.0)),
+                    ("overflow", Value::Enum(mode)),
+                    ("blendingMode", Value::Enum(BLEND_NONE)),
+                ];
+                let dark = run(id, &settings);
+                assert!(dark.data.iter().all(|p| p[0] < 0.5), "{id}, overflow {mode}");
+                let mut bright_settings = settings;
+                bright_settings[2].1 = num(25.0);
+                let bright = run(id, &bright_settings);
+                assert!(bright.data.iter().all(|p| p[0] > 0.5), "{id}, overflow {mode}");
+            }
+            // Without overflow, opposite noise patterns share the brightness offset.
+            let settings = [("brightness", num(-69.0)), ("contrast", num(238.0)), ("overflow", Value::Enum(3))];
+            let normal = run(id, &settings);
+            let inverted = run(id, &[settings.as_slice(), &[("invert", Value::Bool(true))]].concat());
+            for (a, b) in normal.data.iter().zip(&inverted.data) {
+                assert!((a[0] + b[0] - (1.0 - 1.38)).abs() < 1e-5);
+            }
+        }
     }
 
     #[test]
