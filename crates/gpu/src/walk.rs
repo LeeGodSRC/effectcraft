@@ -142,7 +142,23 @@ fn draw_3d<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, run: &[&'a Laye
         }
         return Some(());
     }
-    match r.prepare_3d_run(ctx, run, (canvas.width, canvas.height)).and_then(|prep| crate::classic3d::draw_run(e, &prep, canvas)) {
+    // Layers of the run whose effect stacks run here in full are rendered here and stay here
+    // (`resident_layer`); the CPU renderer prepares their planes from a description. Not text
+    // (per-character 3D cuts planes from the CPU's buffer) nor collapsed precomps.
+    let mut held = std::collections::HashMap::new();
+    let mut textures = std::collections::HashMap::new();
+    for l in run {
+        if matches!(l.source, effectcraft_project::LayerSource::Text) || r.layer_opacity(ctx, l) <= 0.0 || r.collapsed(ctx, l).is_some() {
+            continue;
+        }
+        if let Some((img, head)) = resident_layer(e, r, ctx, l) {
+            held.insert(l.id, head);
+            textures.insert(l.id.0 as u32, img);
+        }
+    }
+    let out = (canvas.width, canvas.height);
+    let prep = if held.is_empty() { r.prepare_3d_run(ctx, run, out) } else { r.prepare_3d_run_holding(ctx, run, out, &held) };
+    match prep.and_then(|prep| crate::classic3d::draw_run_with(e, &prep, canvas, &textures)) {
         Some(img) => *canvas = img,
         None => on_cpu(e, canvas, |img| r.draw_3d_run(ctx, run, img))?,
     }
@@ -302,17 +318,21 @@ fn draw_precomp(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas:
         return None;
     }
     let (sub, item, t, key) = r.plain_precomp(ctx, layer)?;
-    let img = match e.nested.get(&key) {
-        Some(img) => img.clone(),
-        None => {
-            let img = render(e, &sub, item, t)?;
-            e.nested.insert(key, img.clone());
-            img
-        }
-    };
+    let img = nested_frame(e, &sub, item, t, key)?;
     // The frame as a layer buffer: its size and scale are all the placement reads.
     let head = Arc::new(Buf { img: Image { width: img.width, height: img.height, data: Vec::new() }, offset: [0.0; 2], scale: sub.opts.scale });
     Some(composite_layer(e, r, ctx, layer, &head, Some(img), canvas, opacity))
+}
+
+/// A nested comp's frame composited here, once per top-level frame (`key`:
+/// `Renderer::plain_precomp`'s).
+fn nested_frame(e: &mut Enc, sub: &Renderer, item: ItemId, t: Tick, key: u64) -> Option<GpuImage> {
+    if let Some(img) = e.nested.get(&key) {
+        return Some(img.clone());
+    }
+    let img = render(e, sub, item, t)?;
+    e.nested.insert(key, img.clone());
+    Some(img)
 }
 
 /// A layer whose effect stack changes every frame and runs here in full
@@ -329,12 +349,15 @@ fn resident_layer(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer) -> Op
     let origin = r.resident_effects(ctx, layer)?;
     // The input in effect space: a solid is filled here, anything else comes from the CPU
     // renderer (uploaded once while the layer cache keeps it).
-    let (src, offset, scale) = match r.plain_solid(ctx, layer).filter(|(_, w, h)| e.g.fits(*w, *h)) {
-        Some((px, w, h)) => (e.solid(w, h, px), [origin[0] * r.opts.scale, origin[1] * r.opts.scale], r.opts.scale),
-        None => {
-            let input = r.layer_input(ctx, layer, 0)?;
-            (e.g.upload_buf(&input)?, input.offset, input.scale)
-        }
+    let (src, offset, scale) = if let Some((px, w, h)) = r.plain_solid(ctx, layer).filter(|(_, w, h)| e.g.fits(*w, *h)) {
+        (e.solid(w, h, px), [origin[0] * r.opts.scale, origin[1] * r.opts.scale], r.opts.scale)
+    } else if let Some((sub, item, t, key)) = r.precomp_input(ctx, layer) {
+        // A precomp layer with effects: its nested comp is composited here too.
+        let img = nested_frame(e, &sub, item, t, key)?;
+        (img, [origin[0] * sub.opts.scale, origin[1] * sub.opts.scale], sub.opts.scale)
+    } else {
+        let input = r.layer_input(ctx, layer, 0)?;
+        (e.g.upload_buf(&input)?, input.offset, input.scale)
     };
     let mut fx = crate::effects::GpuFx::new(e, src, offset, scale, r.pipe().levels);
     r.run_layer_effects_on(ctx, layer, &mut fx);
@@ -404,7 +427,7 @@ fn composite_iso_with(
                 if let Some((img, head)) = resident_layer(e, r, ctx, m)
                     && let Some(prep) = r.prepare_matte_3d_resident(ctx, m, out, head)
                 {
-                    drawn = crate::classic3d::draw_run_with(e, &prep, &blank, Some(&img));
+                    drawn = crate::classic3d::draw_run_with(e, &prep, &blank, &std::collections::HashMap::from([(m.id.0 as u32, img)]));
                 }
                 if drawn.is_none() {
                     drawn = r.prepare_matte_3d(ctx, m, out).and_then(|prep| crate::classic3d::draw_run(e, &prep, &blank));

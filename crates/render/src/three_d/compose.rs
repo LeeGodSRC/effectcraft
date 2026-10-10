@@ -196,7 +196,11 @@ fn mb_samples(r: &Renderer, ctx: &EvalCtx, layer: &Layer) -> usize {
 
 /// Prepare a layer (buffer, geometry, material). `None` when it shows nothing.
 pub(crate) fn prepare<'a>(r: &Renderer, ctx: &EvalCtx<'a>, layer: &'a Layer, order: usize, out: (u32, u32), in_run: bool) -> Option<Item<'a>> {
-    let buf = r.blend_layer_buf(ctx, layer)?;
+    // (An accelerator may hold the layer's pixels itself: then only their description is here.)
+    let buf = match r.held.and_then(|h| h.get(&layer.id)) {
+        Some(buf) => buf.clone(),
+        None => r.blend_layer_buf(ctx, layer)?,
+    };
     prepare_with(r, ctx, layer, order, out, in_run, buf, Mat4::IDENTITY)
 }
 

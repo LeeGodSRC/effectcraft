@@ -532,6 +532,10 @@ pub struct Renderer<'a> {
     /// layers at the bottom of a comp): the layer buffers that go into it are the first to leave
     /// the layer cache.
     within_still: bool,
+    /// Layers of a 3D run whose pixels an accelerator rendered and holds itself
+    /// ([`Renderer::prepare_3d_run_holding`]): the buffer describing each (size, offset, scale)
+    /// stands in for the layer's processed buffer when its plane is prepared.
+    pub(crate) held: Option<&'a std::collections::HashMap<effectcraft_project::LayerId, Arc<Buf>>>,
 }
 
 /// One collapsed precomp layer a nested comp is drawn through.
@@ -620,6 +624,7 @@ impl<'a> Renderer<'a> {
             through_lost: false,
             memo: None,
             within_still: false,
+            held: None,
         }
     }
 
@@ -1329,9 +1334,18 @@ impl<'a> Renderer<'a> {
     /// `None` for every other layer, and for a nested frame that does not change with time (the
     /// layer cache keeps that one across frames, see [`Self::nested_frame`]).
     pub fn plain_precomp(&self, ctx: &EvalCtx, layer: &Layer) -> Option<(Renderer<'a>, ItemId, Tick, u64)> {
+        if layer.switches.effects && layer.effects().is_some_and(|fx| fx.groups().any(|g| g.enabled)) {
+            return None;
+        }
+        self.precomp_input(ctx, layer)
+    }
+
+    /// [`Self::plain_precomp`] for a precomp layer that may have effects: its nested comp's frame
+    /// is then the input of its effect stack ([`Self::resident_effects`]), not the layer's
+    /// pixels.
+    pub fn precomp_input(&self, ctx: &EvalCtx, layer: &Layer) -> Option<(Renderer<'a>, ItemId, Tick, u64)> {
         let LayerSource::Comp { item } = &layer.source else { return None };
-        if layer.masks().is_some_and(|m| !m.children.is_empty()) || (layer.switches.effects && layer.effects().is_some_and(|fx| fx.groups().any(|g| g.enabled)))
-        {
+        if layer.masks().is_some_and(|m| !m.children.is_empty()) {
             return None;
         }
         if self.project.comp_contains(*item, ctx.comp_id) || self.proxy_for(*item).is_some() || !essential_overrides(ctx, layer).is_empty() {
@@ -2408,6 +2422,20 @@ impl<'a> Renderer<'a> {
         three_d::compose::gpu_run(self, ctx, run, out)
     }
 
+    /// [`Self::prepare_3d_run`] when the accelerator rendered some of the run's layers itself
+    /// ([`Self::resident_effects`]) and holds their pixels: `held` gives, per such layer, the
+    /// buffer describing them (size, offset, scale), which stands in for the layer's processed
+    /// buffer. The plane of a held layer carries that description; its texture is the caller's.
+    pub fn prepare_3d_run_holding(
+        &self,
+        ctx: &EvalCtx,
+        run: &[&Layer],
+        out: (u32, u32),
+        held: &std::collections::HashMap<effectcraft_project::LayerId, Arc<Buf>>,
+    ) -> Option<three_d::Run3d> {
+        three_d::compose::gpu_run(&Renderer { held: Some(held), ..*self }, ctx, run, out)
+    }
+
     /// A run of consecutive 3D layers of an Advanced 3D comp prepared for an accelerator's
     /// compositor ([`three_d::adv::Prepared`]): rendered as one scene and composited (Normal,
     /// premultiplied over) onto the canvas. `None` = not an Advanced 3D comp, or a layer needs the
@@ -2478,7 +2506,8 @@ impl<'a> Renderer<'a> {
             GroupKind::Effect { effect } => effectcraft_effects::find(effect).is_some_and(|s| s.gpu && a.supports_effect(s.id)),
             _ => false,
         };
-        if !stack.all(runs_there) || !(cache::animated(fx) || cache::time_dependent(layer)) {
+        // (A nested comp that moves changes the input every frame, whatever the effects do.)
+        if !stack.all(runs_there) || !(cache::animated(fx) || cache::time_dependent(layer) || self.precomp_input(ctx, layer).is_some()) {
             return None;
         }
         Some(ctx.effect_bounds(layer).1)
