@@ -577,3 +577,22 @@ fn rig_orbit_keeps_distance_and_pan_moves_both() {
     let off = r.eye - r.poi;
     assert!(off.y.abs() / off.length() < 0.9999);
 }
+
+#[test]
+fn two_d_layer_takes_a_3d_track_matte_through_the_camera() {
+    let (mut p, cid, comp) = setup();
+    // A hidden 3D matte, half the comp in size, one camera distance behind the comp plane:
+    // on screen it is a quarter of the comp, centred.
+    let mut matte = solid3(&mut p, &comp, [1.0, 1.0, 1.0], W / 2, H / 2, [W as f64 / 2.0, H as f64 / 2.0, zoom()]);
+    matte.switches.video = false;
+    let sid = p.add_item("Fill", Label::Red, None, ItemKind::Solid(Solid { color: [0.0, 0.0, 1.0], width: W, height: H, pixel_aspect: 1.0 }));
+    let mut fill = build::layer(&mut p, &comp, "Fill", LayerSource::Solid { item: sid }, (W, H), None);
+    fill.track_matte = Some(effectcraft_project::TrackMatte { layer: matte.id, kind: effectcraft_project::MatteKind::Luma });
+    push(&mut p, cid, matte);
+    push(&mut p, cid, fill);
+    let img = render(&p, cid);
+    assert!(img.get(100, 50)[2] > 0.99, "inside the matte as the camera sees it");
+    // Inside the matte's own rectangle (were it placed flat, ignoring depth), outside what
+    // the camera sees of it.
+    assert!(img.get(140, 50)[3] < 0.01, "the matte is not placed flat");
+}

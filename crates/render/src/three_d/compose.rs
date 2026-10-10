@@ -365,6 +365,22 @@ fn dof_blur(cam: &CameraState, dof: &super::camera::Dof, world: Mat4, buf: Arc<B
     Arc::new(Buf { img: super::bokeh::progressive_blur(&pbuf.img, &dof.iris, &pr), offset: pbuf.offset, scale: pbuf.scale })
 }
 
+/// A 3D track matte layer as the camera sees it, drawn alone (its own matte, blend mode and
+/// Preserve Transparency are ignored).
+pub(crate) fn matte_image(r: &Renderer, ctx: &EvalCtx, m: &Layer, out: (u32, u32)) -> Image {
+    let mut img = Image::new(out.0, out.1);
+    let mut solo = m.clone();
+    solo.track_matte = None;
+    solo.preserve_transparency = false;
+    solo.blend_mode = BlendMode::Normal;
+    let its = prepare_all(r, ctx, &solo, 0, out, true);
+    if !its.is_empty() {
+        let lights = scene_lights(ctx);
+        composite(&mut img, &its, &lights, &[], m.id.0 as u32);
+    }
+    img
+}
+
 /// Screen-space track matte factor for a layer, or None.
 fn matte_for(r: &Renderer, ctx: &EvalCtx, layer: &Layer, out: (u32, u32)) -> Option<Arc<Vec<f32>>> {
     let tm = layer.track_matte?;
@@ -372,16 +388,7 @@ fn matte_for(r: &Renderer, ctx: &EvalCtx, layer: &Layer, out: (u32, u32)) -> Opt
     let mut img = Image::new(out.0, out.1);
     if m.is_active_at(ctx.time) {
         if m.is_3d() {
-            // Render the matte plane alone (its own matte is ignored).
-            let mut solo = m.clone();
-            solo.track_matte = None;
-            solo.preserve_transparency = false;
-            solo.blend_mode = BlendMode::Normal;
-            let its = prepare_all(r, ctx, &solo, 0, out, true);
-            if !its.is_empty() {
-                let lights = scene_lights(ctx);
-                composite(&mut img, &its, &lights, &[], m.id.0 as u32);
-            }
+            img = matte_image(r, ctx, m, out);
         } else if let Some(mb) = r.layer_buf(ctx, m) {
             r.place(ctx, m, &mb, &mut img, BlendMode::Normal, ctx.opacity(m) as f32);
         }
