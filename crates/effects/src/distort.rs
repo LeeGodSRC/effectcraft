@@ -242,7 +242,9 @@ fn polar(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let (w, h) = (b.img.width as f64, b.img.height as f64);
     let (cx, cy) = (w / 2.0, h / 2.0);
     let rmax = cx.min(cy);
-    b.img = remap(&b.img, true, |x, y| {
+    // Outside the mapped rectangle is transparent. Repeating its bottom edge fills the
+    // corners outside the polar disc (and turns a radial alpha ramp into an opaque square).
+    b.img = remap(&b.img, false, |x, y| {
         let (px, py) = if to_polar {
             // output is polar: angle → x, radius → y
             let dx = x - cx;
@@ -255,7 +257,11 @@ fn polar(ctx: &EffectCtx, mut b: Buf) -> Buf {
             let r = y / h * rmax;
             (cx + r * a.sin(), cy - r * a.cos())
         };
-        (x + (px - x) * amt, y + (py - y) * amt)
+        let sx = x + (px - x) * amt;
+        // The angular seam still reaches the first/last source column; only the radial
+        // coordinate may leave the source. Do not create a transparent slit at 12 o'clock.
+        let sx = if to_polar { sx.clamp(0.5, (w - 0.5).max(0.5)) } else { sx };
+        (sx, y + (py - y) * amt)
     });
     b
 }
@@ -500,6 +506,18 @@ mod tests {
         (0..4).any(|i| (a[i] - b[i]).abs() > 1e-4)
     }
     type Px4 = [f32; 4];
+
+    #[test]
+    fn polar_disc_does_not_repeat_the_rectangle_edges() {
+        let im = Image::filled(80, 40, [1.0; 4]);
+        let disc = run("ec.distort.polar", &[("interpolation", num(100.0))], im.clone());
+        assert_eq!(disc.img.get(0, 0), [0.0; 4]);
+        assert_eq!(disc.img.get(75, 20), [0.0; 4]);
+        assert_eq!(disc.img.get(40, 20), [1.0; 4]);
+        assert_eq!(disc.img.get(40, 3), [1.0; 4]);
+        let identity = run("ec.distort.polar", &[("interpolation", num(0.0))], im.clone());
+        assert_eq!(identity.img.data, im.data);
+    }
 
     #[test]
     fn twirl_radius_is_a_percentage_of_the_larger_dimension() {

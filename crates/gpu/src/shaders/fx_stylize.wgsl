@@ -166,7 +166,7 @@ fn fxs_point(@builtin(global_invocation_id) gid: vec3<u32>) {
 // u[0].x = mode (all sample bilinear, transparent outside, unless noted):
 //  1 Mirror (distort::mirror): f[0] = (cx, cy, nx, ny)
 //  2 Spherize (distort::spherize): f[0] = (cx, cy, radius)
-//  3 Polar Coordinates (distort::polar, edges repeated): u[0].y = to polar;
+//  3 Polar Coordinates (distort::polar, transparent outside): u[0].y = to polar;
 //    f[0] = (w, h, cx, cy); f[1] = (rmax, interpolation)
 //  4 CC Slant (distort3::cc_slant): f[0] = (floor x, floor y, 1 / height, slant); f[1].x = x scale
 //  5 CC Smear (distort3::cc_smear): f[0] = (from x, from y, dx, dy); f[1] = (len², reach, radius)
@@ -259,7 +259,6 @@ fn fxs_warp(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
         }
         case 3u: {
-            clamped = true;
             let w = P.f[0].x;
             let h = P.f[0].y;
             let cx = P.f[0].z;
@@ -280,6 +279,9 @@ fn fxs_warp(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
             let amt = P.f[1].y;
             s = vec2<f32>(x + (pp.x - x) * amt, y + (pp.y - y) * amt);
+            if (P.u[0].y != 0u) {
+                s.x = clamp(s.x, 0.5, max(w - 0.5, 0.5));
+            }
         }
         case 4u: {
             let fl = P.f[0].xy;
