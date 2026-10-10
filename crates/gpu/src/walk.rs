@@ -399,7 +399,17 @@ fn composite_iso_with(
                 // Classic 3D: the matte layer alone through the device's own compositor; the
                 // CPU renderer draws it otherwise (Advanced 3D).
                 let blank = e.zeros(out.0, out.1);
-                match r.prepare_matte_3d(ctx, m, out).and_then(|prep| crate::classic3d::draw_run(e, &prep, &blank)) {
+                // Its effects run here when they can, and the result stays here.
+                let mut drawn = None;
+                if let Some((img, head)) = resident_layer(e, r, ctx, m)
+                    && let Some(prep) = r.prepare_matte_3d_resident(ctx, m, out, head)
+                {
+                    drawn = crate::classic3d::draw_run_with(e, &prep, &blank, Some(&img));
+                }
+                if drawn.is_none() {
+                    drawn = r.prepare_matte_3d(ctx, m, out).and_then(|prep| crate::classic3d::draw_run(e, &prep, &blank));
+                }
+                match drawn {
                     Some(img) => img,
                     None => e.g.upload_image(&r.matte_3d(ctx, layer, m, out))?,
                 }

@@ -2460,7 +2460,7 @@ impl<'a> Renderer<'a> {
         out
     }
 
-    /// A 2D layer whose effects an accelerator can run on its own device and keep there, instead
+    /// A layer whose effects an accelerator can run on its own device and keep there, instead
     /// of each frame's result being read back for the layer cache and uploaded again to be
     /// composited: where effect space starts in layer coordinates (the stack runs on the
     /// layer's input, [`Self::layer_input`] or [`Self::plain_solid`], in effect space). Only for a stack that changes from frame to frame (a still
@@ -2468,7 +2468,7 @@ impl<'a> Renderer<'a> {
     /// supports; no layer styles, no motion-blurred content.
     pub fn resident_effects(&self, ctx: &EvalCtx, layer: &Layer) -> Option<[f64; 2]> {
         let a = self.active_accel()?;
-        if layer.switches.adjustment || layer.is_3d() || !layer.switches.effects || styles::active(ctx, layer) || self.content_times(ctx, layer).is_some() {
+        if layer.switches.adjustment || !layer.switches.effects || styles::active(ctx, layer) || self.content_times(ctx, layer).is_some() {
             return None;
         }
         let fx = layer.effects()?;
@@ -2587,6 +2587,20 @@ impl<'a> Renderer<'a> {
         solo.blend_mode = BlendMode::Normal;
         solo.switches.video = true;
         three_d::compose::gpu_run(self, ctx, &[&solo], out)
+    }
+
+    /// [`Self::prepare_matte_3d`] for a matte whose pixels the accelerator rendered and holds
+    /// ([`Self::resident_effects`]): `buf` describes them (size, offset, scale).
+    pub fn prepare_matte_3d_resident(&self, ctx: &EvalCtx, m: &Layer, out: (u32, u32), buf: Arc<Buf>) -> Option<three_d::Run3d> {
+        if !m.is_active_at(ctx.time) {
+            return None;
+        }
+        let mut solo = m.clone();
+        solo.track_matte = None;
+        solo.preserve_transparency = false;
+        solo.blend_mode = BlendMode::Normal;
+        solo.switches.video = true;
+        three_d::compose::gpu_run_of(self, ctx, &solo, out, buf)
     }
 
     /// Opacity the layer composites with (its Opacity × collapsed precomps' opacity).

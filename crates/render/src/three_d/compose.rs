@@ -778,30 +778,48 @@ pub(crate) fn gpu_run(r: &Renderer, ctx: &EvalCtx, run: &[&Layer], out: (u32, u3
     // Depth of field is left to the accelerator (its blur runs where the planes are drawn).
     let rd = Renderer { defer_dof: true, ..*r };
     let g = gather(&rd, ctx, run, out);
-    let planes: Vec<Plane3d> = g
-        .items
-        .into_iter()
-        .chain(g.extra)
-        .map(|it| Plane3d {
-            layer_id: it.layer.id.0 as u32,
-            mode: it.layer.blend_mode,
-            buf: it.buf,
-            dof: it.dof,
-            bicubic: it.bicubic,
-            geos: it.geos,
-            mat: it.mat,
-            opacity: it.opacity,
-            draw: it.draw,
-            matte: it.matte,
-            preserve: it.preserve,
-            winv: it.winv,
-            bounds: it.bounds,
-            bbox: it.bbox,
-            order: it.order,
-        })
-        .collect();
+    let planes: Vec<Plane3d> = g.items.into_iter().chain(g.extra).map(plane_of).collect();
     let casters = planes.iter().enumerate().filter(|(_, p)| r.opts.shadows() && p.mat.casts_shadows != 0 && !p.geos.is_empty()).map(|(i, _)| i).collect();
     Some(Run3d { planes, casters, lights: g.lights, seed: run[0].id.0 as u32 })
+}
+
+fn plane_of(it: Item) -> Plane3d {
+    Plane3d {
+        layer_id: it.layer.id.0 as u32,
+        mode: it.layer.blend_mode,
+        buf: it.buf,
+        dof: it.dof,
+        bicubic: it.bicubic,
+        geos: it.geos,
+        mat: it.mat,
+        opacity: it.opacity,
+        draw: it.draw,
+        matte: it.matte,
+        preserve: it.preserve,
+        winv: it.winv,
+        bounds: it.bounds,
+        bbox: it.bbox,
+        order: it.order,
+    }
+}
+
+/// [`gpu_run`] of one layer drawn alone whose pixels the accelerator holds itself: `buf` only
+/// describes them (size, offset, scale). `None` as [`gpu_run`], and for per-character 3D text
+/// (one plane per character, cut from the CPU's buffer).
+pub(crate) fn gpu_run_of(r: &Renderer, ctx: &EvalCtx, layer: &Layer, out: (u32, u32), buf: Arc<Buf>) -> Option<Run3d> {
+    if layer.switches.adjustment
+        || layer.environment_background
+        || matches!(layer.source, effectcraft_project::LayerSource::Text)
+        || r.quality(layer) == effectcraft_project::Quality::Wireframe
+        || super::adv::active(r, ctx)
+    {
+        return None;
+    }
+    let rd = Renderer { defer_dof: true, ..*r };
+    let plane = plane_of(prepare_with(&rd, ctx, layer, 0, out, true, buf, Mat4::IDENTITY)?);
+    let lights = scene_lights(&r.collapse3d.map_or(*ctx, |c| c.parent));
+    let casters = if r.opts.shadows() && plane.mat.casts_shadows != 0 && !plane.geos.is_empty() { vec![0] } else { vec![] };
+    Some(Run3d { planes: vec![plane], casters, lights, seed: layer.id.0 as u32 })
 }
 
 // ------------------------------------------------------------------ auxiliary render pass
