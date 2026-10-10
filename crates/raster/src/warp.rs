@@ -30,22 +30,27 @@ impl Default for WarpOpts {
     }
 }
 
-/// Box-filter halving (for minification).
-fn half(src: &Image) -> Image {
-    let w = src.width.div_ceil(2).max(1);
-    let h = src.height.div_ceil(2).max(1);
+/// Box-filter halving of only the source axes that are being minified.
+fn half(src: &Image, axes: [bool; 2]) -> Image {
+    let step_x = if axes[0] { 2 } else { 1 };
+    let step_y = if axes[1] { 2 } else { 1 };
+    let w = src.width.div_ceil(step_x).max(1);
+    let h = src.height.div_ceil(step_y).max(1);
+    let weight = 1.0 / (step_x * step_y) as f32;
     let mut out = Image::new(w, h);
     out.rows_mut().for_each(|(y, row)| {
         for (x, px) in row.iter_mut().enumerate() {
-            let (sx, sy) = (2 * x as i64, 2 * y as i64);
+            let (sx, sy) = (step_x as i64 * x as i64, step_y as i64 * y as i64);
             let mut acc = [0.0f32; 4];
-            for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
-                let p = src.get_clamped(sx + dx, sy + dy);
-                for c in 0..4 {
-                    acc[c] += p[c];
+            for dy in 0..step_y {
+                for dx in 0..step_x {
+                    let p = src.get_clamped(sx + dx as i64, sy + dy as i64);
+                    for c in 0..4 {
+                        acc[c] += p[c];
+                    }
                 }
             }
-            *px = acc.map(|v| v * 0.25);
+            *px = acc.map(|v| v * weight);
         }
     });
     out
@@ -213,25 +218,31 @@ fn composite_warp_impl(dst: &mut Image, src: &Image, m: &Mat3, opts: &WarpOpts, 
         return;
     }
     let Some(inv) = m.inverse() else { return };
-    // Minification: pick a pre-filtered level so sampling doesn't alias.
-    let scale = m.mean_scale();
-    let mut level_img;
-    let mut img = src;
+    // Measure the destination pixel's footprint along each source axis. A mean
+    // scale blurred both axes of highly nonuniform transforms, erasing detail
+    // along an unscaled axis (e.g. tick marks on a narrow vertical strip).
+    let mut footprint = [inv.0[0][0].hypot(inv.0[0][1]), inv.0[1][0].hypot(inv.0[1][1])];
+    let mut factors = [1.0; 2];
+    let mut level_img = None;
     let mut inv = inv;
-    if scale < 0.5 && m.is_affine() {
-        let mut s = scale;
-        let mut f = 1.0;
-        level_img = half(src);
-        f *= 0.5;
-        s *= 2.0;
-        while s < 0.5 && level_img.width > 1 && level_img.height > 1 {
-            level_img = half(&level_img);
-            f *= 0.5;
-            s *= 2.0;
+    if m.is_affine() {
+        loop {
+            let img = level_img.as_ref().unwrap_or(src);
+            let axes = [footprint[0] > 2.0 && img.width > 1, footprint[1] > 2.0 && img.height > 1];
+            if !axes[0] && !axes[1] {
+                break;
+            }
+            level_img = Some(half(img, axes));
+            for axis in 0..2 {
+                if axes[axis] {
+                    footprint[axis] *= 0.5;
+                    factors[axis] *= 0.5;
+                }
+            }
         }
-        img = &level_img;
-        inv = Mat3::scale(vec2(f, f)) * inv;
+        inv = Mat3::scale(vec2(factors[0], factors[1])) * inv;
     }
+    let img = level_img.as_ref().unwrap_or(src);
     let bounds = m.map_rect(&Rect::from_size(src.width as f64, src.height as f64)).inflate(1.0).round_out();
     let full = Rect::from_size(dst.width as f64, dst.height as f64);
     let mut area = bounds.intersect(&full);
@@ -328,6 +339,37 @@ pub fn resample(src: &Image, w: u32, h: u32) -> Image {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nonuniform_minification_preserves_unscaled_stripes_and_edges() {
+        // Like a long solid compressed into a narrow bar: the along-bar dashes
+        // must retain their colours and alpha, including at its first/last row.
+        for vertical in [true, false] {
+            let (w, h) = if vertical { (256, 32) } else { (32, 256) };
+            let mut src = Image::new(w, h);
+            for y in 0..h {
+                for x in 0..w {
+                    let along = if vertical { y } else { x };
+                    let px = if along % 4 < 2 { [0.25, 0.5, 0.75, 1.0] } else { [0.0; 4] };
+                    src.set(x, y, px);
+                }
+            }
+            let (w, h, sx, sy) = if vertical { (4, 32, 1.0 / 64.0, 1.0) } else { (32, 4, 1.0, 1.0 / 64.0) };
+            let mut dst = Image::new(w, h);
+            composite_warp(&mut dst, &src, &Mat3::scale(vec2(sx, sy)), &WarpOpts::default());
+            for along in 0..32 {
+                let (x, y) = if vertical { (2, along) } else { (along, 2) };
+                let expected = if along % 4 < 2 { [0.25, 0.5, 0.75, 1.0] } else { [0.0; 4] };
+                assert_eq!(dst.get(x, y), expected, "vertical {vertical}, sample {along}");
+            }
+        }
+        // A one-pixel-high source still needs filtering in its long dimension.
+        let mut line = Image::new(256, 1);
+        for x in (0..256).step_by(2) {
+            line.set(x, 0, [1.0; 4]);
+        }
+        assert_eq!(resample(&line, 1, 1).get(0, 0), [0.5; 4]);
+    }
 
     #[test]
     fn identity_warp_copies() {
