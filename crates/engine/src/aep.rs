@@ -19,6 +19,17 @@ pub const MAX_FILE_BYTES: usize = 64 * 1024 * 1024;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// The Photoshop document at `path`, when it is one of a readable size (`None` otherwise: the
+/// layer then keeps its plain pixels).
+fn read_photoshop_file(path: &str) -> Option<effectcraft_psd::Psd> {
+    let size = std::fs::metadata(path).ok()?.len();
+    if size > MAX_FILE_BYTES as u64 * 8 {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    effectcraft_psd::is_psd(&bytes).then(|| effectcraft_psd::Psd::parse(bytes).ok()).flatten()
+}
+
 use effectcraft_color::Label;
 use effectcraft_project::build;
 use effectcraft_project::{AutoOrient, Comp, Footage, FootageKind, Item, ItemId, ItemKind, LayerSource, Project, Solid};
@@ -929,6 +940,9 @@ fn build_project(
         }
     }
 
+    // Photoshop documents whose layers are footage, read once each for their layer effects.
+    let mut photoshop_files: HashMap<String, Option<effectcraft_psd::Psd>> = HashMap::new();
+
     // 4. Build each composition
     for (dcomp, cid) in decoded_comps.into_iter().zip(comp_ids) {
         let frame_rate = FrameRate::from_f64(dcomp.frame_rate);
@@ -1080,6 +1094,21 @@ fn build_project(
             }
 
             import_warnings.extend(streams::install_transforms(&dlayer.transforms, &mut layer, source_size, &mut build::Ids(&mut project.next_id))?);
+            // Footage that is one layer of a Photoshop document shows that layer as Photoshop
+            // does, layer effects (Color Overlay, Stroke, glows...) and Fill Opacity included:
+            // the file's own style properties for such a layer are empty when the styles were
+            // merged into the footage at import. They are rebuilt here as Layer Styles.
+            if let LayerSource::Footage { item } = layer.source
+                && let Some(ItemKind::Footage(footage)) = project.item(item).map(|i| &i.kind)
+                && let Some(index) = footage.layer.as_ref().map(|l| l.index as usize)
+                && !footage.missing
+            {
+                let path = footage.path.clone();
+                let psd = photoshop_files.entry(path).or_insert_with_key(|path| read_photoshop_file(path));
+                if let Some(photoshop_layer) = psd.as_ref().and_then(|psd| psd.layers.get(index)).cloned() {
+                    crate::psd_import::apply_layer_styles(&mut project, &mut layer, &photoshop_layer, &comp.global_light);
+                }
+            }
             import_warnings.extend(shapes::apply(&dlayer.shapes, &mut project, &mut layer, size)?);
             let (groups, warnings) =
                 effects::instantiate(&dlayer.effects, &mut build::Ids(&mut project.next_id), [f64::from(size.0), f64::from(size.1)], &raw_layer_ids)?;

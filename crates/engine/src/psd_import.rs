@@ -298,18 +298,23 @@ fn build_layer(proj: &mut Project, cx: &mut Ctx, comp: &Comp, n: &Node) -> Optio
             masks.children.push(build::mask(&mut ids, &format!("Mask {}", k + 1), path, mode, [255, 255, 0]).into());
         }
     }
-    // Layer effects → Layer Styles; Fill Opacity → Advanced Blending.
-    let gl = comp.global_light.clone();
+    apply_layer_styles(proj, &mut layer, &pl, &comp.global_light);
+    Some(layer)
+}
+
+/// A Photoshop layer's look beyond its pixels, on `layer`: layer effects become Layer Styles,
+/// Fill Opacity becomes Advanced Blending.
+pub(crate) fn apply_layer_styles(proj: &mut Project, layer: &mut Layer, pl: &effectcraft_psd::Layer, gl: &styles::GlobalLight) {
     if let Some(fx) = &pl.effects
         && fx.bool("masterFXSwitch") != Some(false)
         && layer.can_have_styles()
     {
-        apply_effects(proj, &mut layer, fx, &gl);
+        apply_effects(proj, layer, fx, gl);
     }
     if pl.fill_opacity < 255 && layer.can_have_styles() {
         let mut ids = Ids(&mut proj.next_id);
         if layer.props.sub(styles::GROUP).is_none() {
-            let g = styles::layer_styles(&mut ids, &gl);
+            let g = styles::layer_styles(&mut ids, gl);
             let at = layer.props.children.iter().position(|c| c.match_id() == "transform").map(|i| i + 1).unwrap_or(layer.props.children.len());
             layer.props.children.insert(at, g.into());
         }
@@ -317,7 +322,6 @@ fn build_layer(proj: &mut Project, cx: &mut Ctx, comp: &Comp, n: &Node) -> Optio
             p.value = Value::Scalar(pl.fill_opacity as f64 / 255.0 * 100.0);
         }
     }
-    Some(layer)
 }
 
 /// Where layer space's origin sits in document pixels.
@@ -713,5 +717,37 @@ mod tests {
         assert_eq!(blend_mode("pass"), BlendMode::Normal);
         assert_eq!(desc_blend(Some("linearDodge")), Some(BlendMode::LinearDodge));
         assert_eq!(font_names("Inter-Bold"), ("Inter".into(), "Bold".into()));
+    }
+
+    /// A Photoshop layer's effects and Fill Opacity land on any layer that shows it (also the
+    /// footage layers of an imported After Effects project).
+    #[test]
+    fn photoshop_layer_effects_become_layer_styles() {
+        let named = |items: Vec<(&str, DValue)>| Descriptor {
+            class_name: String::new(),
+            class_id: "null".into(),
+            items: items.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
+        };
+        let white = named(vec![("Rd  ", DValue::Double(255.0)), ("Grn ", DValue::Double(255.0)), ("Bl  ", DValue::Double(255.0))]);
+        let overlay = named(vec![("enab", DValue::Bool(true)), ("Opct", DValue::UnitFloat("#Prc".into(), 100.0)), ("Clr ", DValue::Descriptor(white))]);
+        let photoshop_layer = effectcraft_psd::Layer {
+            effects: Some(named(vec![("masterFXSwitch", DValue::Bool(true)), ("SoFi", DValue::Descriptor(overlay))])),
+            fill_opacity: 51,
+            ..Default::default()
+        };
+        let mut session = crate::Session::new();
+        session.execute("comp.new", serde_json::json!({"width":64,"height":64})).unwrap();
+        session.execute("layer.newSolid", serde_json::json!({"color":"#201810"})).unwrap();
+        let mut project = (*session.project).clone();
+        let comp = project.comps().next().unwrap().1.clone();
+        let mut layer = comp.layers[0].clone();
+        apply_layer_styles(&mut project, &mut layer, &photoshop_layer, &comp.global_light);
+        assert_eq!(layer.props.prop("layerStyles/colorOverlay/color").unwrap().value, Value::Color([1.0, 1.0, 1.0, 1.0]));
+        assert_eq!(layer.props.prop("layerStyles/blendingOptions/advancedBlending/fillOpacity").unwrap().value, Value::Scalar(20.0));
+        // Effects switched off as a whole add no style.
+        let mut plain = comp.layers[0].clone();
+        let off = effectcraft_psd::Layer { effects: Some(named(vec![("masterFXSwitch", DValue::Bool(false))])), fill_opacity: 255, ..Default::default() };
+        apply_layer_styles(&mut project, &mut plain, &off, &comp.global_light);
+        assert!(plain.props.sub(styles::GROUP).is_none());
     }
 }
