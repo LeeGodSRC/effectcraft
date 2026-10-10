@@ -184,7 +184,7 @@ pub fn range_value(r: &Range, i: usize, n: usize) -> f64 {
                     0.0
                 }
             };
-            if e - s <= 1e-12 { 0.0 } else { edge(c - s).min(edge(e - c)) }
+            if e - s <= 1e-12 { 0.0 } else { (edge(c - s) + edge(e - c) - 1.0).clamp(0.0, 1.0) }
         }
         shape => {
             if e - s <= 1e-12 {
@@ -195,11 +195,11 @@ pub fn range_value(r: &Range, i: usize, n: usize) -> f64 {
                     _ => 0.0,
                 }
             } else {
-                ease(shape_value(shape, (c - s) / (e - s)), r.ease_high, r.ease_low)
+                shape_value(shape, (c - s) / (e - s))
             }
         }
     };
-    v * r.amount
+    ease(v, r.ease_high, r.ease_low) * r.amount
 }
 
 /// SplitMix64 step (deterministic hashing for seeds and noise lattices).
@@ -339,6 +339,22 @@ mod tests {
         // Monotonic.
         let v: Vec<f64> = (0..=20).map(|i| ease(i as f64 / 20.0, -1.0, 1.0)).collect();
         assert!(v.windows(2).all(|w| w[1] >= w[0]));
+    }
+
+    #[test]
+    fn square_edges_obey_ease_and_short_ranges_measure_coverage() {
+        let linear = r(0.0, 0.3, Shape::Square);
+        let low = Range { ease_low: 1.0, ..linear };
+        let high = Range { ease_high: 1.0, ..linear };
+        let v = range_value(&linear, 1, 4);
+        assert!((v - 0.2).abs() < 1e-9);
+        assert!(range_value(&low, 1, 4) < v);
+        assert!(range_value(&high, 1, 4) > v);
+        let hard = Range { smoothness: 0.0, ..high };
+        assert_eq!(range_value(&hard, 1, 4), 0.0);
+        assert_eq!(range_value(&hard, 0, 4), 1.0);
+        // A range narrower than a character covers only that fraction of its cell.
+        assert!((range_value(&r(0.4, 0.6, Shape::Square), 0, 1) - 0.2).abs() < 1e-9);
     }
 
     #[test]

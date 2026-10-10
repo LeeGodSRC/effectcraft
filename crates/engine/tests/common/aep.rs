@@ -33,6 +33,9 @@ fn item(id: u32, name: &str, children: &[Vec<u8>]) -> Vec<u8> {
     list(b"Item", &nodes)
 }
 pub fn comp(id: u32, name: &str, source: u32) -> Vec<u8> {
+    comp_with_props(id, name, source, &[])
+}
+fn comp_with_props(id: u32, name: &str, source: u32, props: &[Vec<u8>]) -> Vec<u8> {
     let mut meta = vec![0; 204];
     put(&mut meta, 44, 240);
     put(&mut meta, 48, 24);
@@ -52,7 +55,9 @@ pub fn comp(id: u32, name: &str, source: u32) -> Vec<u8> {
     put(&mut ld, 40, source);
     let pos: Vec<_> = [23.0f64, 17.0, 0.0].into_iter().flat_map(f64::to_be_bytes).collect();
     let transform = list(b"tdgp", &[chunk(b"tdmn", b"ADBE Position"), list(b"tdbs", &[chunk(b"cdat", &pos)])]);
-    let layer = list(b"Layr", &[chunk(b"ldta", &ld), chunk(b"Utf8", b"Layer"), list(b"tdgp", &[chunk(b"tdmn", b"ADBE Transform Group"), transform])]);
+    let mut groups = vec![chunk(b"tdmn", b"ADBE Transform Group"), transform];
+    groups.extend_from_slice(props);
+    let layer = list(b"Layr", &[chunk(b"ldta", &ld), chunk(b"Utf8", b"Layer"), list(b"tdgp", &groups)]);
     item(
         id,
         name,
@@ -64,6 +69,9 @@ pub fn comp(id: u32, name: &str, source: u32) -> Vec<u8> {
             list(b"SecL", &[chunk(b"ldta", &ld), chunk(b"Utf8", b"Markers")]),
         ],
     )
+}
+pub fn text_project(blob: &[u8]) -> Vec<u8> {
+    container(&[comp_with_props(1, "Text", 0, &[chunk(b"tdmn", b"ADBE Text Properties"), list(b"tdgp", &[list(b"btdk", &[blob.to_vec()])])])])
 }
 pub fn project() -> Vec<u8> {
     let mut metadata = vec![0; 286];

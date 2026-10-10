@@ -142,6 +142,12 @@ fn layer_seed(layer: &Layer, seed: f64) -> u64 {
     (seed as i64 as u64) ^ layer.id.0.wrapping_mul(0x9E37_79B9)
 }
 
+fn range_seed(anim: &PropGroup, seed: f64) -> u64 {
+    // AE's zero seed belongs to the animator group. An explicit seed reproduces an
+    // order across groups and layers. Our permutation is deterministic, not AE's RNG.
+    if seed == 0.0 { anim.uid } else { seed as i64 as u64 }
+}
+
 /// Range Selector parameters at the context time (fractions of `n` units).
 fn range_params(ctx: &EvalCtx, layer: &Layer, sel: &PropGroup, n: usize) -> Range {
     let adv = sel.sub("advanced");
@@ -186,7 +192,7 @@ pub fn animator_selection(ctx: &EvalCtx, layer: &Layer, anim: &PropGroup, lay: &
                 let r = range_params(ctx, layer, sel, n);
                 let adv = sel.sub("advanced");
                 let perm =
-                    adv.filter(|a| ctx.b(layer, a, "randomize")).map(|a| selectors::random_order(n, layer_seed(layer, ctx.f(layer, a, "randomSeed", 0.0))));
+                    adv.filter(|a| ctx.b(layer, a, "randomize")).map(|a| selectors::random_order(n, range_seed(anim, ctx.f(layer, a, "randomSeed", 0.0))));
                 Box::new(move |i, n, _| {
                     let i = perm.as_ref().and_then(|p| p.get(i).copied()).unwrap_or(i);
                     [selectors::range_value(&r, i, n); 3]
@@ -582,6 +588,18 @@ pub fn text_geom(ctx: &EvalCtx, layer: &Layer) -> Option<TextGeom> {
     // Variable Font Axes: the advance at the animated design-space position (later characters
     // on the line move with it).
     let n = lay.glyphs.len();
+    // Grouping Alignment Y is measured against capital height: -50% centers capitals
+    // around their baseline anchor. Font size (the em square) makes stretched glyphs
+    // pivot much too high. Measuring H also works for fonts without cap-height metadata.
+    let cap_heights: Vec<f64> = lay
+        .styles
+        .iter()
+        .map(|st| {
+            let (h, _) = char_glyph_style(st, 'H');
+            effectcraft_path::bounds(&[h]).map_or(st.size * 0.7, |b| b.height())
+        })
+        .collect();
+    let cap_height = |g: &CharGlyph| cap_heights.get(g.run).copied().unwrap_or(g.size * 0.7);
     let vadv: Vec<f64> = (0..n)
         .map(|gi| match (subs[gi], xfs[gi].axis_deltas()) {
             (None, d) if !d.is_empty() => effectcraft_text::variable::char_advance_delta(&lay.glyphs[gi], &d).unwrap_or(0.0),
@@ -635,7 +653,7 @@ pub fn text_geom(ctx: &EvalCtx, layer: &Layer) -> Option<TextGeom> {
             _ => usize::MAX,
         }
     };
-    let mut extents: std::collections::HashMap<usize, [f64; 4]> = std::collections::HashMap::new();
+    let mut extents: std::collections::HashMap<usize, [f64; 5]> = std::collections::HashMap::new();
     if grouping != 0 {
         for gi in 0..n {
             let g = &lay.glyphs[gi];
@@ -643,11 +661,12 @@ pub fn text_geom(ctx: &EvalCtx, layer: &Layer) -> Option<TextGeom> {
                 continue;
             }
             let o = origin(gi);
-            let e = extents.entry(group_key(g)).or_insert([f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY]);
+            let e = extents.entry(group_key(g)).or_insert([f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY, 0.0]);
             e[0] = e[0].min(o[0]);
             e[2] = e[2].max(o[0] + advance(gi));
             e[1] = e[1].min(o[1]);
             e[3] = e[3].max(o[1]);
+            e[4] = e[4].max(cap_height(g));
         }
     }
 
@@ -689,7 +708,6 @@ pub fn text_geom(ctx: &EvalCtx, layer: &Layer) -> Option<TextGeom> {
         }
         let o = origin(gi);
         let st = lay.styles.get(g.run).unwrap_or(&base);
-        let size = st.size;
         // Outline (substituted characters aligned in the original slot).
         let (outline, adv) = match subs[gi] {
             Some(c) => {
@@ -711,8 +729,10 @@ pub fn text_geom(ctx: &EvalCtx, layer: &Layer) -> Option<TextGeom> {
             continue;
         }
         let pivot = match extents.get(&group_key(g)) {
-            Some(e) if grouping != 0 => [(e[0] + e[2]) / 2.0 + galign[0] / 100.0 * (e[2] - e[0]), (e[1] + e[3]) / 2.0 + galign[1] / 100.0 * size],
-            _ => [o[0] + adv / 2.0 + galign[0] / 100.0 * adv, o[1] + galign[1] / 100.0 * size],
+            Some(e) if grouping != 0 => {
+                [(e[0] + e[2]) / 2.0 + galign[0] / 100.0 * (e[2] - e[0]), (e[1] + e[3]) / 2.0 + galign[1] / 100.0 * (e[3] - e[1] + e[4])]
+            }
+            _ => [o[0] + adv / 2.0 + galign[0] / 100.0 * adv, o[1] + galign[1] / 100.0 * cap_height(g)],
         };
         // Outline relative to the pivot.
         let local = kurbo::Affine::translate((o[0] - pivot[0], o[1] - pivot[1])) * outline;
@@ -871,6 +891,27 @@ fn runs(geom: &TextGeom) -> Vec<(Vec<usize>, bool)> {
     out
 }
 
+/// Blur is a character-space operation, before its animator transform. Rasterizing it
+/// after Scale turns a thin, tall streak into a wide horizontal smudge. Keep both axes
+/// (and their rotation/skew) by blurring a local patch and transforming that patch.
+fn draw_blurred_glyph(g: &PlacedGlyph, stroke: bool, img: &mut Image, m: &Mat3, mode: BlendMode) {
+    let Some(b) = effectcraft_path::bounds(std::slice::from_ref(&g.local)) else { return };
+    let pad = if stroke { g.stroke_width } else { 0.0 };
+    let b = b.inflate(pad + 2.0 + g.xf.blur[0] * 1.5, pad + 2.0 + g.xf.blur[1] * 1.5);
+    if !b.width().is_finite() || !b.height().is_finite() || b.width() <= 0.0 || b.height() <= 0.0 {
+        return;
+    }
+    // Bound memory even for hostile text sizes / animator values. At least half a pixel
+    // per local unit avoids losing narrow outlines before a large vertical stretch.
+    let sx = m.0[0][0].hypot(m.0[1][0]).max(0.5).min(4096.0 / b.width());
+    let sy = m.0[0][1].hypot(m.0[1][1]).max(0.5).min(4096.0 / b.height());
+    let (w, h) = ((b.width() * sx).ceil().clamp(1.0, 4096.0) as i64, (b.height() * sy).ceil().clamp(1.0, 4096.0) as i64);
+    let local_to_patch = Mat3::scale(vec2(sx, sy)) * Mat3::translate(vec2(-b.x0, -b.y0));
+    let patch = raster_pass(g, stroke, std::slice::from_ref(&g.local), &local_to_patch, [0, 0, w, h], [g.xf.blur[0] * sx, g.xf.blur[1] * sy]);
+    let patch_to_local = Mat3::translate(vec2(b.x0, b.y0)) * Mat3::scale(vec2(1.0 / sx, 1.0 / sy));
+    effectcraft_raster::composite_warp(img, &patch, &(*m * patch_to_local), &effectcraft_raster::WarpOpts { mode, ..Default::default() });
+}
+
 /// Draw glyphs (paths mapped by `to_px` from layer space into `img`).
 fn draw_glyphs(geom: &TextGeom, img: &mut Image, to_px: &Mat3, s: f64, only: Option<usize>) {
     let (w, h) = (img.width as i64, img.height as i64);
@@ -880,6 +921,11 @@ fn draw_glyphs(geom: &TextGeom, img: &mut Image, to_px: &Mat3, s: f64, only: Opt
     };
     for (run, stroke) in runs {
         let Some(g) = run.first().map(|&gi| &geom.glyphs[gi]) else { continue };
+        if g.xf.blur.iter().any(|v| *v > 0.05) {
+            let m = if only.is_some() { *to_px } else { *to_px * g.m2() };
+            draw_blurred_glyph(g, stroke, img, &m, if only.is_some() { BlendMode::Normal } else { geom.blend });
+            continue;
+        }
         // One glyph is drawn from its own outline; a run from its glyphs' outlines in layer
         // space, all wound the same way so overlaps add up instead of cancelling (NonZero).
         let local = Cow::Borrowed(std::slice::from_ref(&g.local));
@@ -915,14 +961,25 @@ pub fn render(ctx: &EvalCtx, layer: &Layer, s: f64) -> Buf {
     let Some(geom) = text_geom(ctx, layer) else { return empty() };
     let mut bounds: Option<kurbo::Rect> = None;
     for g in &geom.glyphs {
-        if let Some(b) = effectcraft_path::bounds(&[g.path()]) {
-            let pad = g.stroke_width + 2.0 + g.xf.blur[0].max(g.xf.blur[1]) * 1.5;
-            let b = b.inflate(pad, pad);
+        if g.xf.opacity > 0.0
+            && let Some(b) = effectcraft_path::bounds(std::slice::from_ref(&g.local))
+        {
+            let pad = g.stroke_width + 2.0;
+            let b = b.inflate(pad + g.xf.blur[0] * 1.5, pad + g.xf.blur[1] * 1.5);
+            let b = g.m2().map_rect(&effectcraft_geom::Rect::new(b.x0, b.y0, b.x1, b.y1));
+            let b = kurbo::Rect::new(b.x0, b.y0, b.x1, b.y1);
             bounds = Some(bounds.map_or(b, |a| a.union(b)));
         }
     }
     let Some(b) = bounds else { return empty() };
     let b = b.intersect(kurbo::Rect::new(-20000.0, -20000.0, 20000.0, 20000.0));
+    if b.width() <= 0.0 || b.height() <= 0.0 || !s.is_finite() || s <= 0.0 {
+        return empty();
+    }
+    // Bound the area, not just the longest side: tall, narrow streaks need enough
+    // horizontal samples to survive. Keep at most four million RGBA-float pixels,
+    // plus the two-pixel border, without changing the layer-space geometry.
+    let s = s.min(16380.0 / b.width()).min(16380.0 / b.height()).min((4_000_000.0 / (b.width() * b.height())).sqrt());
     let w = ((b.width() * s).ceil() as u32 + 4).clamp(1, 16384);
     let h = ((b.height() * s).ceil() as u32 + 4).clamp(1, 16384);
     let offset = [-b.x0 * s + 2.0, -b.y0 * s + 2.0];

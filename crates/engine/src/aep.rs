@@ -34,7 +34,7 @@ mod text;
 pub struct AepReport {
     /// Project file path if known.
     pub project_path: Option<String>,
-    /// Font families referenced in the project.
+    /// Font names used by imported text styles (not unused entries in AEP font tables).
     pub fonts: Vec<String>,
     /// Fonts missing from the local system.
     pub missing_fonts: Vec<String>,
@@ -1101,10 +1101,25 @@ fn build_project(
         );
     }
 
+    // Text blobs also contain editing defaults such as Myriad-Roman, even when no
+    // character uses them. Report the reconstructed styles, including every run.
+    let mut used_fonts = std::collections::BTreeSet::new();
+    for (_, comp) in project.comps() {
+        for layer in &comp.layers {
+            if let Some(prop) = layer.props.prop("text/sourceText") {
+                for value in std::iter::once(&prop.value).chain(prop.keys.iter().map(|k| &k.value)) {
+                    if let effectcraft_keyframe::Value::Text(doc) = value {
+                        used_fonts.insert(doc.font.clone());
+                        used_fonts.extend(doc.runs.iter().map(|run| run.style.font.clone()));
+                    }
+                }
+            }
+        }
+    }
     let missing_count = missing_footage.len();
     let report = AepReport {
         project_path: project_path.map(|p| p.to_string_lossy().to_string()),
-        fonts,
+        fonts: used_fonts.into_iter().collect(),
         missing_fonts: Vec::new(),
         missing_footage,
         total_footage_count: total_footage,

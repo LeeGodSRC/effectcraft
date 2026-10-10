@@ -172,6 +172,7 @@ fn text_animators(nodes: &[ChunkNode<'_>], ids: &mut build::Ids<'_>, warnings: &
                 for (name, _, data) in entries(sub) {
                     if name == "ADBE Text Selector" {
                         let mut selector = build::range_selector(ids, &title(data, "Range Selector"));
+                        selector.enabled = enabled(data);
                         text_numeric(data, &mut selector, warnings)?;
                         selectors.push(selector);
                     }
@@ -191,17 +192,30 @@ fn text_animators(nodes: &[ChunkNode<'_>], ids: &mut build::Ids<'_>, warnings: &
 }
 
 fn text_numeric(nodes: &[ChunkNode<'_>], group: &mut PropGroup, warnings: &mut Vec<String>) -> Result<(), String> {
-    for (name, _, children) in entries(nodes) {
-        if name == "ADBE Text Range Advanced" {
-            if let Some(advanced) = group.group_mut("advanced") {
+    // Advanced/Units determines which of the two stored range channels is active,
+    // regardless of the order in which those streams occur in the file.
+    if let Some(advanced) = group.group_mut("advanced") {
+        for (name, _, children) in entries(nodes) {
+            if name == "ADBE Text Range Advanced" {
                 text_numeric(children, advanced, warnings)?;
             }
+        }
+    }
+    let index_units = group.prop("advanced/units").is_some_and(|p| p.value.as_enum() == 1);
+    for (name, _, children) in entries(nodes) {
+        if name == "ADBE Text Range Advanced" {
+            continue;
+        }
+        if (name.starts_with("ADBE Text Percent ") && index_units) || (name.starts_with("ADBE Text Index ") && !index_units) {
             continue;
         }
         let (path, enum_offset) = match name.as_str() {
-            "ADBE Text Percent Start" => ("start", false),
-            "ADBE Text Percent End" => ("end", false),
-            "ADBE Text Percent Offset" => ("offset", false),
+            "ADBE Text Percent Start" | "ADBE Text Index Start" => ("start", false),
+            "ADBE Text Percent End" | "ADBE Text Index End" => ("end", false),
+            "ADBE Text Percent Offset" | "ADBE Text Index Offset" => ("offset", false),
+            "ADBE Text Range Units" => ("units", true),
+            "ADBE Text Selector Mode" => ("mode", true),
+            "ADBE Text Selector Max Amount" => ("amount", false),
             "ADBE Text Range Shape" => ("shape", true),
             "ADBE Text Range Type2" => ("basedOn", true),
             "ADBE Text Selector Smoothness" => ("smoothness", false),
@@ -215,8 +229,12 @@ fn text_numeric(nodes: &[ChunkNode<'_>], group: &mut PropGroup, warnings: &mut V
         };
         if let Some(property) = group.prop_mut(path) {
             warnings.extend(super::streams::apply(children, property)?);
-            if enum_offset && let Value::Enum(value) = &mut property.value {
-                *value = value.saturating_sub(1);
+            if enum_offset {
+                for value in std::iter::once(&mut property.value).chain(property.keys.iter_mut().map(|k| &mut k.value)) {
+                    if let Value::Enum(value) = value {
+                        *value = value.saturating_sub(1);
+                    }
+                }
             }
         }
     }
@@ -451,6 +469,65 @@ mod tests {
     }
     fn list<'a>(kind: &[u8; 4], children: Vec<ChunkNode<'a>>) -> ChunkNode<'a> {
         ChunkNode::List { id: *b"LIST", list_type: *kind, children }
+    }
+    #[test]
+    fn text_range_preserves_advanced_controls_and_active_index_channels() {
+        let values: Vec<_> = [2.0f64, 3.0, -40.0, 4.0, 6.0, 25.0, -60.0, 70.0, 1.0, 19.0, 2.0, 7.0, -1.0, 90.0].map(f64::to_be_bytes).into();
+        let advanced_names: [&[u8]; 10] = [
+            b"ADBE Text Range Units",
+            b"ADBE Text Selector Mode",
+            b"ADBE Text Selector Max Amount",
+            b"ADBE Text Range Type2",
+            b"ADBE Text Range Shape",
+            b"ADBE Text Selector Smoothness",
+            b"ADBE Text Levels Max Ease",
+            b"ADBE Text Levels Min Ease",
+            b"ADBE Text Randomize Order",
+            b"ADBE Text Random Seed",
+        ];
+        let mut advanced = Vec::new();
+        for (name, value) in advanced_names.iter().zip(&values) {
+            advanced.extend([chunk(b"tdmn", name), list(b"tdbs", vec![chunk(b"cdat", value)])]);
+        }
+        let mut nodes = Vec::new();
+        for (name, value) in
+            [b"ADBE Text Index Start".as_slice(), b"ADBE Text Index End", b"ADBE Text Index Offset", b"ADBE Text Percent Start"].iter().zip(&values[10..])
+        {
+            nodes.extend([chunk(b"tdmn", name), list(b"tdbs", vec![chunk(b"cdat", value)])]);
+        }
+        nodes.extend([chunk(b"tdmn", b"ADBE Text Range Advanced"), list(b"tdgp", advanced)]);
+        let mut counter = 1;
+        let mut group = build::range_selector(&mut build::Ids(&mut counter), "Range");
+        let mut warnings = Vec::new();
+        text_numeric(&nodes, &mut group, &mut warnings).unwrap();
+        for (path, want) in [
+            ("start", Value::Scalar(2.0)),
+            ("end", Value::Scalar(7.0)),
+            ("offset", Value::Scalar(-1.0)),
+            ("advanced/units", Value::Enum(1)),
+            ("advanced/mode", Value::Enum(2)),
+            ("advanced/basedOn", Value::Enum(3)),
+            ("advanced/shape", Value::Enum(5)),
+            ("advanced/amount", Value::Scalar(-40.0)),
+            ("advanced/smoothness", Value::Scalar(25.0)),
+            ("advanced/easeHigh", Value::Scalar(-60.0)),
+            ("advanced/easeLow", Value::Scalar(70.0)),
+            ("advanced/randomize", Value::Bool(true)),
+            ("advanced/randomSeed", Value::Scalar(19.0)),
+        ] {
+            assert_eq!(group.prop(path).unwrap().value, want, "{path}");
+        }
+        assert!(warnings.is_empty());
+        let mut disabled = vec![chunk(b"tdsb", &[0, 0, 0, 0])];
+        disabled.extend(nodes);
+        let animators = vec![
+            chunk(b"tdmn", b"ADBE Text Animator"),
+            list(b"tdgp", vec![chunk(b"tdmn", b"ADBE Text Selectors"), list(b"tdgp", vec![chunk(b"tdmn", b"ADBE Text Selector"), list(b"tdgp", disabled)])]),
+        ];
+        let decoded = text_animators(&animators, &mut build::Ids(&mut counter), &mut warnings).unwrap();
+        let selector = decoded[0].sub("selectors").unwrap().groups().next().unwrap();
+        assert!(!selector.enabled);
+        assert_eq!(selector.prop("advanced/units").unwrap().value, Value::Enum(1));
     }
     #[test]
     fn vector_primitives_preserve_disabled_fill_color_and_size() {

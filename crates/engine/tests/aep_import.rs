@@ -110,6 +110,27 @@ fn aep_text_blob_is_opaque_not_a_malformed_subtree() {
 }
 
 #[test]
+fn aep_font_report_uses_character_runs_instead_of_unused_editing_defaults() {
+    let blob = br"/0 << /1 << /0 [
+        << /0 << /0 << /0 (Unused-Editing-Default) >> >> >>
+        << /0 << /0 << /0 (Inter-Bold) >> >> >>
+        << /0 << /0 << /0 (Original-Test-Font) >> >> >>
+    ] >> >> /1 << /1 [ << /0 << /0 (Ab\r)
+        /6 << /0 [
+            << /0 << /0 << /6 << /0 1 /1 40 /12 2 >> >> >> /1 1 >>
+            << /0 << /0 << /6 << /0 2 /1 20 /12 1 >> >> >> /1 2 >>
+        ] >> >> >> ] >>";
+    let (p, report) = aep::from_aep_with_report(&fixture::text_project(blob), None).unwrap();
+    assert_eq!(report.fonts, ["Inter-Bold", "Original-Test-Font"]);
+    let l = &p.comps().next().unwrap().1.layers[0];
+    assert!(matches!(l.source, LayerSource::Text));
+    let effectcraft_engine::keyframe::Value::Text(doc) = &l.props.prop("text/sourceText").unwrap().value else { panic!("source text") };
+    assert_eq!(doc.text, "Ab");
+    assert!(doc.all_caps);
+    assert!(doc.runs[1].style.small_caps);
+}
+
+#[test]
 fn aep_accepts_large_property_streams_within_the_byte_budget() {
     let empty = fixture::chunk(b"JUNK", b"");
     let payload = empty.repeat(350_000);
