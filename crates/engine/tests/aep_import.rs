@@ -370,3 +370,19 @@ fn aep_three_d_and_motion_blur_flags_are_independent() {
         assert_eq!(switches.motion_blur, motion_blur);
     }
 }
+
+#[test]
+fn aep_camera_aims_at_its_point_of_interest_only_when_flagged() {
+    use effectcraft_project::AutoOrient;
+    for (flags, aim) in [(1u32, AutoOrient::Off), (1 | 0x10000, AutoOrient::TowardsPointOfInterest)] {
+        let mut bytes = fixture::camera_project();
+        let offset = bytes.windows(4).position(|tag| tag == b"ldta").unwrap() + 8;
+        bytes[offset + 36..offset + 40].copy_from_slice(&flags.to_be_bytes());
+        let (project, _) = aep::from_aep_or_aepx_with_report(&bytes, None).unwrap();
+        let comp = project.items.values().find(|item| item.name == "Camera").unwrap().as_comp().unwrap();
+        let layer = &comp.layers[0];
+        assert!(matches!(layer.source, LayerSource::Camera));
+        assert_eq!(layer.auto_orient, aim);
+        assert!(!layer.switches.motion_blur, "a camera has no motion blur switch");
+    }
+}

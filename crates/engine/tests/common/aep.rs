@@ -73,6 +73,9 @@ fn comp_with_props(id: u32, name: &str, source: u32, props: &[Vec<u8>]) -> Vec<u
 pub fn text_project(blob: &[u8]) -> Vec<u8> {
     container(&[comp_with_props(1, "Text", 0, &[chunk(b"tdmn", b"ADBE Text Properties"), list(b"tdgp", &[list(b"btdk", &[blob.to_vec()])])])])
 }
+pub fn camera_project() -> Vec<u8> {
+    container(&[comp_with_props(1, "Camera", 0, &[chunk(b"tdmn", b"ADBE Camera Options Group"), list(b"tdgp", &[])])])
+}
 pub fn project() -> Vec<u8> {
     let mut metadata = vec![0; 286];
     put(&mut metadata, 30, 64);

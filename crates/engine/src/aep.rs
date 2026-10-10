@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use effectcraft_color::Label;
 use effectcraft_project::build;
-use effectcraft_project::{Comp, Footage, FootageKind, Item, ItemId, ItemKind, LayerSource, Project, Solid};
+use effectcraft_project::{AutoOrient, Comp, Footage, FootageKind, Item, ItemId, ItemKind, LayerSource, Project, Solid};
 use effectcraft_time::{FrameRate, Tick};
 
 mod effects;
@@ -1025,6 +1025,12 @@ fn build_project(
             layer.switches.collapse = dlayer.flags & 0x80 != 0;
             layer.switches.adjustment = dlayer.flags & 0x200 != 0;
             layer.switches.motion_blur = dlayer.flags & 0x10000 != 0;
+            // A camera has no motion blur switch: in observed files the same bit is set on
+            // cameras that aim at their point of interest and clear on one-node cameras.
+            if dlayer.is_camera {
+                layer.switches.motion_blur = false;
+                layer.auto_orient = if dlayer.flags & 0x10000 != 0 { AutoOrient::TowardsPointOfInterest } else { AutoOrient::Off };
+            }
             layer.switches.three_d = dlayer.three_d || dlayer.flags & 0x400 != 0;
             layer.parent = raw_layer_ids.get(&dlayer.parent_id).copied().map(effectcraft_project::LayerId);
             if dlayer.parent_id != 0 && layer.parent.is_none() {
