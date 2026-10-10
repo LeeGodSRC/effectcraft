@@ -409,7 +409,9 @@ fn decode_path(nodes: &[ChunkNode<'_>]) -> Result<Option<ShapePath>, String> {
     for bytes in data.as_chunks::<8>().0 {
         points.push([bounds[0] + number(bytes, 0)? * (bounds[2] - bounds[0]), bounds[1] + number(bytes, 4)? * (bounds[3] - bounds[1])]);
     }
-    let closed = h.get(20).copied().ok_or("truncated AEP shape flags")? != 0;
+    // In observed files bit 3 of the header's fourth byte marks an open path.
+    let open = h.get(3).copied().ok_or("truncated AEP shape flags")? & 0x08 != 0;
+    let closed = h.get(20).copied().ok_or("truncated AEP shape flags")? != 0 && !open;
     let mut path = ShapePath { closed, ..Default::default() };
     let n = points.len();
     for (i, triple) in points.as_chunks::<3>().0.iter().enumerate() {
@@ -567,6 +569,10 @@ mod tests {
         assert_eq!(path.out_tangents, [[25.0, 0.0], [-25.0, 0.0]]);
         assert_eq!(path.in_tangents, [[0.0, 50.0], [0.0, -50.0]]);
         assert!(path.closed);
+        let mut open = header.clone();
+        open[3] = 0x09;
+        let nodes = vec![list(b"shap", vec![chunk(b"shph", &open), list(b"list", vec![chunk(b"ldat", &data)])])];
+        assert!(!decode_path(&nodes).unwrap().unwrap().closed);
         for length in 0..24 {
             let nodes = vec![list(b"shap", vec![chunk(b"shph", &header[..length]), list(b"list", vec![chunk(b"ldat", &data)])])];
             assert!(decode_path(&nodes).is_err());
