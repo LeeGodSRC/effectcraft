@@ -22,11 +22,45 @@ pub use warp::{Sampling, WarpOpts, accumulate_warp, composite_warp, composite_wa
 
 pub type Px = [f32; 4];
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Debug, Default, PartialEq)]
 pub struct Image {
     pub width: u32,
     pub height: u32,
     pub data: Vec<Px>,
+}
+
+/// Buffers of at least this many pixels are filled and copied in parallel.
+const PARALLEL_PIXELS: usize = 1 << 16;
+
+/// Pixels per parallel task when filling or copying a large buffer.
+const FILL_CHUNK: usize = 1 << 14;
+
+/// `n` pixels, each written by `fill` from its chunk's offset. Large buffers start as untouched
+/// zero pages and are written in parallel, so the memory is first touched (and paged in) by
+/// every core instead of one.
+fn pixels_with(n: usize, serial: impl FnOnce() -> Vec<Px>, fill: impl Fn(usize, &mut [Px]) + Sync) -> Vec<Px> {
+    if n < PARALLEL_PIXELS {
+        return serial();
+    }
+    let mut data = vec![[0.0; 4]; n];
+    data.par_chunks_mut(FILL_CHUNK).enumerate().for_each(|(i, chunk)| fill(i * FILL_CHUNK, chunk));
+    data
+}
+
+impl Clone for Image {
+    fn clone(&self) -> Image {
+        let src = &self.data;
+        let data = pixels_with(
+            src.len(),
+            || src.clone(),
+            |at, chunk| {
+                if let Some(from) = src.get(at..at + chunk.len()) {
+                    chunk.copy_from_slice(from);
+                }
+            },
+        );
+        Image { width: self.width, height: self.height, data }
+    }
 }
 
 impl Image {
@@ -34,7 +68,8 @@ impl Image {
         Image { width, height, data: vec![[0.0; 4]; width as usize * height as usize] }
     }
     pub fn filled(width: u32, height: u32, px: Px) -> Image {
-        Image { width, height, data: vec![px; width as usize * height as usize] }
+        let n = width as usize * height as usize;
+        Image { width, height, data: pixels_with(n, || vec![px; n], |_, chunk| chunk.fill(px)) }
     }
     pub fn is_empty(&self) -> bool {
         self.width == 0 || self.height == 0
@@ -315,6 +350,24 @@ impl Mask {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Large buffers are filled and copied in parallel chunks: same pixels as the serial path.
+    #[test]
+    fn large_fill_and_clone_match_small_ones() {
+        let (w, h) = (701u32, 257u32);
+        assert!((w * h) as usize >= PARALLEL_PIXELS && !(w * h).is_multiple_of(FILL_CHUNK as u32));
+        let px = [0.25, 0.5, 0.75, 1.0];
+        let filled = Image::filled(w, h, px);
+        assert_eq!(filled.data, vec![px; (w * h) as usize]);
+        let mut img = Image::new(w, h);
+        for (i, p) in img.data.iter_mut().enumerate() {
+            *p = [i as f32, (i * 3) as f32, -(i as f32), 1.0];
+        }
+        let copy = img.clone();
+        assert_eq!((copy.width, copy.height), (w, h));
+        assert_eq!(copy.data, img.data);
+        assert_eq!(Image::new(0, 0).clone().data.len(), 0);
+    }
 
     #[test]
     fn rgba8_roundtrip() {
