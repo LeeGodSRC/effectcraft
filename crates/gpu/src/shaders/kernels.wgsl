@@ -868,8 +868,9 @@ fn pointwise(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
             let op = P.f[2].z;
             if (P.u[1].z == 1u) {
-                // Normal: the noise over the layer at Opacity, then Blend With Original.
-                let over = vec4<f32>(vec3<f32>(val) * op, op) + px * (1.0 - op);
+                // Normal stays inside the source alpha, as noise3::composite and
+                // the general fractal kernel do (masked solids keep their mask).
+                let over = blend_pixel(0u, px, vec4<f32>(vec3<f32>(val) * op, op) * px.a, 0.5);
                 px = px * P.f[2].y + over * (1.0 - P.f[2].y);
             } else {
                 px = put(px, vec3<f32>(val), op, P.f[2].y);
