@@ -560,3 +560,13 @@ fn curve_encode(curve: u32, v: f32) -> f32 {
     }
     return select(e, -e, v < 0.0);
 }
+
+// render::preserve_pixel: clipping layers retain the destination coverage.
+fn preserve_pixel(mode: u32, dst: vec4<f32>, src: vec4<f32>, noise: f32) -> vec4<f32> {
+    if (dst.w <= 0.0) {
+        return vec4<f32>(0.0);
+    }
+    let opaque = vec4<f32>(dst.xyz / dst.w, 1.0);
+    let blended = blend_pixel(mode, opaque, src, noise);
+    return vec4<f32>(blended.xyz * dst.w, dst.w);
+}

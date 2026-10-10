@@ -15,14 +15,14 @@ pub struct EngineDesc {
     pub life: f32,
     pub producer: [f32; 3],
     pub radius: [f32; 3],
-    /// Animation (0 Explosive … 9 Fractal Uni).
+    /// Internal animation (0 Explosive … 9 Fractal Uni; 10 Particle World Direction Axis).
     pub anim: u32,
     pub speed: f32,
     pub gravity: [f32; 3],
     /// Normalised direction axis.
     pub axis: [f32; 3],
     pub extra: f32,
-    /// Cone Axis spread factor `|tan(extra angle / 2)|` (≤ 20).
+    /// Cone Axis spread factor `|tan(extra angle / 2)|` (≤ 20), or phase in radians for mode 10.
     pub cone: f32,
     /// Velocity damping per step `exp(−drag · dt)`.
     pub damp: f32,

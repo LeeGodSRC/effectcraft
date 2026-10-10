@@ -583,7 +583,7 @@ fn composite(canvas: &mut Image, items: &[Item], lights: &[LightState], casters:
             for (_, _, px, k) in &frags {
                 let it = active[*k];
                 let mut s = *px;
-                let op = it.opacity * if it.preserve { d[3] } else { 1.0 };
+                let op = it.opacity;
                 for c in s.iter_mut() {
                     *c *= op;
                 }
@@ -593,7 +593,7 @@ fn composite(canvas: &mut Image, items: &[Item], lights: &[LightState], casters:
                 } else {
                     0.5
                 };
-                d = blend_pixel(mode, d, s, n);
+                d = if it.preserve { crate::preserve_pixel(mode, d, s, n) } else { blend_pixel(mode, d, s, n) };
             }
             row[x] = d;
         }

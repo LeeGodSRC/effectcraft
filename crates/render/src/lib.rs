@@ -37,6 +37,18 @@ use effectcraft_time::{FrameRate, TICKS_PER_SECOND, Tick};
 pub use eval::{EvalCtx, ExprHost, effect_bounds, source_size};
 use rayon::prelude::*;
 
+/// Blend within the existing coverage, as a clipping layer. Multiplying the source by
+/// destination alpha before ordinary Over would increase that alpha a second time.
+pub(crate) fn preserve_pixel(mode: BlendMode, dst: [f32; 4], src: [f32; 4], noise: f32) -> [f32; 4] {
+    let a = dst[3];
+    if a <= 0.0 {
+        return [0.0; 4];
+    }
+    let opaque = [dst[0] / a, dst[1] / a, dst[2] / a, 1.0];
+    let blended = effectcraft_color::blend_pixel(mode, opaque, src, noise);
+    [blended[0] * a, blended[1] * a, blended[2] * a, a]
+}
+
 /// Supplies decoded footage frames (implemented by the media layer).
 pub trait FootageSource: Send + Sync {
     /// The frame of `item` at source time `t`, straight from the file (any size).
@@ -1968,13 +1980,14 @@ impl<'a> Renderer<'a> {
             });
         }
         if preserve {
-            iso.data.par_iter_mut().zip(canvas.data.par_iter()).for_each(|(p, q)| {
-                for c in p.iter_mut() {
-                    *c *= q[3];
-                }
+            canvas.data.par_iter_mut().zip(iso.data.par_iter()).enumerate().for_each(|(i, (d, s))| {
+                let w = iso.width.max(1) as usize;
+                let noise = effectcraft_raster::hash_noise((i % w) as u32, (i / w) as u32, layer.id.0 as u32);
+                *d = preserve_pixel(layer.blend_mode, *d, s.map(|v| v * opacity), noise);
             });
+        } else {
+            canvas.blend_from(&iso, layer.blend_mode, opacity, layer.id.0 as u32);
         }
-        canvas.blend_from(&iso, layer.blend_mode, opacity, layer.id.0 as u32);
     }
 
     /// Adjustment layer: effects applied to the comp below, limited to the layer's footprint.

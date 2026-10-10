@@ -89,6 +89,13 @@ fn ps_spawn_engine(id: u32) -> Part {
     let jitter = ps_rand_dir(id, 5u, flat);
     var dir = jitter;
     switch anim {
+        case 10u: {
+            let angle = S.f[0].w;
+            let c = cos(angle);
+            let s = sin(angle);
+            let rotated = jitter * c + cross(ax, jitter) * s + ax * dot(ax, jitter) * (1.0 - c);
+            dir = ps_norm3(ax + rotated * S.f[0].z);
+        }
         case 1u, 9u: {
             dir = ps_norm3(ax + jitter * 0.08);
         }

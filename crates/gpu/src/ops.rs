@@ -141,10 +141,14 @@ pub fn matte(e: &mut Enc, iso: &GpuImage, matte: &GpuImage, kind: MatteKind) -> 
     out
 }
 
-/// Preserve Transparency: multiply by the alpha below.
-pub fn preserve(e: &mut Enc, iso: &GpuImage, canvas: &GpuImage) -> GpuImage {
-    let out = e.scratch(iso.width, iso.height);
-    e.pixels("preserve", &Params::default(), iso, Some(canvas), &out, None);
+/// Blend a clipping layer while retaining the coverage below it.
+pub fn preserve(e: &mut Enc, iso: &GpuImage, canvas: &GpuImage, mode: BlendMode, opacity: f32, seed: u32, levels: Option<f32>) -> GpuImage {
+    let mut p = Params::default();
+    p.u[0] = [mode_id(mode), 0, seed, 0];
+    p.f[0] = [opacity, levels.unwrap_or(0.0), levels.map_or(0.0, |v| 1.0 / v), 0.0];
+    let mut out = e.scratch(iso.width, iso.height);
+    e.pixels("preserve", &p, iso, Some(canvas), &out, None);
+    out.levels = levels;
     out
 }
 

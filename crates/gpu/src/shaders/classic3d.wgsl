@@ -444,17 +444,18 @@ fn classic3d(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     for (var k = 0u; k < nf; k++) {
         let pl = planes[fi[k]];
-        var op = pl.mat1.z;
-        if ((pl.ints.z & 2u) != 0u) {
-            op *= d.w;
-        }
+        let op = pl.mat1.z;
         let s = fp[k] * op;
         let mode = pl.ints.w;
         var n = 0.5;
         if (mode == 1u || mode == 2u) {
             n = hash_noise(u32(x), u32(y), pl.ints3.y);
         }
-        d = blend_pixel(mode, d, s, n);
+        if ((pl.ints.z & 2u) != 0u) {
+            d = preserve_pixel(mode, d, s, n);
+        } else {
+            d = blend_pixel(mode, d, s, n);
+        }
     }
     textureStore(out, pix, d);
 }
