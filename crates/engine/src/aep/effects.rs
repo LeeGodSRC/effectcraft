@@ -47,6 +47,11 @@ pub(super) fn effect_id(name: &str) -> Option<&'static str> {
         "ADBE Venetian Blinds" => "ec.transition.venetian",
         "ADBE Easy Levels2" => "ec.color.levels",
         "ADBE Radial Blur" => "ec.blur.radial",
+        "ADBE Displacement Map" => "ec.distort.displacementmap",
+        "ADBE Roughen Edges" => "ec.stylize.roughenedges",
+        "ADBE Point Control" => "ec.control.point",
+        "CC Lens" => "ec.distort.cclens",
+        "CS CrossBlur" => "ec.blur.cccross",
         _ => return None,
     })
 }
@@ -584,6 +589,11 @@ mod tests {
             "ADBE Venetian Blinds",
             "ADBE Easy Levels2",
             "ADBE Radial Blur",
+            "ADBE Displacement Map",
+            "ADBE Roughen Edges",
+            "ADBE Point Control",
+            "CC Lens",
+            "CS CrossBlur",
         ] {
             assert!(effect_id(name).and_then(effectcraft_effects::find).is_some(), "{name}");
         }
