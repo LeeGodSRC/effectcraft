@@ -325,11 +325,297 @@ impl Fractal {
     }
 
     /// Final grey value: invert the noise before contrast, brightness and overflow.
+    #[cfg(test)]
     pub(crate) fn value(&self, x: f32, y: f32) -> f32 {
         let raw = self.raw(x, y);
         let raw = if self.invert { 1.0 - raw } else { raw };
         // Brightness retains its sign with Invert enabled: dark noise remains dark.
         overflow((raw - 0.5) * self.contrast + 0.5 + self.brightness, self.overflow)
+    }
+}
+
+/// `floor` as an integer, without the library call a baseline x86-64 build makes for it.
+#[inline]
+fn floor_i32(x: f32) -> i32 {
+    let i = x as i32;
+    if (i as f32) > x { i.saturating_sub(1) } else { i }
+}
+
+/// One noise layer's lattice values over the cells an image reaches, already blended along the
+/// evolution axis (and across Cycle Evolution's two offsets). Every interpolation is a weighted
+/// sum of lattice values, so interpolating these gives [`Fractal::layer`] at a fraction of the
+/// hashing: a cell covers many pixels, and each pixel otherwise hashes 8 to 32 corners.
+struct Grid {
+    x0: i32,
+    y0: i32,
+    nx: usize,
+    ny: usize,
+    v: Vec<f32>,
+}
+
+/// What [`Fractal::raw`] works out per noise layer before it touches the pixel.
+struct Octave {
+    org: [f32; 2],
+    /// Sub Rotation (sin, cos) of this layer.
+    sub_rot: Option<(f32, f32)>,
+    f: f32,
+    amp: f32,
+    w: f32,
+    of: f32,
+    z: f32,
+    seed: u32,
+    grid: Option<Grid>,
+}
+
+/// A [`Fractal`] prepared for one image: per-layer constants and lattice grids.
+pub(crate) struct Plan<'f> {
+    fr: &'f Fractal,
+    octaves: Vec<Octave>,
+    norm: f32,
+}
+
+impl Fractal {
+    /// The value at lattice point (ix, iy) that [`Self::layer`] interpolates between.
+    fn lattice_at(&self, ix: i32, iy: i32, o: f32, z: f32, seed: u32) -> f32 {
+        let at = |zc: f32| {
+            let z0 = zc.floor();
+            let (iz, fz) = (z0 as i32, fade(zc - z0));
+            let (a, b) = (lattice(ix, iy, iz, seed), lattice(ix, iy, iz.wrapping_add(1), seed));
+            a + (b - a) * fz
+        };
+        match self.cycle {
+            Some(c) => {
+                let t = self.evolution.rem_euclid(c);
+                let w = t / c;
+                at(t + z) * (1.0 - w) + at(t - c + z) * w
+            }
+            None => at(self.evolution * (1.0 + self.turbulence * o) + z),
+        }
+    }
+
+    /// Lattice coordinates of pixel centre (x, y) in the layer `oc`.
+    #[inline]
+    fn lattice_uv(&self, oc: &Octave, x: f32, y: f32) -> (f32, f32) {
+        let (sr, cr) = self.rot;
+        let (dx, dy) = (x - oc.org[0], y - oc.org[1]);
+        let (mut u, mut v) = ((dx * cr + dy * sr) / self.size[0], (-dx * sr + dy * cr) / self.size[1]);
+        if let Some((s, c)) = oc.sub_rot {
+            (u, v) = (u * c + v * s, -u * s + v * c);
+        }
+        (u * oc.f, v * oc.f)
+    }
+
+    /// How far [`Self::lattice_uv`] moves per pixel along x.
+    fn lattice_step(&self, oc: &Octave) -> (f32, f32) {
+        let (sr, cr) = self.rot;
+        let (mut u, mut v) = (cr / self.size[0], -sr / self.size[1]);
+        if let Some((s, c)) = oc.sub_rot {
+            (u, v) = (u * c + v * s, -u * s + v * c);
+        }
+        (u * oc.f, v * oc.f)
+    }
+
+    /// Prepare the fractal for a `w` × `h` image. The Dynamic types warp the domain per pixel,
+    /// so they keep hashing ([`Self::raw`]).
+    pub(crate) fn plan(&self, w: u32, h: u32) -> Plan<'_> {
+        let n_oct = self.octaves.ceil() as usize;
+        let frac = self.octaves - self.octaves.floor();
+        let (mut norm, mut amp, mut f, mut depth) = (0.0f32, 1.0f32, 1.0f32, 1.0f32);
+        let mut octaves = Vec::with_capacity(n_oct);
+        // A grid finer than the image costs more memory than it saves hashing.
+        let budget = (w as usize).saturating_mul(h as usize).saturating_mul(2).max(4096);
+        for o in 0..n_oct {
+            let wgt = if o + 1 == n_oct && frac > 0.0 { frac } else { 1.0 };
+            let of = o as f32;
+            let k = if self.perspective { depth } else { 1.0 } * (1.0 + self.turbulence * of);
+            let mut org = self.origin;
+            if k != 1.0 {
+                org = [self.center[0] + (self.origin[0] - self.center[0]) * k, self.center[1] + (self.origin[1] - self.center[1]) * k];
+            }
+            if !self.center_subscale {
+                org = [org[0] + self.sub_offset[0] * of, org[1] + self.sub_offset[1] * of];
+            }
+            let sub_rot = (self.sub_rotation != 0.0).then(|| (self.sub_rotation * of).sin_cos());
+            let mut oc = Octave { org, sub_rot, f, amp, w: wgt, of, z: of * 7.31, seed: self.seed.wrapping_add(o as u32), grid: None };
+            if !(4..=6).contains(&self.kind) {
+                oc.grid = self.grid(&oc, w, h, budget);
+            }
+            octaves.push(oc);
+            norm += amp * wgt;
+            amp *= self.influence;
+            f /= self.sub_scaling;
+            depth *= self.sub_scaling;
+        }
+        Plan { fr: self, octaves, norm }
+    }
+
+    /// The lattice cells layer `oc` reaches from a `w` × `h` image (its corners bound them: the
+    /// mapping is affine), when they fit `budget` values.
+    fn grid(&self, oc: &Octave, w: u32, h: u32, budget: usize) -> Option<Grid> {
+        let (mut lo, mut hi) = ([f32::INFINITY; 2], [f32::NEG_INFINITY; 2]);
+        for (x, y) in [(0.0, 0.0), (w as f32, 0.0), (0.0, h as f32), (w as f32, h as f32)] {
+            let (u, v) = self.lattice_uv(oc, x, y);
+            if !u.is_finite() || !v.is_finite() {
+                return None;
+            }
+            (lo, hi) = ([lo[0].min(u), lo[1].min(v)], [hi[0].max(u), hi[1].max(v)]);
+        }
+        // Spline reads one cell before and two after; a margin absorbs rounding at the edges.
+        let span = |a: f32, b: f32| -> Option<(i32, usize)> {
+            if a.abs() > 1e9 || b.abs() > 1e9 {
+                return None;
+            }
+            let first = floor_i32(a) - 3;
+            Some((first, (floor_i32(b) + 4 - first) as usize))
+        };
+        let ((x0, nx), (y0, ny)) = (span(lo[0], hi[0])?, span(lo[1], hi[1])?);
+        if nx.checked_mul(ny)? > budget {
+            return None;
+        }
+        let mut v = vec![0.0f32; nx * ny];
+        v.par_chunks_mut(nx).enumerate().for_each(|(j, row)| {
+            for (i, c) in row.iter_mut().enumerate() {
+                *c = self.lattice_at(x0.wrapping_add(i as i32), y0.wrapping_add(j as i32), oc.of, oc.z, oc.seed);
+            }
+        });
+        Some(Grid { x0, y0, nx, ny, v })
+    }
+}
+
+impl Plan<'_> {
+    /// [`Fractal::layer`] at (u, v) of layer `oc`, from its grid.
+    #[inline]
+    fn layer(&self, oc: &Octave, g: &Grid, u: f32, v: f32) -> f32 {
+        let fr = self.fr;
+        let nt = fr.noise_type;
+        let h = if nt == NOISE_SOFT_LINEAR { 0.5 } else { 0.0 };
+        let (ix, iy) = (floor_i32(u + h), floor_i32(v + h));
+        let (tx, ty) = (u + h - ix as f32, v + h - iy as f32);
+        let (jx, jy) = (ix.wrapping_sub(g.x0) as i64, iy.wrapping_sub(g.y0) as i64);
+        // The taps stay inside the grid (its margin); a pixel that somehow reaches past it hashes.
+        if jx < 1 || jy < 1 || jx + 2 >= g.nx as i64 || jy + 2 >= g.ny as i64 {
+            return fr.layer(u, v, oc.of, oc.z, oc.seed);
+        }
+        let base = jy as usize * g.nx + jx as usize;
+        let c = |dx: i64, dy: i64| g.v.get((base as i64 + dy * g.nx as i64 + dx) as usize).copied().unwrap_or(0.0);
+        let l = |a: f32, b: f32, t: f32| a + (b - a) * t;
+        match nt {
+            0 => c(0, 0),
+            1 => l(l(c(0, 0), c(1, 0), tx), l(c(0, 1), c(1, 1), tx), ty),
+            NOISE_SOFT_LINEAR => {
+                let (wx, wy) = (bspline(tx), bspline(ty));
+                let row = |dy: i64| wx[0] * c(-1, dy) + wx[1] * c(0, dy) + wx[2] * c(1, dy);
+                0.5 + (wy[0] * row(-1) + wy[1] * row(0) + wy[2] * row(1) - 0.5) * SOFT_LINEAR_GAIN
+            }
+            _ => {
+                let row = |dy: i64| catmull(c(-1, dy), c(0, dy), c(1, dy), c(2, dy), tx);
+                catmull(row(-1), row(0), row(1), row(2), ty)
+            }
+        }
+    }
+
+    /// The grid rows around lattice row `v`, interpolated down to one row of values per lattice
+    /// column: what every pixel of an image row reads when the row runs along the lattice. `None`
+    /// when the taps reach past the grid.
+    fn column(&self, g: &Grid, v: f32, col: &mut Vec<f32>) -> Option<()> {
+        let nt = self.fr.noise_type;
+        let h = if nt == NOISE_SOFT_LINEAR { 0.5 } else { 0.0 };
+        let iy = floor_i32(v + h);
+        let ty = v + h - iy as f32;
+        let jy = iy.wrapping_sub(g.y0) as i64;
+        if jy < 1 || jy + 2 >= g.ny as i64 {
+            return None;
+        }
+        let row = |d: i64| g.v.get((jy + d) as usize * g.nx..((jy + d) as usize + 1) * g.nx);
+        col.clear();
+        match nt {
+            0 => col.extend_from_slice(row(0)?),
+            1 => col.extend(row(0)?.iter().zip(row(1)?).map(|(a, b)| a + (b - a) * ty)),
+            NOISE_SOFT_LINEAR => {
+                let w = bspline(ty);
+                col.extend(row(-1)?.iter().zip(row(0)?).zip(row(1)?).map(|((a, b), c)| w[0] * a + w[1] * b + w[2] * c));
+            }
+            _ => col.extend(row(-1)?.iter().zip(row(0)?).zip(row(1)?).zip(row(2)?).map(|(((a, b), c), d)| catmull(*a, *b, *c, *d, ty))),
+        }
+        Some(())
+    }
+
+    /// [`Self::layer`] at `u` from a [`Self::column`] starting at lattice column `x0`.
+    #[inline]
+    fn along(&self, col: &[f32], x0: i32, u: f32) -> Option<f32> {
+        let nt = self.fr.noise_type;
+        let h = if nt == NOISE_SOFT_LINEAR { 0.5 } else { 0.0 };
+        let ix = floor_i32(u + h);
+        let tx = u + h - ix as f32;
+        let j = ix.wrapping_sub(x0) as i64;
+        if j < 1 {
+            return None;
+        }
+        let &[a, b, c, d] = col.get(j as usize - 1..j as usize + 3)? else { return None };
+        Some(match nt {
+            0 => b,
+            1 => b + (c - b) * tx,
+            NOISE_SOFT_LINEAR => {
+                let w = bspline(tx);
+                0.5 + (w[0] * a + w[1] * b + w[2] * c - 0.5) * SOFT_LINEAR_GAIN
+            }
+            _ => catmull(a, b, c, d, tx),
+        })
+    }
+
+    /// [`Fractal::raw`] at the `out.len()` pixel centres of the row at `y`.
+    pub(crate) fn row(&self, y: f32, col: &mut Vec<f32>, out: &mut [f32]) {
+        let fr = self.fr;
+        if (4..=6).contains(&fr.kind) {
+            for (x, o) in out.iter_mut().enumerate() {
+                *o = fr.raw(x as f32 + 0.5, y);
+            }
+            return;
+        }
+        out.fill(0.0);
+        let max = fr.kind == 7;
+        for oc in &self.octaves {
+            // The lattice coordinates are affine in the pixel: a start and a step per row.
+            let (u0, v0) = fr.lattice_uv(oc, 0.5, y);
+            let (du, dv) = fr.lattice_step(oc);
+            let k = if max { oc.amp } else { oc.amp * oc.w };
+            let put = |o: &mut f32, n: f32| {
+                let n = shape(fr.kind, n) * k;
+                *o = if max { o.max(n) } else { *o + n };
+            };
+            let hashed = |u: f32, v: f32| fr.layer(u, v, oc.of, oc.z, oc.seed);
+            match &oc.grid {
+                // Along the lattice the vertical half of the interpolation is the same for the
+                // whole row.
+                Some(g) if dv == 0.0 && self.column(g, v0, col).is_some() => {
+                    for (x, o) in out.iter_mut().enumerate() {
+                        let u = u0 + x as f32 * du;
+                        put(o, self.along(col, g.x0, u).unwrap_or_else(|| hashed(u, v0)));
+                    }
+                }
+                Some(g) => {
+                    for (x, o) in out.iter_mut().enumerate() {
+                        put(o, self.layer(oc, g, u0 + x as f32 * du, v0 + x as f32 * dv));
+                    }
+                }
+                None => {
+                    for (x, o) in out.iter_mut().enumerate() {
+                        put(o, hashed(u0 + x as f32 * du, v0 + x as f32 * dv));
+                    }
+                }
+            }
+        }
+        if !max {
+            let inv = 1.0 / self.norm.max(1e-6);
+            out.iter_mut().for_each(|o| *o *= inv);
+        }
+    }
+
+    /// [`Fractal::value`] from a raw value of [`Self::row`].
+    #[inline]
+    pub(crate) fn finish(&self, raw: f32) -> f32 {
+        let raw = if self.fr.invert { 1.0 - raw } else { raw };
+        overflow((raw - 0.5) * self.fr.contrast + 0.5 + self.fr.brightness, self.fr.overflow)
     }
 }
 
@@ -454,12 +740,17 @@ fn render(ctx: &EffectCtx, mut b: Buf, turbulent: bool) -> Buf {
     let opacity = (ctx.params.f("opacity") as f32 / 100.0).clamp(0.0, 1.0);
     let mode = blend_mode(ctx.params.get("blendingMode").map(Value::as_enum).unwrap_or(BLEND_NONE));
     let blend = ctx.params.f("blend") as f32 / 100.0;
-    b.img.rows_mut().for_each(|(y, row)| {
-        for (x, px) in row.iter_mut().enumerate() {
-            let v = fr.value(x as f32 + 0.5, y as f32 + 0.5);
-            *px = composite(*px, v, opacity, mode, blend);
-        }
-    });
+    let plan = fr.plan(b.img.width, b.img.height);
+    b.img.rows_mut().for_each_init(
+        || (Vec::new(), Vec::new()),
+        |(col, raw), (y, row)| {
+            raw.resize(row.len(), 0.0);
+            plan.row(y as f32 + 0.5, col, raw);
+            for (px, r) in row.iter_mut().zip(raw.iter()) {
+                *px = composite(*px, plan.finish(*r), opacity, mode, blend);
+            }
+        },
+    );
     b
 }
 
@@ -589,6 +880,68 @@ mod tests {
         assert!(hi.data.iter().any(|p| p[0] > 1.0 || p[0] < 0.0));
         let clip = run("ec.noise.fractal", &[("contrast", num(400.0)), ("overflow", Value::Enum(0)), ("blendingMode", Value::Enum(BLEND_NONE))]);
         assert!(clip.data.iter().all(|p| (0.0..=1.0).contains(&p[0])));
+    }
+
+    /// The lattice grids are a faster way to the same numbers as hashing every corner per pixel.
+    #[test]
+    fn planned_noise_matches_the_hashed_noise() {
+        let base = || Fractal {
+            kind: 0,
+            noise_type: NOISE_SOFT_LINEAR,
+            contrast: 1.4,
+            brightness: -0.1,
+            overflow: 3,
+            invert: false,
+            rot: 0.0f32.sin_cos(),
+            size: [17.0, 17.0],
+            origin: [31.5, -12.25],
+            center: [48.0, 30.0],
+            perspective: false,
+            octaves: 6.12,
+            influence: 0.7,
+            sub_scaling: 0.56,
+            sub_rotation: 0.0,
+            sub_offset: [0.0, 0.0],
+            center_subscale: false,
+            evolution: 1.37,
+            cycle: None,
+            turbulence: 0.0,
+            seed: 0x51ed,
+        };
+        let mut cases = Vec::new();
+        for noise_type in 0..4 {
+            for kind in [0, 2, 3, 5, 7, 8] {
+                cases.push(Fractal { noise_type, kind, ..base() });
+            }
+            cases.push(Fractal { noise_type, rot: 0.6f32.sin_cos(), size: [40.0, 9.0], sub_rotation: 0.3, sub_offset: [5.0, -3.0], ..base() });
+            cases.push(Fractal { noise_type, cycle: Some(2.0), perspective: true, turbulence: 0.5, invert: true, ..base() });
+            cases.push(Fractal { noise_type, octaves: 12.18, sub_scaling: 0.3, evolution: -4.2, ..base() });
+        }
+        for fr in &cases {
+            let plan = fr.plan(96, 60);
+            let (mut col, mut raw) = (Vec::new(), vec![0.0f32; 96]);
+            let mut off = 0;
+            // Layers far finer than a pixel sit beyond the precision of f32 lattice coordinates:
+            // there the two ways round differently, within those layers' small weight.
+            let fine = fr.sub_scaling < 0.5;
+            let tol = if fine { 0.05 } else { 2e-4 };
+            for y in 0..60 {
+                plan.row(y as f32 + 0.5, &mut col, &mut raw);
+                for (x, r) in raw.iter().enumerate() {
+                    let (a, b) = (plan.finish(*r), fr.value(x as f32 + 0.5, y as f32 + 0.5));
+                    // Block is a step at every cell edge: a pixel centre a rounding error away
+                    // from one may land on the other side.
+                    if fr.noise_type == 0 && (a - b).abs() >= tol {
+                        off += 1;
+                        continue;
+                    }
+                    assert!((a - b).abs() < tol, "type {} kind {} at {x},{y}: {a} vs {b}", fr.noise_type, fr.kind);
+                }
+            }
+            assert!(off < 30 || fine, "type {} kind {}: {off} pixels differ", fr.noise_type, fr.kind);
+        }
+        // The first layers of an image this size do come from grids.
+        assert!(cases.iter().all(|fr| (4..=6).contains(&fr.kind) || fr.plan(96, 60).octaves.first().is_some_and(|o| o.grid.is_some())));
     }
 
     #[test]
