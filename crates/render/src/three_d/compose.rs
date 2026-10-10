@@ -445,6 +445,13 @@ struct Gathered<'a> {
 fn gather<'a>(r: &Renderer<'a>, ctx: &EvalCtx<'a>, run: &[&'a Layer], out: (u32, u32)) -> Gathered<'a> {
     // A collapsed precomp's 3D layers are lit by the outer comp's lights.
     let lights = scene_lights(&r.collapse3d.map_or(*ctx, |c| c.parent));
+    // Planes showing the same nested comp frame render it once, before they all ask for it.
+    let precomps: Vec<&'a Layer> = run
+        .iter()
+        .copied()
+        .filter(|l| ctx.opacity(l) > 0.0 && r.quality(l) != effectcraft_project::Quality::Wireframe && r.collapsed(ctx, l).is_none())
+        .collect();
+    r.prewarm_precomps(ctx, &precomps);
     let mut items: Vec<Item> = run
         .par_iter()
         .enumerate()

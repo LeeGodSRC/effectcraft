@@ -16,6 +16,7 @@ pub mod disk_cache;
 use color::Region;
 pub mod eval;
 pub mod masks;
+mod memo;
 pub mod passes;
 pub mod shapes;
 pub mod styles;
@@ -475,6 +476,8 @@ pub struct Renderer<'a> {
     through: [Option<Through<'a>>; MAX_THROUGH],
     /// More collapsed levels than [`MAX_THROUGH`]: their motion is not blurred.
     through_lost: bool,
+    /// Nested comp frames already rendered for this top-level frame (see [`memo`]).
+    memo: Option<&'a memo::FrameMemo>,
 }
 
 /// One collapsed precomp layer a nested comp is drawn through.
@@ -561,6 +564,7 @@ impl<'a> Renderer<'a> {
             top: true,
             through: [None; MAX_THROUGH],
             through_lost: false,
+            memo: None,
         }
     }
 
@@ -831,6 +835,11 @@ impl<'a> Renderer<'a> {
             }
             return out;
         }
+        // One top-level frame shares its nested comp frames (see [`memo`]).
+        if self.depth == 0 && self.memo.is_none() {
+            let shared = memo::FrameMemo::default();
+            return Renderer { memo: Some(&shared), ..*self }.comp_frame_cpu(comp_id, t);
+        }
         let (w, h) = match self.roi_offset() {
             Some((_, _, rw, rh)) => (rw, rh),
             None => (w, h),
@@ -1066,29 +1075,22 @@ impl<'a> Renderer<'a> {
                 // values.
                 let ov = essential_overrides(ctx, layer);
                 let tmp = if ov.is_empty() { None } else { effectcraft_project::essential::with_overrides(self.project, *item, &ov) };
-                // Preserve resolution when nested: drawn at full size even when this comp renders
-                // smaller (the buffer's scale places it).
-                let full = s < 1.0 && self.project.comp(*item).is_some_and(|nc| nc.preserve_resolution);
-                let bs = if full { 1.0 } else { s };
-                let base = self.nested_through(layer);
-                let base = Renderer { opts: RenderOpts { scale: bs, ..base.opts }, ..base };
+                let (base, frames) = self.nested_frames(ctx, layer, *item, lt);
+                let bs = base.opts.scale;
                 let sub = match &tmp {
-                    Some(p) => Renderer { project: p, ..base },
+                    // This instance's own comp: not the frame other layers of the comp share.
+                    Some(p) => Renderer { project: p, memo: None, ..base },
                     None => base,
                 };
-                // Frame blending between the nested comp's frames (time-stretched/remapped).
-                let mode = frame_blend_mode(ctx, layer);
-                if mode != FrameBlend::Off
-                    && let Some(nc) = self.project.comp(*item)
-                {
-                    let (i, w) = frame_position(lt, nc.frame_rate);
-                    if w > 1e-6 {
-                        let a = sub.comp_frame(*item, nc.frame_rate.tick_of(i));
-                        let b = sub.comp_frame(*item, nc.frame_rate.tick_of(i + 1));
-                        return Some(Buf { img: blend_frames(mode, &a, &b, w as f32), offset: [0.0; 2], scale: bs });
+                let img = match frames {
+                    NestedFrames::One(t) => unshare(sub.nested_frame(*item, t, false)),
+                    NestedFrames::Blend(mode, a, b, w) => {
+                        let a = sub.nested_frame(*item, a, false);
+                        let b = sub.nested_frame(*item, b, false);
+                        blend_frames(mode, &a, &b, w)
                     }
-                }
-                Some(Buf { img: sub.comp_frame(*item, lt), offset: [0.0; 2], scale: bs })
+                };
+                Some(Buf { img, offset: [0.0; 2], scale: bs })
             }
             LayerSource::Footage { item } => {
                 let it = self.project.item(*item)?;
@@ -1117,6 +1119,83 @@ impl<'a> Renderer<'a> {
             LayerSource::Shape => layer.props.sub("contents").map(|c| self.authored(shapes::render(ctx, layer, c, self.raster_scale(ctx, layer)))),
             _ => None,
         }
+    }
+
+    /// How precomp layer `layer` draws its nested comp `item` at nested time `lt`: the renderer
+    /// (one level deeper, the layer's switches passed down, at the nested scale) and the comp
+    /// frames it needs.
+    fn nested_frames(&self, ctx: &EvalCtx, layer: &Layer, item: ItemId, lt: Tick) -> (Renderer<'a>, NestedFrames) {
+        let s = self.opts.scale;
+        // Preserve resolution when nested: drawn at full size even when this comp renders
+        // smaller (the buffer's scale places it).
+        let full = s < 1.0 && self.project.comp(item).is_some_and(|nc| nc.preserve_resolution);
+        let bs = if full { 1.0 } else { s };
+        let base = self.nested_through(layer);
+        let base = Renderer { opts: RenderOpts { scale: bs, ..base.opts }, ..base };
+        // Frame blending between the nested comp's frames (time-stretched/remapped).
+        let mode = frame_blend_mode(ctx, layer);
+        if mode != FrameBlend::Off
+            && let Some(nc) = self.project.comp(item)
+        {
+            let (i, w) = frame_position(lt, nc.frame_rate);
+            if w > 1e-6 {
+                return (base, NestedFrames::Blend(mode, nc.frame_rate.tick_of(i), nc.frame_rate.tick_of(i + 1), w as f32));
+            }
+        }
+        (base, NestedFrames::One(lt))
+    }
+
+    /// This (nested) renderer's frame of comp `item` at `t`, shared with the other layers of the
+    /// top-level frame that show the same one (see [`memo`]). `keep`: more layers are known to
+    /// want it; otherwise a frame is kept from the second time it is rendered.
+    fn nested_frame(&self, item: ItemId, t: Tick, keep: bool) -> Arc<Image> {
+        let Some(shared) = self.memo else { return Arc::new(self.comp_frame(item, t)) };
+        let key = memo::Key::new(item, t, self.opts.scale, self.depth, self.inherited);
+        if let Some(img) = shared.get(&key) {
+            return img;
+        }
+        let keep = shared.repeated(key) || keep;
+        let img = Arc::new(self.comp_frame(item, t));
+        if keep {
+            shared.insert(key, img.clone());
+        }
+        img
+    }
+
+    /// Render the nested comp frames that several of `layers` (precomp layers of this comp, about
+    /// to be drawn in parallel) share, each once, so that every one of them finds it in the
+    /// [`memo`] instead of all rendering it at the same time.
+    pub(crate) fn prewarm_precomps(&self, ctx: &EvalCtx<'a>, layers: &[&'a Layer]) {
+        let Some(shared) = self.memo else { return };
+        // (renderer, comp, time, layers that want it)
+        let mut wanted: Vec<(Renderer<'a>, memo::Key, ItemId, Tick, usize)> = Vec::new();
+        for layer in layers {
+            let LayerSource::Comp { item } = &layer.source else { continue };
+            // As `source` decides: these draw nothing, a proxy, or an instance of their own.
+            if self.project.comp_contains(*item, ctx.comp_id) || self.proxy_for(*item).is_some() || !essential_overrides(ctx, layer).is_empty() {
+                continue;
+            }
+            let lt = ctx.nested_time(layer);
+            if !self.project.comp(*item).is_some_and(|nc| nc.covers(lt)) {
+                continue;
+            }
+            let (sub, frames) = self.nested_frames(ctx, layer, *item, lt);
+            let times = match frames {
+                NestedFrames::One(t) => [Some(t), None],
+                NestedFrames::Blend(_, a, b, _) => [Some(a), Some(b)],
+            };
+            for t in times.into_iter().flatten() {
+                let key = memo::Key::new(*item, t, sub.opts.scale, sub.depth, sub.inherited);
+                match wanted.iter_mut().find(|w| w.1 == key) {
+                    Some(w) => w.4 += 1,
+                    None => wanted.push((Renderer { ..sub }, key, *item, t, 1)),
+                }
+            }
+        }
+        wanted.retain(|w| w.4 > 1 && shared.get(&w.1).is_none());
+        wanted.par_iter().for_each(|(sub, _, item, t, _)| {
+            sub.nested_frame(*item, *t, true);
+        });
     }
 
     /// The proxy footage used for `item` under this render's Proxy Use, if any.
@@ -1811,6 +1890,18 @@ impl<'a> Renderer<'a> {
             }
         });
     }
+}
+
+/// The frames of a nested comp a precomp layer shows (see [`Renderer::nested_frames`]).
+enum NestedFrames {
+    One(Tick),
+    /// Frame blending: mode, the two frames and the weight of the second.
+    Blend(FrameBlend, Tick, Tick, f32),
+}
+
+/// The image itself: without a copy when nothing else holds it.
+fn unshare(img: Arc<Image>) -> Image {
+    Arc::try_unwrap(img).unwrap_or_else(|shared| (*shared).clone())
 }
 
 /// A layer ready to composite (see [`Renderer::styled_layer`]).
