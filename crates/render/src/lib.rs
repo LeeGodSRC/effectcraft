@@ -1287,9 +1287,15 @@ impl<'a> Renderer<'a> {
             Some(times) => self.blurred_source(ctx, layer, &times)?,
             None => self.source(ctx, layer)?,
         };
-        // A solid is filled with a quantised colour: only masks can take it off the grid.
-        let solid = matches!(layer.source, LayerSource::Solid { .. });
-        if masks::apply(ctx, layer, &mut buf, self.mask_blur(ctx, layer)) || !solid {
+        // A solid is filled with a quantised colour and a nested comp's frame is quantised after
+        // every layer: only masks can take them off the grid.
+        let exact = match &layer.source {
+            LayerSource::Solid { .. } => true,
+            // (A proxy's pixels and a blend of two frames are not on the grid.)
+            LayerSource::Comp { item } => self.proxy_for(*item).is_none() && frame_blend_mode(ctx, layer) == FrameBlend::Off,
+            _ => false,
+        };
+        if masks::apply(ctx, layer, &mut buf, self.mask_blur(ctx, layer)) || !exact {
             self.pipe.quantize(&mut buf.img);
         }
         Some(buf)
