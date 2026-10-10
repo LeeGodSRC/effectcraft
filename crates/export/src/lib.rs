@@ -242,6 +242,8 @@ const FRAME_BUFFERS: u64 = 28;
 /// few frames in flight, and an effect-heavy frame is bound by memory traffic rather than by
 /// cores: measured on 28 threads, 2 to 12 frames at a time rendered at the same rate, the larger
 /// batches only holding more memory.
+/// The same holds when the frames composite on the GPU: 6 or 7 in flight measured slower than
+/// 4 and held more video memory.
 pub(crate) fn batch_size(width: u32, height: u32, available: Option<u64>) -> u64 {
     let threads = (rayon::current_num_threads() as u64 / 4).clamp(2, 4);
     let Some(available) = available else { return threads };

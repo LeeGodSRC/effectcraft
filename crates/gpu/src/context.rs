@@ -772,6 +772,21 @@ impl GpuContext {
     /// A bounded native readback: polling and receiving share one deadline.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn read_buffer(&self, buffer: &wgpu::Buffer, row: usize, stride: usize, height: usize) -> Result<Vec<u8>, String> {
+        self.read_buffer_after(buffer, row, stride, height, None)
+    }
+
+    /// [`Self::read_buffer`] waiting for submission `after` (the one that fills the buffer)
+    /// instead of for everything submitted so far: with several frames rendering on the device,
+    /// a readback then does not wait for the other frames' queued work.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn read_buffer_after(
+        &self,
+        buffer: &wgpu::Buffer,
+        row: usize,
+        stride: usize,
+        height: usize,
+        after: Option<wgpu::SubmissionIndex>,
+    ) -> Result<Vec<u8>, String> {
         let deadline = std::time::Instant::now() + crate::readback::TIMEOUT;
         let (tx, rx) = std::sync::mpsc::channel();
         self.map_readback(buffer, row, stride, height, move |r| {
@@ -787,7 +802,7 @@ impl GpuContext {
             }
             // Block until the GPU is done (bounded by the deadline: a timeout retires the
             // context) rather than polling and sleeping, which adds latency to every readback.
-            self.poll_readbacks(wgpu::PollType::Wait { submission_index: None, timeout: Some(remaining) })?;
+            self.poll_readbacks(wgpu::PollType::Wait { submission_index: after.clone(), timeout: Some(remaining) })?;
             // The callback may be running on another thread that polled the same device.
             match rx.recv_timeout(remaining.min(std::time::Duration::from_millis(1))) {
                 Ok(result) => return result,
@@ -799,6 +814,18 @@ impl GpuContext {
 
     #[cfg(target_arch = "wasm32")]
     pub(crate) fn read_buffer(&self, _buffer: &wgpu::Buffer, _row: usize, _stride: usize, _height: usize) -> Result<Vec<u8>, String> {
+        Err("synchronous GPU readback is unavailable in the browser".into())
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn read_buffer_after(
+        &self,
+        _buffer: &wgpu::Buffer,
+        _row: usize,
+        _stride: usize,
+        _height: usize,
+        _after: Option<wgpu::SubmissionIndex>,
+    ) -> Result<Vec<u8>, String> {
         Err("synchronous GPU readback is unavailable in the browser".into())
     }
 
@@ -1313,13 +1340,20 @@ impl<'g> Enc<'g> {
 
     /// Submit recorded work.
     pub fn submit(&mut self) {
+        let _ = self.submit_indexed();
+    }
+
+    /// [`Self::submit`], returning the submission to wait for (`None`: nothing was recorded).
+    fn submit_indexed(&mut self) -> Option<wgpu::SubmissionIndex> {
+        let mut index = None;
         if let Some((enc, id)) = self.enc.take() {
-            self.g.queue.submit([enc.finish()]);
+            index = Some(self.g.queue.submit([enc.finish()]));
             if let Ok(mut p) = self.g.pool.lock() {
                 p.close(id);
             }
         }
         self.pending = 0;
+        index
     }
 
     /// Read an image back to the CPU (submits and waits). `None` where readback is impossible.
@@ -1375,8 +1409,10 @@ impl<'g> Enc<'g> {
             wgpu::TexelCopyBufferInfo { buffer: &buf, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(padded), rows_per_image: Some(h) } },
             wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
         );
-        self.submit();
-        let bytes = self.g.read_buffer(&buf, row, padded as usize, h as usize).map_err(|e| log::error!("gpu texture readback: {e}")).ok()?;
+        // Wait for this copy's submission only: other frames' work queued behind it on the
+        // device is not what this readback needs.
+        let after = self.submit_indexed();
+        let bytes = self.g.read_buffer_after(&buf, row, padded as usize, h as usize, after).map_err(|e| log::error!("gpu texture readback: {e}")).ok()?;
         if bytes.len() != out.len() {
             log::error!("gpu texture readback size mismatch");
             return None;
