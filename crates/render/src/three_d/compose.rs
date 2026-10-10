@@ -254,11 +254,20 @@ fn prepare_with<'a>(
         let fd = ctx.comp.frame_duration().seconds();
         let angle = ctx.comp.shutter_angle / 360.0;
         let phase = ctx.comp.shutter_phase / 360.0;
+        // The frame selects the shot's camera. Sample its animated pose throughout
+        // the exposure, even before its in-point (e.g. a negative shutter phase at
+        // frame zero). Selecting again at each sample mixed in the default camera
+        // and drew a second, differently sized image of a stationary layer.
+        let exposure_camera = ctx.comp.active_camera(ctx.time);
         (0..n)
             .filter_map(|i| {
                 let f = phase + angle * i as f64 / (n - 1) as f64;
                 let sub = ctx.at(ctx.time + Tick::from_seconds_f64(f * fd));
-                let c = camera_for(r, &sub);
+                let c = if r.collapse3d.is_some() || (r.depth == 0 && r.opts.view.is_some()) {
+                    cam
+                } else {
+                    exposure_camera.map_or(cam, |layer| super::camera::layer_camera(&sub, layer))
+                };
                 geo(&c, outer * sub.world_matrix(layer) * local, bounds, comp, s, out, r.out_offset())
             })
             .collect()

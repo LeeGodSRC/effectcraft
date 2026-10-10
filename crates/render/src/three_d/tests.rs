@@ -351,6 +351,42 @@ fn camera(p: &mut Project, comp: &Comp) -> Layer {
 }
 
 #[test]
+fn motion_blur_keeps_the_frame_camera_across_its_in_point() {
+    for time in [Tick::ZERO, Tick::from_seconds_f64(0.5)] {
+        let (mut p, cid, comp) = setup();
+        let mut cam = camera(&mut p, &comp);
+        // A one-node camera makes the later translation move the image, without
+        // a two-node camera's automatic pan back towards its Point of Interest.
+        cam.auto_orient = effectcraft_project::AutoOrient::Off;
+        cam.in_point = time;
+        set(&mut cam, "transform/position", Value::Vec3([100.0, 50.0, -zoom() * 0.5]));
+        push(&mut p, cid, cam);
+        let mut layer = solid3(&mut p, &comp, [1.0, 1.0, 1.0], 30, 20, [80.0, 50.0, 0.0]);
+        layer.switches.motion_blur = true;
+        push(&mut p, cid, layer);
+        p.comp_mut(cid).unwrap().enable_motion_blur = true;
+        let render = |p: &Project, motion_blur| Renderer::new(p, &NoFootage, RenderOpts { motion_blur, ..Default::default() }).comp_frame(cid, time);
+        let sharp = render(&p, false);
+        let blurred = render(&p, true);
+        for (a, b) in sharp.data.iter().zip(&blurred.data) {
+            assert!((a[3] - b[3]).abs() < 1e-5, "stationary shot at {time:?}: {a:?} != {b:?}");
+        }
+
+        // Keep evaluating camera motion at each sample, rather than freezing its pose.
+        let camera = &mut p.comp_mut(cid).unwrap().layers[0];
+        camera.props.prop_mut("transform/position").unwrap().keys = vec![
+            effectcraft_keyframe::Keyframe::new(time - Tick::from_units(1, 30), Value::Vec3([90.0, 50.0, -zoom() * 0.5])),
+            effectcraft_keyframe::Keyframe::new(time + Tick::from_units(1, 30), Value::Vec3([110.0, 50.0, -zoom() * 0.5])),
+        ];
+        let moving = render(&p, true);
+        assert!(moving.data.iter().zip(&sharp.data).any(|(a, b)| (a[3] - b[3]).abs() > 0.05));
+        // Extending this same camera's trim must not change the exposure.
+        p.comp_mut(cid).unwrap().layers[0].in_point = time - Tick::from_seconds_f64(1.0);
+        assert_eq!(moving, render(&p, true));
+    }
+}
+
+#[test]
 fn default_camera_layer_matches_comp_camera() {
     let (mut p, cid, comp) = setup();
     let cam = camera(&mut p, &comp);
