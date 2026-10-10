@@ -614,6 +614,16 @@ mod tests {
         assert_eq!(g.prop("blendingMode").unwrap().value, Value::Enum(3));
     }
     #[test]
+    fn particle_world_popup_labels_map_direction_and_star() {
+        let mut animation = param("", "Animation", 7, Value::Scalar(2.0));
+        animation.options = ["Explosive", "Direction Axis", "Cone Axis", "(-", "Viscouse", "Twirl", "Twirly"].map(str::to_string).to_vec();
+        let mut particle = param("", "Particle Type", 7, Value::Scalar(2.0));
+        particle.options = ["Line", "Star", "(-", "Shaded Sphere", "Faded Sphere"].map(str::to_string).to_vec();
+        let g = build("CC Particle World", vec![animation, particle]);
+        assert_eq!(g.prop("physics/animation").unwrap().value, Value::Enum(1));
+        assert_eq!(g.prop("particle/particleType").unwrap().value, Value::Enum(4));
+    }
+    #[test]
     fn decodes_pard_typed_defaults_without_native_default_substitution() {
         let mut bytes = vec![0; 148];
         bytes[56..60].copy_from_slice(&(32768u32).to_be_bytes());

@@ -842,6 +842,15 @@ impl Phys {
         let ax = norm3(self.axis);
         let jitter = rand_dir(id, 5, seed, self.flat);
         let dir = match self.anim {
+            // Particle World's Direction Axis uses Extra for cone spread; the axis is
+            // the cone's centre. Extra Angle rotates the emission around that axis.
+            10 => {
+                let (s, c) = self.extra_angle.to_radians().sin_cos();
+                let dot = ax[0] * jitter[0] + ax[1] * jitter[1] + ax[2] * jitter[2];
+                let cross = [ax[1] * jitter[2] - ax[2] * jitter[1], ax[2] * jitter[0] - ax[0] * jitter[2], ax[0] * jitter[1] - ax[1] * jitter[0]];
+                let rotated: [f32; 3] = std::array::from_fn(|k| jitter[k] * c + cross[k] * s + ax[k] * dot * (1.0 - c));
+                norm3(std::array::from_fn(|k| ax[k] + rotated[k] * self.extra))
+            }
             1 | 9 => norm3([ax[0] + jitter[0] * 0.08, ax[1] + jitter[1] * 0.08, ax[2] + jitter[2] * 0.08]),
             2 => {
                 let k = (self.extra_angle.to_radians() * 0.5).tan().abs().min(20.0);
@@ -957,7 +966,7 @@ impl Phys {
             gravity: self.gravity,
             axis: norm3(self.axis),
             extra: self.extra,
-            cone: (self.extra_angle.to_radians() * 0.5).tan().abs().min(20.0),
+            cone: if self.anim == 10 { self.extra_angle.to_radians() } else { (self.extra_angle.to_radians() * 0.5).tan().abs().min(20.0) },
             damp: (-drag * dt).exp(),
             seed: self.seed,
             flat: self.flat,
@@ -1054,13 +1063,19 @@ static PW_CACHE: SimCache<PState> = SimCache::new(6);
 fn pw_phys(ctx: &EffectCtx) -> Phys {
     let pr = ctx.params;
     Phys {
-        // Line dust needs a denser emitter than the separately calibrated polygons.
-        // The multiplier is fitted; Cycore documents density, not particles/second.
-        rate: pr.f("birthRate").max(0.0) * if pr.e("particle/particleType") == 0 { 6_000.0 } else { 120.0 },
+        // These multipliers are fitted to rendered density; Cycore does not specify
+        // particles/second. Stars were incorrectly using the textured-polygon fit.
+        rate: pr.f("birthRate").max(0.0)
+            * match pr.e("particle/particleType") {
+                0 => 6_000.0,
+                4 => 30.0,
+                _ => 120.0,
+            },
         life: pr.f("longevity").max(0.0) as f32,
         producer: [pr.f("producer/producerX") as f32, pr.f("producer/producerY") as f32, pr.f("producer/producerZ") as f32],
         radius: [pr.f("producer/radiusX").max(0.0) as f32, pr.f("producer/radiusY").max(0.0) as f32, pr.f("producer/radiusZ").max(0.0) as f32],
-        anim: pr.e("physics/animation"),
+        // Internal mode 10 leaves Particle Systems II's different Direction mode alone.
+        anim: if pr.e("physics/animation") == 1 { 10 } else { pr.e("physics/animation") },
         speed: pr.f("physics/velocity") as f32 * 0.5,
         gravity: {
             let g = pr.f("physics/gravity") as f32;
@@ -1290,12 +1305,22 @@ fn particle_world_layout(ctx: &EffectCtx, b: &Buf) -> Option<WorldPlan> {
         .par_iter()
         .filter_map(|q| {
             let PwSeen { depth, x, y, k, v } = cam.see(q.p, q.v, lw, lh, b)?;
-            let (c, size) = particle_look(q, birth, death, bs, ds, svar, max_op);
+            let (c, mut size) = particle_look(q, birth, death, bs, ds, svar, max_op);
+            if kind == 4 {
+                // Star tips extend to twice Sprite::r, unlike the sphere's perimeter.
+                // Match their diameter before applying the common particle size scale.
+                size *= 0.5;
+            }
             let color = pw_color(ctx, q, birth, death, c[3], textured);
             let radius = size * 0.5 * lw * k * scale * quad;
             let mut rotation = (q.rnd * initial + q.age * spin).to_radians();
             if pr.b("texture/align") {
                 rotation += v[1].atan2(v[0]);
+            }
+            // Initial Rotation / Rotation Speed apply to rotating polygon types,
+            // not the screen-aligned four-point Star (Cycore public manual).
+            if kind == 4 {
+                rotation = 0.0;
             }
             let sp = if kind == 0 {
                 pw_line_sprite(x, y, radius, color, v[0] * lw * k * scale, v[1] * lw * k * scale, scale)
@@ -2046,6 +2071,62 @@ mod tests {
             let ctx = EffectCtx { params: &params, time: 1.0, layer_size: [64.0; 2], seed: 1, adjustment: false, env: EffectEnv::default() };
             assert!((pw_phys(&ctx).rate - 1.2).abs() < 1e-9);
         }
+    }
+
+    #[test]
+    fn particle_world_stars_have_bounded_size_and_separate_density() {
+        let mut params = pw_params();
+        for (id, value) in [
+            ("particle/particleType", Value::Enum(4)),
+            ("birthRate", num(1.0)),
+            ("longevity", num(2.0)),
+            ("physics/velocity", num(0.0)),
+            ("physics/gravity", num(0.0)),
+            ("producer/radiusZ", num(0.0)),
+            ("particle/birthSize", num(1.0)),
+            ("particle/deathSize", num(1.0)),
+            ("particle/sizeVariation", num(0.0)),
+        ] {
+            params.values.insert(id.into(), value);
+        }
+        let ctx = EffectCtx { params: &params, time: 1.0, layer_size: [64.0; 2], seed: 3, adjustment: false, env: EffectEnv::default() };
+        assert_eq!(pw_phys(&ctx).rate, 30.0);
+        let b = Buf { img: Image::new(64, 64), offset: [0.0; 2], scale: 1.0 };
+        let plan = particle_world_layout(&ctx, &b).unwrap();
+        assert_eq!(plan.sprites.len(), 30);
+        assert!(plan.sprites.iter().all(|s| s.sprite.r <= 4.0), "four-radius star width must not exceed requested diameter");
+        assert!(plan.sprites.iter().all(|s| s.sprite.r == 4.0));
+        assert!(plan.sprites.iter().all(|s| s.sprite.rot == 0.0));
+        let half = particle_world_layout(&ctx, &Buf { img: Image::new(32, 32), scale: 0.5, ..b }).unwrap();
+        for (a, b) in plan.sprites.iter().zip(&half.sprites) {
+            assert_eq!(a.sprite.r, b.sprite.r * 2.0);
+        }
+    }
+
+    #[test]
+    fn particle_world_direction_axis_obeys_extra_and_phase() {
+        let mut params = pw_params();
+        params.values.insert("physics/animation".into(), Value::Enum(1));
+        params.values.insert("physics/extra".into(), num(0.0));
+        let physics =
+            |params: &crate::Params| pw_phys(&EffectCtx { params, time: 0.0, layer_size: [64.0; 2], seed: 3, adjustment: false, env: EffectEnv::default() });
+        let straight = physics(&params).spawn(1).v;
+        assert_eq!(straight[0], 0.0);
+        assert!(straight[1] < 0.0);
+        assert_eq!(straight[2], 0.0);
+        params.values.insert("physics/extra".into(), num(0.5));
+        params.values.insert("physics/extraAngle".into(), num(0.0));
+        let spread = physics(&params);
+        assert!((0..50).any(|i| spread.spawn(i).v[0].abs() > 0.05));
+        params.values.insert("physics/extraAngle".into(), num(180.0));
+        let turned = physics(&params);
+        for id in 0..50 {
+            let a = spread.spawn(id).v;
+            let b = turned.spawn(id).v;
+            assert!((a[0] + b[0]).abs() < 1e-6 && (a[2] + b[2]).abs() < 1e-6);
+            assert!((a[1] - b[1]).abs() < 1e-6);
+        }
+        assert!((turned.desc().cone - std::f32::consts::PI).abs() < 1e-6, "GPU phase is radians");
     }
 
     #[test]
