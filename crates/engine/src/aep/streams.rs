@@ -47,6 +47,43 @@ impl DecodedStream {
         property.expr.clone_from(&self.expression);
     }
 
+    /// Scale each axis of a spatial stream by its own factor: values, spatial tangents, and the
+    /// eases' speeds (by how much the path to the neighbouring key grew, as a speed along a
+    /// path has no per-axis form).
+    fn scale_axes(&mut self, scale: [f64; 3]) {
+        let scaled = |value: &Value| {
+            let components = value.components().iter().zip(scale).map(|(v, s)| v * s).collect::<Vec<_>>();
+            value.with_components(&components)
+        };
+        let distance = |a: &Value, b: &Value| a.components().iter().zip(b.components()).map(|(a, b)| (a - b).powi(2)).sum::<f64>().sqrt();
+        let growth = |a: Option<&Keyframe>, b: Option<&Keyframe>| match (a, b) {
+            (Some(a), Some(b)) => {
+                let raw = distance(&a.value, &b.value);
+                let grown = distance(&scaled(&a.value), &scaled(&b.value));
+                if raw > 0.0 && grown.is_finite() { grown / raw } else { 1.0 }
+            }
+            _ => 1.0,
+        };
+        let factors = (0..self.keys.len())
+            .map(|i| (growth(i.checked_sub(1).and_then(|p| self.keys.get(p)), self.keys.get(i)), growth(self.keys.get(i), self.keys.get(i + 1))))
+            .collect::<Vec<_>>();
+        for (key, (incoming, outgoing)) in self.keys.iter_mut().zip(factors) {
+            for ease in &mut key.in_ease {
+                ease.speed *= incoming;
+            }
+            for ease in &mut key.out_ease {
+                ease.speed *= outgoing;
+            }
+            for (tangent, s) in key.spatial_in.iter_mut().zip(scale) {
+                *tangent *= s;
+            }
+            for (tangent, s) in key.spatial_out.iter_mut().zip(scale) {
+                *tangent *= s;
+            }
+        }
+        self.map_values(scaled);
+    }
+
     fn multiply(&mut self, factor: f64) {
         self.map_values(|value| value.with_components(&value.components().iter().map(|v| v * factor).collect::<Vec<_>>()));
         for key in &mut self.keys {
@@ -378,8 +415,27 @@ fn collect_transform_properties(nodes: &[ChunkNode<'_>], depth: usize, inherited
     Ok(())
 }
 
-pub(crate) fn install_transforms(decoded: &[DecodedTransform], layer: &mut Layer, ids: &mut Ids<'_>) -> Result<Vec<String>, String> {
+/// Installs a layer's decoded transform streams. `source_size` is the pixel size of the layer's
+/// footage, solid or composition source (`None` for layers without a sized source item).
+pub(crate) fn install_transforms(
+    decoded: &[DecodedTransform],
+    layer: &mut Layer,
+    source_size: Option<(u32, u32)>,
+    ids: &mut Ids<'_>,
+) -> Result<Vec<String>, String> {
+    use effectcraft_project::LayerSource;
     let mut warnings = Vec::new();
+    // The anchor point of a layer that shows a source item (footage, solid, composition) is
+    // stored as a fraction of that source's width and height: an untouched anchor is absent
+    // (the centre), (0, 0.5) is the middle of the left edge. Text layers, which have no source
+    // size, store pixels. Observed in every stored anchor of the reference project and confirmed
+    // against its After Effects render; the depth component's unit is unverified and is kept.
+    let anchor_scale = match (&layer.source, source_size) {
+        (LayerSource::Footage { .. } | LayerSource::Solid { .. } | LayerSource::Comp { .. }, Some((w, h))) if w > 0 && h > 0 => {
+            Some([f64::from(w), f64::from(h), 1.0])
+        }
+        _ => None,
+    };
     // AE nulls are anchored at their upper-left corner. An untouched anchor may
     // be absent from the file; do not inherit the native builder's centred anchor.
     // Install explicit values, keys and expressions over this default below.
@@ -411,6 +467,11 @@ pub(crate) fn install_transforms(decoded: &[DecodedTransform], layer: &mut Layer
         }
         if let Some(property) = layer.props.prop_mut(&path) {
             let mut stream = entry.stream.clone();
+            if entry.path == "anchor"
+                && let Some(scale) = anchor_scale
+            {
+                stream.scale_axes(scale);
+            }
             let template = property.value.clone();
             stream.map_values(|value| template.with_components(&value.components()));
             stream.install(property);

@@ -318,7 +318,7 @@ fn imported_null_uses_top_left_anchor_unless_explicitly_authored() {
     let mut null = session.project.comps().next().unwrap().1.layers[0].clone();
     let mut next_id = session.project.next_id;
     assert_eq!(null.source, effectcraft_project::LayerSource::Null);
-    install_transforms(&[], &mut null, &mut Ids(&mut next_id)).unwrap();
+    install_transforms(&[], &mut null, None, &mut Ids(&mut next_id)).unwrap();
     assert_eq!(null.props.prop("transform/anchor").unwrap().value, Value::Vec3([0.0; 3]));
 
     let anchor = DecodedTransform {
@@ -329,7 +329,7 @@ fn imported_null_uses_top_left_anchor_unless_explicitly_authored() {
             ..Default::default()
         },
     };
-    install_transforms(&[anchor], &mut null, &mut Ids(&mut next_id)).unwrap();
+    install_transforms(&[anchor], &mut null, None, &mut Ids(&mut next_id)).unwrap();
     let anchor = null.props.prop("transform/anchor").unwrap();
     assert_eq!(anchor.value, Value::Vec3([12.0, 34.0, 0.0]));
     assert_eq!(anchor.keys[0].value, Value::Vec3([5.0, 6.0, 0.0]));
@@ -343,10 +343,42 @@ fn omitted_camera_position_uses_imported_lens_and_preserves_explicit_position() 
     let mut camera = session.project.comps().next().unwrap().1.layers[0].clone();
     let mut next_id = session.project.next_id;
     let zoom = DecodedTransform { path: "cameraOptions/zoom".into(), stream: DecodedStream { value: Some(Value::Scalar(1078.0)), ..Default::default() } };
-    install_transforms(std::slice::from_ref(&zoom), &mut camera, &mut Ids(&mut next_id)).unwrap();
+    install_transforms(std::slice::from_ref(&zoom), &mut camera, None, &mut Ids(&mut next_id)).unwrap();
     assert_eq!(camera.props.prop("transform/position").unwrap().value, Value::Vec3([960.0, 540.0, -1078.0]));
     let position =
         DecodedTransform { path: "position".into(), stream: DecodedStream { value: Some(Value::Vec3([900.0, 500.0, -854.0])), ..Default::default() } };
-    install_transforms(&[zoom, position], &mut camera, &mut Ids(&mut next_id)).unwrap();
+    install_transforms(&[zoom, position], &mut camera, None, &mut Ids(&mut next_id)).unwrap();
     assert_eq!(camera.props.prop("transform/position").unwrap().value, Value::Vec3([900.0, 500.0, -854.0]));
+}
+
+#[test]
+fn source_layer_anchor_is_a_fraction_of_the_source_size() {
+    let mut session = crate::Session::new();
+    session.execute("comp.new", serde_json::json!({"width":1920,"height":1080})).unwrap();
+    session.execute("layer.newSolid", serde_json::json!({"width":6500,"height":250})).unwrap();
+    session.execute("layer.newText", serde_json::json!({"text":"x"})).unwrap();
+    let layers = session.project.comps().next().unwrap().1.layers.clone();
+    let mut solid = layers.iter().find(|l| matches!(l.source, effectcraft_project::LayerSource::Solid { .. })).unwrap().clone();
+    let mut text = layers.iter().find(|l| l.source == effectcraft_project::LayerSource::Text).unwrap().clone();
+    let mut next_id = session.project.next_id;
+    let mut first = Keyframe::new(Tick::ZERO, Value::Vec3([0.0, 0.5, 0.0]));
+    first.spatial_out = [0.1, 0.2, 3.0];
+    first.out_ease = vec![effectcraft_keyframe::Ease { speed: 2.0, influence: 33.0 }];
+    let second = Keyframe::new(Tick::from_seconds_f64(1.0), Value::Vec3([1.0, 0.5, 0.0]));
+    let anchor = DecodedTransform {
+        path: "anchor".into(),
+        stream: DecodedStream { value: Some(Value::Vec3([-0.01, 0.5, 7.0])), keys: vec![first, second], ..Default::default() },
+    };
+    // A solid: fractions of its own 6500 x 250, so (-0.01, 0.5) is 65 px left of the middle of
+    // its left edge; depth stays as stored.
+    install_transforms(std::slice::from_ref(&anchor), &mut solid, Some((6500, 250)), &mut Ids(&mut next_id)).unwrap();
+    let installed = solid.props.prop("transform/anchor").unwrap();
+    assert_eq!(installed.value, Value::Vec3([-65.0, 125.0, 7.0]));
+    assert_eq!(installed.keys[0].value, Value::Vec3([0.0, 125.0, 0.0]));
+    assert_eq!(installed.keys[1].value, Value::Vec3([6500.0, 125.0, 0.0]));
+    assert_eq!(installed.keys[0].spatial_out, [650.0, 50.0, 3.0]);
+    assert_eq!(installed.keys[0].out_ease[0].speed, 13000.0);
+    // A text layer has no source size: pixels, untouched.
+    install_transforms(&[anchor], &mut text, None, &mut Ids(&mut next_id)).unwrap();
+    assert_eq!(text.props.prop("transform/anchor").unwrap().value, Value::Vec3([-0.01, 0.5, 7.0]));
 }

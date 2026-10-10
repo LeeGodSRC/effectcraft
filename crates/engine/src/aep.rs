@@ -1008,7 +1008,8 @@ fn build_project(
             } else {
                 dlayer.name.clone()
             };
-            let size = source.item().and_then(|id| source_sizes.get(&id)).copied().unwrap_or((dcomp.width, dcomp.height));
+            let source_size = source.item().and_then(|id| source_sizes.get(&id)).copied();
+            let size = source_size.unwrap_or((dcomp.width, dcomp.height));
             let mut layer = build::layer(&mut project, &comp, &layer_name, source, size, Some(duration));
             // Imports preserve names, including duplicates used by expressions. The interactive
             // builder's name uniquification is appropriate only for newly created layers.
@@ -1078,7 +1079,7 @@ fn build_project(
                 }
             }
 
-            import_warnings.extend(streams::install_transforms(&dlayer.transforms, &mut layer, &mut build::Ids(&mut project.next_id))?);
+            import_warnings.extend(streams::install_transforms(&dlayer.transforms, &mut layer, source_size, &mut build::Ids(&mut project.next_id))?);
             import_warnings.extend(shapes::apply(&dlayer.shapes, &mut project, &mut layer, size)?);
             let (groups, warnings) =
                 effects::instantiate(&dlayer.effects, &mut build::Ids(&mut project.next_id), [f64::from(size.0), f64::from(size.1)], &raw_layer_ids)?;
