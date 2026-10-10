@@ -154,6 +154,9 @@ fn fxp_raster(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
         let c = s.c;
         switch (P.u[0].y) {
+            case 3u: {
+                d = d + c - d * c;
+            }
             case 1u: {
                 d = vec4<f32>(d.xyz + c.xyz, min(d.w + c.w, 1.0));
             }

@@ -21,6 +21,7 @@ pub struct EngineDesc {
     pub gravity: [f32; 3],
     /// Normalised direction axis.
     pub axis: [f32; 3],
+    /// Animation strength; Direction Axis uses the converted angular spread.
     pub extra: f32,
     /// Cone Axis spread factor `|tan(extra angle / 2)|` (≤ 20), or phase in radians for mode 10.
     pub cone: f32,

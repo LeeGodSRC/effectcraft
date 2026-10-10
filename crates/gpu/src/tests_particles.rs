@@ -92,6 +92,31 @@ fn particle_world_matches_the_cpu() {
 }
 
 #[test]
+fn particle_world_direction_phase_and_fixed_lifetime_match_cpu() {
+    let Some(g) = gpu() else { return };
+    let host = Host(g);
+    for (axis, angle) in [([0.0, -1.0, 0.0], 90.0), ([0.0, 0.0, 1.0], 180.0), ([0.0, 0.0, -1.0], -90.0)] {
+        let p = params(
+            "ec.sim.ccparticleworld",
+            &[
+                ("particle/particleType", Value::Enum(1)),
+                ("physics/animation", Value::Enum(1)),
+                ("birthRate", n(2.0)),
+                ("longevity", n(0.75)),
+                ("physics/extra", n(0.5)),
+                ("physics/extraAngle", n(angle)),
+                ("physics/directionAxis/axisX", n(axis[0])),
+                ("physics/directionAxis/axisY", n(axis[1])),
+                ("physics/directionAxis/axisZ", n(axis[2])),
+            ],
+        );
+        let (cpu, gpu) = states("ec.sim.ccparticleworld", &p, 1.0, &host);
+        assert!(cpu.iter().chain(&gpu).all(|q| q.life == 0.75));
+        agree("direction phase and fixed lifespan", &cpu, &gpu, 1e-4, 1);
+    }
+}
+
+#[test]
 fn particle_systems_ii_matches_the_cpu() {
     let Some(g) = gpu() else { return };
     let host = Host(g);

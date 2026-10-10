@@ -90,11 +90,15 @@ fn ps_spawn_engine(id: u32) -> Part {
     var dir = jitter;
     switch anim {
         case 10u: {
+            var base = ps_norm3(vec3<f32>(ax.x * ax.z, ax.y * ax.z, ax.z * ax.z - 1.0));
+            if (abs(ax.z) >= 0.999) {
+                base = ps_norm3(vec3<f32>(ax.z, 0.0, -ax.x));
+            }
+            let launch = base + jitter * S.f[0].z;
             let angle = S.f[0].w;
             let c = cos(angle);
             let s = sin(angle);
-            let rotated = jitter * c + cross(ax, jitter) * s + ax * dot(ax, jitter) * (1.0 - c);
-            dir = ps_norm3(ax + rotated * S.f[0].z);
+            dir = ps_norm3(launch * c + cross(ax, launch) * s + ax * dot(ax, launch) * (1.0 - c));
         }
         case 1u, 9u: {
             dir = ps_norm3(ax + jitter * 0.08);
@@ -123,7 +127,7 @@ fn ps_spawn_engine(id: u32) -> Part {
     if (flat) {
         v.z = 0.0;
     }
-    let life = S.f[0].x * (0.8 + 0.4 * ps_h(id, 10u));
+    let life = select(S.f[0].x, S.f[0].x * (0.8 + 0.4 * ps_h(id, 10u)), flat);
     let dt = S.f[5].y;
     let frac = ps_h(id, 12u) * dt;
     return Part(p + v * frac, v, frac, life, ps_h(id, 11u));
