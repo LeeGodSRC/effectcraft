@@ -14,8 +14,9 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
 
+use effectcraft_effects::Buf;
 use effectcraft_project::{ItemId, Quality};
-use effectcraft_raster::{Image, Px};
+use effectcraft_raster::Px;
 use effectcraft_time::Tick;
 
 /// Pixels kept per top-level frame (bytes); frames past it are rendered again when needed.
@@ -47,7 +48,7 @@ impl Key {
 
 #[derive(Default)]
 struct Inner {
-    frames: HashMap<Key, Arc<Image>>,
+    frames: HashMap<Key, Arc<Buf>>,
     /// Keys rendered once without being kept.
     seen: HashSet<Key>,
     bytes: usize,
@@ -61,7 +62,7 @@ pub(crate) struct FrameMemo {
 
 impl FrameMemo {
     /// The frame kept for `key`.
-    pub(crate) fn get(&self, key: &Key) -> Option<Arc<Image>> {
+    pub(crate) fn get(&self, key: &Key) -> Option<Arc<Buf>> {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner).frames.get(key).cloned()
     }
 
@@ -71,14 +72,14 @@ impl FrameMemo {
         !self.inner.lock().unwrap_or_else(PoisonError::into_inner).seen.insert(key)
     }
 
-    /// Keep `img` for `key` (unless the memo is full or another thread got there first).
-    pub(crate) fn insert(&self, key: Key, img: Arc<Image>) {
-        let bytes = img.data.len().saturating_mul(std::mem::size_of::<Px>());
+    /// Keep `buf` for `key` (unless the memo is full or another thread got there first).
+    pub(crate) fn insert(&self, key: Key, buf: Arc<Buf>) {
+        let bytes = buf.img.data.len().saturating_mul(std::mem::size_of::<Px>());
         let mut g = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         if g.bytes.saturating_add(bytes) > BUDGET || g.frames.contains_key(&key) {
             return;
         }
         g.bytes += bytes;
-        g.frames.insert(key, img);
+        g.frames.insert(key, buf);
     }
 }

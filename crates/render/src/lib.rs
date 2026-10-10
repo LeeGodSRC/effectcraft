@@ -1083,11 +1083,11 @@ impl<'a> Renderer<'a> {
                     None => base,
                 };
                 let img = match frames {
-                    NestedFrames::One(t) => unshare(sub.nested_frame(*item, t, false)),
+                    NestedFrames::One(t) => unshare(sub.nested_frame(*item, t, false)).img,
                     NestedFrames::Blend(mode, a, b, w) => {
                         let a = sub.nested_frame(*item, a, false);
                         let b = sub.nested_frame(*item, b, false);
-                        blend_frames(mode, &a, &b, w)
+                        blend_frames(mode, &a.img, &b.img, w)
                     }
                 };
                 Some(Buf { img, offset: [0.0; 2], scale: bs })
@@ -1148,18 +1148,39 @@ impl<'a> Renderer<'a> {
     /// This (nested) renderer's frame of comp `item` at `t`, shared with the other layers of the
     /// top-level frame that show the same one (see [`memo`]). `keep`: more layers are known to
     /// want it; otherwise a frame is kept from the second time it is rendered.
-    fn nested_frame(&self, item: ItemId, t: Tick, keep: bool) -> Arc<Image> {
-        let Some(shared) = self.memo else { return Arc::new(self.comp_frame(item, t)) };
+    fn nested_frame(&self, item: ItemId, t: Tick, keep: bool) -> Arc<Buf> {
+        let render = || Arc::new(Buf { img: self.comp_frame(item, t), offset: [0.0; 2], scale: self.opts.scale });
+        let Some(shared) = self.memo else { return render() };
         let key = memo::Key::new(item, t, self.opts.scale, self.depth, self.inherited);
-        if let Some(img) = shared.get(&key) {
-            return img;
+        if let Some(buf) = shared.get(&key) {
+            return buf;
         }
         let keep = shared.repeated(key) || keep;
-        let img = Arc::new(self.comp_frame(item, t));
+        let buf = render();
         if keep {
-            shared.insert(key, img.clone());
+            shared.insert(key, buf.clone());
         }
-        img
+        buf
+    }
+
+    /// The processed buffer of a precomp layer that shows its nested comp's frame as it is (no
+    /// masks, effects, proxy, instance overrides or frame blending): the shared frame itself, so
+    /// the layers showing it hold one buffer between them. `None` for every other layer.
+    fn shared_precomp(&self, ctx: &EvalCtx, layer: &Layer) -> Option<Arc<Buf>> {
+        let LayerSource::Comp { item } = &layer.source else { return None };
+        if layer.masks().is_some_and(|m| !m.children.is_empty()) || (layer.switches.effects && layer.effects().is_some_and(|fx| fx.groups().any(|g| g.enabled)))
+        {
+            return None;
+        }
+        if self.project.comp_contains(*item, ctx.comp_id) || self.proxy_for(*item).is_some() || !essential_overrides(ctx, layer).is_empty() {
+            return None;
+        }
+        let lt = ctx.nested_time(layer);
+        if !self.project.comp(*item).is_some_and(|nc| nc.covers(lt)) {
+            return None;
+        }
+        let (sub, NestedFrames::One(t)) = self.nested_frames(ctx, layer, *item, lt) else { return None };
+        Some(sub.nested_frame(*item, t, false))
     }
 
     /// Render the nested comp frames that several of `layers` (precomp layers of this comp, about
@@ -1371,6 +1392,10 @@ impl<'a> Renderer<'a> {
                 t.cached = true;
             }
             return Some((b, key));
+        }
+        // A precomp shown as it is: the nested comp's (shared) frame, without a copy.
+        if let Some(buf) = self.shared_precomp(ctx, layer) {
+            return Some((buf, key));
         }
         let buf = self.masked_source(ctx, layer)?;
         let buf = Arc::new(self.apply_effects_timed(ctx, layer, buf, false, usize::MAX, timing.map(|t| &mut t.effects)));
@@ -1905,9 +1930,9 @@ enum NestedFrames {
     Blend(FrameBlend, Tick, Tick, f32),
 }
 
-/// The image itself: without a copy when nothing else holds it.
-fn unshare(img: Arc<Image>) -> Image {
-    Arc::try_unwrap(img).unwrap_or_else(|shared| (*shared).clone())
+/// The buffer itself: without a copy when nothing else holds it.
+fn unshare(buf: Arc<Buf>) -> Buf {
+    Arc::try_unwrap(buf).unwrap_or_else(|shared| (*shared).clone())
 }
 
 /// A layer ready to composite (see [`Renderer::styled_layer`]).
