@@ -20,8 +20,9 @@
 //! Overflow and a [`StorageQuota`] hook, files that don't fit go to the overflow folders. A
 //! render log (Errors Only / Plus Settings / Plus Per Frame Info) is written next to the output.
 //!
-//! Frames are rendered in parallel batches (rayon; one batch ≈ one frame per core) and handed to
-//! the encoder in order. They share the job's layer cache, as viewer frames share the viewer's:
+//! Frames are rendered in parallel batches (rayon; a few frames at a time within the available
+//! memory, see [`batch_size`]; the job's first frame alone) and handed to the encoder in order,
+//! which encodes a batch while the next one renders. They share the job's layer cache, as viewer frames share the viewer's:
 //! static and transform-only layers render once per job. Progress is reported after each batch through a callback that can cancel
 //! the job by returning `false`. Codecs and the MP4/MOV muxer are FilmCraft's pure-Rust crates
 //! (plan ADR 0001); nothing outside this crate touches them.
@@ -203,6 +204,8 @@ async fn export_with(cx: &Cx<'_>, progress: &mut dyn FnMut(&Progress) -> bool, t
         f if f.is_sequence() => sequence(cx, comp, w, h, &mut st).await?,
         f => return Err(ExportError::Unsupported(f.label().into())),
     };
+    // The job's frames are done: the pixel buffers waiting for reuse go back to the system.
+    effectcraft_raster::pool::trim();
     report.seconds = t0.elapsed().as_secs_f64();
     report.frames = total;
     (report.width, report.height) = (w, h);
