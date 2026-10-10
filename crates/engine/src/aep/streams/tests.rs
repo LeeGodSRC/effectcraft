@@ -91,6 +91,31 @@ fn spatial_keys_preserve_values_and_tangents() {
 }
 
 #[test]
+fn installing_spatial_animator_position_keeps_its_curved_path() {
+    let header = header(3, 14, 24);
+    let list = list_header(2, 128);
+    let mut rows = [vec![0; 128], vec![0; 128]];
+    for (i, row) in rows.iter_mut().enumerate() {
+        row[..4].copy_from_slice(&(i as i32 * 24).to_be_bytes());
+        row[4] = 1;
+        row[5] = 1;
+        f64_at(row, 56, i as f64 * 100.0);
+        // Symmetric arch: y=0 at both keys, positive y between them.
+        f64_at(row, if i == 0 { 112 } else { 88 }, 80.0);
+    }
+    let data = rows.concat();
+    let mut counter = 0;
+    let mut property = effectcraft_project::build::text_anim_prop(&mut Ids(&mut counter), "position").unwrap();
+    assert!(!property.spatial);
+    apply(&animated(&header, &list, &data), &mut property).unwrap();
+    assert!(property.spatial);
+    let middle = property.value_at(Tick::from_units(1, 2)).as_vec3();
+    assert!((middle[0] - 50.0).abs() < 0.01, "{middle:?}");
+    assert!((middle[1] - 60.0).abs() < 0.01, "the path must not flatten to y=0: {middle:?}");
+    assert_eq!(property.keys[0].out_interp, Interp::Linear, "spatial tangents do not imply temporal easing");
+}
+
+#[test]
 fn color_stream_remains_raw_until_caller_converts_channels() {
     let header = header(4, 6, 24_576);
     let list = list_header(1, 152);
