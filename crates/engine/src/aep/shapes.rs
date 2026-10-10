@@ -358,6 +358,10 @@ fn mask(nodes: &[ChunkNode<'_>], metadata: Option<&[u8]>, ids: &mut build::Ids<'
         _ => return Err("unsupported AEP mask mode".into()),
     };
     let mut group = build::mask(ids, &title(nodes, "Mask"), path.unwrap_or_default(), mode, [177, 180, 79]);
+    // The mask information's first byte is the Inverted switch.
+    if let effectcraft_project::GroupKind::Mask { inverted, .. } = &mut group.kind {
+        *inverted = metadata.and_then(|d| d.first()).is_some_and(|b| *b != 0);
+    }
     group.enabled = enabled(nodes);
     if let Some(property) = group.prop_mut("path") {
         property.keys = keys;
@@ -589,7 +593,16 @@ mod tests {
         metadata[8..12].copy_from_slice(&37u32.to_be_bytes());
         let mut counter = 1;
         let group = mask(&[], Some(&metadata), &mut build::Ids(&mut counter), &mut Vec::new()).unwrap();
-        assert!(matches!(group.kind, effectcraft_project::GroupKind::Mask { mode: MaskMode::Subtract, .. }));
+        assert!(matches!(group.kind, effectcraft_project::GroupKind::Mask { mode: MaskMode::Subtract, inverted: false, .. }));
+    }
+    #[test]
+    fn mask_keeps_its_inverted_switch() {
+        let mut metadata = [0; 12];
+        metadata[0] = 1;
+        metadata[4..8].copy_from_slice(&1u32.to_be_bytes());
+        let mut counter = 1;
+        let group = mask(&[], Some(&metadata), &mut build::Ids(&mut counter), &mut Vec::new()).unwrap();
+        assert!(matches!(group.kind, effectcraft_project::GroupKind::Mask { mode: MaskMode::Add, inverted: true, .. }));
     }
     #[test]
     fn applying_masks_replaces_builder_group_and_scales_static_and_animated_paths() {

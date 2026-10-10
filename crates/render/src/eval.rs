@@ -188,9 +188,27 @@ impl<'a> EvalCtx<'a> {
             * Mat4::translate(-Vec3::from(anchor))
     }
 
-    /// Layer space → comp (world) space, including parents.
-    pub fn world_matrix(&self, layer: &Layer) -> Mat4 {
-        let mut m = self.local_matrix_par(layer, self.par_ratio(layer));
+    /// The part of a 3D layer's transform that a 2D child follows: anchor, position and scale in
+    /// x/y and the Z Rotation. After Effects gives a 2D layer no depth, so a 3D parent's X/Y
+    /// Rotation, Orientation, z position and z scale neither foreshorten nor move it (measured on
+    /// a reference render: 2D layers parented to a 3D null whose Y Rotation animates stay round
+    /// and stay put). Orientation's z component is left out with the rest of Orientation; the
+    /// reference doesn't exercise it.
+    fn flat_matrix(&self, layer: &Layer) -> Mat4 {
+        let Some(tr) = layer.transform() else { return Mat4::IDENTITY };
+        let pos = self.position(layer, tr);
+        let anchor = self.v3(layer, tr, "anchor", [0.0; 3]);
+        let scale = self.v3(layer, tr, "scale", [100.0; 3]);
+        let rz = self.f(layer, tr, "rotation", 0.0);
+        Mat4::layer_3d(vec3(anchor[0], anchor[1], 0.0), vec3(pos[0], pos[1], 0.0), vec3(scale[0], scale[1], 100.0), Vec3::ZERO, vec3(0.0, 0.0, rz))
+    }
+
+    /// The space of a layer's Position (its parent chain) → comp (world) space; identity when
+    /// unparented. From a 2D layer upwards the chain is flat: 3D ancestors contribute only
+    /// their 2D transform ([`Self::flat_matrix`]). Cameras and lights keep their full transform.
+    pub fn parent_matrix(&self, layer: &Layer) -> Mat4 {
+        let mut m = Mat4::IDENTITY;
+        let mut flat = !layer.is_3d() && !layer.is_camera() && !layer.is_light();
         let mut cur = layer.parent;
         let mut guard = 0;
         while let Some(pid) = cur {
@@ -199,10 +217,17 @@ impl<'a> EvalCtx<'a> {
                 break;
             }
             let Some(p) = self.comp.layer(pid) else { break };
-            m = self.local_matrix(p) * m;
+            let rig = p.is_camera() || p.is_light();
+            m = if flat && p.is_3d() && !rig { self.flat_matrix(p) } else { self.local_matrix(p) } * m;
+            flat |= !p.is_3d() && !rig;
             cur = p.parent;
         }
         m
+    }
+
+    /// Layer space → comp (world) space, including parents.
+    pub fn world_matrix(&self, layer: &Layer) -> Mat4 {
+        self.parent_matrix(layer) * self.local_matrix_par(layer, self.par_ratio(layer))
     }
 
     pub fn opacity(&self, layer: &Layer) -> f64 {

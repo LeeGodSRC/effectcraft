@@ -413,14 +413,9 @@ fn quad_intersects_box(q: &[[f64; 2]; 4], a: [f64; 2], b: [f64; 2]) -> bool {
 
 /// Parent-space linear inverse (to convert a comp-space drag delta into a position delta).
 fn parent_inverse(ctx: &EvalCtx, layer: &Layer) -> Mat3 {
-    match layer.parent.and_then(|p| ctx.comp.layer(p)) {
-        Some(p) => {
-            let w = ctx.world_matrix(p);
-            let m = Mat3([[w.0[0][0], w.0[0][1], 0.0], [w.0[1][0], w.0[1][1], 0.0], [0.0, 0.0, 1.0]]);
-            m.inverse().unwrap_or(Mat3::IDENTITY)
-        }
-        None => Mat3::IDENTITY,
-    }
+    let w = ctx.parent_matrix(layer);
+    let m = Mat3([[w.0[0][0], w.0[0][1], 0.0], [w.0[1][0], w.0[1][1], 0.0], [0.0, 0.0, 1.0]]);
+    m.inverse().unwrap_or(Mat3::IDENTITY)
 }
 
 /// Draw the extra views of a 2- or 4-view layout and return the main view's rectangle.
@@ -1698,10 +1693,7 @@ fn drag_axes(ctx: &EvalCtx, l: &Layer) -> ([f64; 3], [f64; 3]) {
     let anchor = l.transform().map(|tr| ctx.v3(l, tr, "anchor", [0.0; 3])).unwrap_or([0.0; 3]);
     let wp = ctx.world_matrix(l).apply(anchor.into());
     let k = if cam.ortho { 1.0 / cam.zoom.max(1e-9) } else { cam.depth(wp).max(1.0) / cam.zoom.max(1e-9) };
-    let pinv = match l.parent.and_then(|p| ctx.comp.layer(p)) {
-        Some(p) => ctx.world_matrix(p).inverse().unwrap_or_default(),
-        None => effectcraft_engine::geom::Mat4::IDENTITY,
-    };
+    let pinv = ctx.parent_matrix(l).inverse().unwrap_or_default();
     let a = pinv.apply_vec(cam.right() * k);
     let b = pinv.apply_vec(cam.down() * k);
     ([a.x, a.y, a.z], [b.x, b.y, b.z])

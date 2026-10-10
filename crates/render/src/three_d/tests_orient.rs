@@ -128,3 +128,31 @@ fn layer_cache_is_independent_of_camera_lights_and_view() {
     assert_ne!(third, second);
     assert!(cache.stats().hits > 0, "the cache was actually used");
 }
+
+#[test]
+fn two_d_child_of_a_3d_parent_ignores_its_depth_and_tilt() {
+    // A 2D layer has no depth: a 3D parent's Y Rotation and z position neither foreshorten nor
+    // move it; the parent's x/y position, x/y scale and Z Rotation still apply.
+    let (mut p, cid, comp) = setup();
+    let mut parent = solid(&mut p, &comp, true, [100.0, 40.0, 700.0]);
+    parent.props.prop_mut("transform/anchor").unwrap().value = Value::Vec3([0.0; 3]);
+    parent.props.prop_mut("transform/rotationY").unwrap().value = Value::Scalar(45.0);
+    parent.props.prop_mut("transform/scale").unwrap().value = Value::Vec3([200.0, 200.0, 300.0]);
+    let mut child = solid(&mut p, &comp, false, [-30.0, 10.0, 0.0]);
+    child.props.prop_mut("transform/anchor").unwrap().value = Value::Vec3([0.0; 3]);
+    child.parent = Some(parent.id);
+    let mut child3 = child.clone();
+    child3.id = effectcraft_project::LayerId(child.id.0 + 1000);
+    child3.switches.three_d = true;
+    p.comp_mut(cid).unwrap().layers.extend([parent, child, child3]);
+    let c = p.comp(cid).unwrap();
+    let ctx = EvalCtx::new(&p, cid, c, Tick::ZERO);
+    let w = ctx.world_matrix(&c.layers[1]);
+    let o = w.apply(vec3(0.0, 0.0, 0.0));
+    assert!((o - vec3(40.0, 60.0, 0.0)).length() < 1e-9, "{o:?}");
+    let x = w.apply_vec(vec3(1.0, 0.0, 0.0));
+    assert!((x - vec3(2.0, 0.0, 0.0)).length() < 1e-9, "{x:?}");
+    // A 3D child still follows the whole transform.
+    let o3 = ctx.world_matrix(&c.layers[2]).apply(vec3(0.0, 0.0, 0.0));
+    assert!((o3.x - (100.0 - 60.0 * 45f64.to_radians().cos())).abs() < 1e-6 && o3.z != 700.0, "{o3:?}");
+}
