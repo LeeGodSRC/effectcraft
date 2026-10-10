@@ -18,6 +18,7 @@ const MAX_EXPRESSION: usize = 1024 * 1024;
 pub(crate) struct DecodedStream {
     pub value: Option<Value>,
     pub keys: Vec<Keyframe>,
+    pub spatial: bool,
     pub expression: Option<Expression>,
     pub warnings: Vec<String>,
 }
@@ -39,6 +40,10 @@ impl DecodedStream {
             property.value = value.clone();
         }
         property.keys.clone_from(&self.keys);
+        // Text animator Position and effect points are not spatial in every
+        // native builder. The stream's motion-path flag must accompany its
+        // tangents, or evaluation silently interpolates independent axes.
+        property.spatial |= self.spatial;
         property.expr.clone_from(&self.expression);
     }
 
@@ -103,8 +108,8 @@ pub(crate) fn decode(nodes: &[ChunkNode<'_>], template: &Value) -> Result<Decode
         return Err("AEP stream requires a numeric property template".into());
     }
     let header = chunk(nodes, b"tdb4");
-    let mut decoded = DecodedStream::default();
     let kind = header.map(|h| u16_at(h, 4)).transpose()?.unwrap_or(0);
+    let mut decoded = DecodedStream { spatial: kind & 8 != 0 && (2..=3).contains(&dimensions), ..DecodedStream::default() };
     // Orientation's custom stream advertises one opaque item, containing three LE doubles.
     let orientation = kind == 7 && dimensions == 3 && header.is_some_and(|h| u16_at(h, 8).ok() == Some(6));
     if let Some(data) = chunk(nodes, b"cdat") {

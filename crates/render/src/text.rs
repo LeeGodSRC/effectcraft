@@ -891,27 +891,6 @@ fn runs(geom: &TextGeom) -> Vec<(Vec<usize>, bool)> {
     out
 }
 
-/// Blur is a character-space operation, before its animator transform. Rasterizing it
-/// after Scale turns a thin, tall streak into a wide horizontal smudge. Keep both axes
-/// (and their rotation/skew) by blurring a local patch and transforming that patch.
-fn draw_blurred_glyph(g: &PlacedGlyph, stroke: bool, img: &mut Image, m: &Mat3, mode: BlendMode) {
-    let Some(b) = effectcraft_path::bounds(std::slice::from_ref(&g.local)) else { return };
-    let pad = if stroke { g.stroke_width } else { 0.0 };
-    let b = b.inflate(pad + 2.0 + g.xf.blur[0] * 1.5, pad + 2.0 + g.xf.blur[1] * 1.5);
-    if !b.width().is_finite() || !b.height().is_finite() || b.width() <= 0.0 || b.height() <= 0.0 {
-        return;
-    }
-    // Bound memory even for hostile text sizes / animator values. At least half a pixel
-    // per local unit avoids losing narrow outlines before a large vertical stretch.
-    let sx = m.0[0][0].hypot(m.0[1][0]).max(0.5).min(4096.0 / b.width());
-    let sy = m.0[0][1].hypot(m.0[1][1]).max(0.5).min(4096.0 / b.height());
-    let (w, h) = ((b.width() * sx).ceil().clamp(1.0, 4096.0) as i64, (b.height() * sy).ceil().clamp(1.0, 4096.0) as i64);
-    let local_to_patch = Mat3::scale(vec2(sx, sy)) * Mat3::translate(vec2(-b.x0, -b.y0));
-    let patch = raster_pass(g, stroke, std::slice::from_ref(&g.local), &local_to_patch, [0, 0, w, h], [g.xf.blur[0] * sx, g.xf.blur[1] * sy]);
-    let patch_to_local = Mat3::translate(vec2(b.x0, b.y0)) * Mat3::scale(vec2(1.0 / sx, 1.0 / sy));
-    effectcraft_raster::composite_warp(img, &patch, &(*m * patch_to_local), &effectcraft_raster::WarpOpts { mode, ..Default::default() });
-}
-
 /// Draw glyphs (paths mapped by `to_px` from layer space into `img`).
 fn draw_glyphs(geom: &TextGeom, img: &mut Image, to_px: &Mat3, s: f64, only: Option<usize>) {
     let (w, h) = (img.width as i64, img.height as i64);
@@ -921,11 +900,6 @@ fn draw_glyphs(geom: &TextGeom, img: &mut Image, to_px: &Mat3, s: f64, only: Opt
     };
     for (run, stroke) in runs {
         let Some(g) = run.first().map(|&gi| &geom.glyphs[gi]) else { continue };
-        if g.xf.blur.iter().any(|v| *v > 0.05) {
-            let m = if only.is_some() { *to_px } else { *to_px * g.m2() };
-            draw_blurred_glyph(g, stroke, img, &m, if only.is_some() { BlendMode::Normal } else { geom.blend });
-            continue;
-        }
         // One glyph is drawn from its own outline; a run from its glyphs' outlines in layer
         // space, all wound the same way so overlaps add up instead of cancelling (NonZero).
         let local = Cow::Borrowed(std::slice::from_ref(&g.local));
@@ -964,10 +938,12 @@ pub fn render(ctx: &EvalCtx, layer: &Layer, s: f64) -> Buf {
         if g.xf.opacity > 0.0
             && let Some(b) = effectcraft_path::bounds(std::slice::from_ref(&g.local))
         {
-            let pad = g.stroke_width + 2.0;
-            let b = b.inflate(pad + g.xf.blur[0] * 1.5, pad + g.xf.blur[1] * 1.5);
+            let b = b.inflate(g.stroke_width, g.stroke_width);
             let b = g.m2().map_rect(&effectcraft_geom::Rect::new(b.x0, b.y0, b.x1, b.y1));
-            let b = kurbo::Rect::new(b.x0, b.y0, b.x1, b.y1);
+            // Animator Blur is measured in layer pixels, after character transforms
+            // and before the layer/parent transform. Scaling its support with the
+            // glyph can multiply a modest vertical blur into thousands of pixels.
+            let b = kurbo::Rect::new(b.x0, b.y0, b.x1, b.y1).inflate(2.0 + g.xf.blur[0] * 1.5, 2.0 + g.xf.blur[1] * 1.5);
             bounds = Some(bounds.map_or(b, |a| a.union(b)));
         }
     }

@@ -180,22 +180,60 @@ fn grouping_alignment_centers_capitals_before_animator_scale() {
 }
 
 #[test]
-fn character_blur_follows_scale_and_rotation() {
+fn character_blur_is_in_layer_pixels_after_character_scale_and_rotation() {
     let (mut p, cid, comp) = setup(600, 600);
     let mut l = text_layer(&mut p, &comp, doc("H", 40.0));
     animator(&mut p, &mut l, &["scale", "blur", "rotation"], &["range"]);
     set(&mut l, "text/animators/#1/properties/scale", Value::Vec3([20.0, 800.0, 100.0]));
-    set(&mut l, "text/animators/#1/properties/blur", Value::Vec2([80.0, 10.0]));
     p.comp_mut(cid).unwrap().layers.push(l);
     let image = |p: &Project| render(&ctx(p, cid, 0.0), &p.comp(cid).unwrap().layers[0], 1.0).img;
-    let a = alpha_bbox_at(&image(&p), 0.01).unwrap();
-    let width = a[2] - a[0];
-    let height = a[3] - a[1];
-    assert!(height > width * 5, "blur stretches with the glyph: {a:?}");
-    set(&mut p.comp_mut(cid).unwrap().layers[0], "text/animators/#1/properties/rotation", Value::Scalar(90.0));
-    let b = alpha_bbox_at(&image(&p), 0.01).unwrap();
-    assert!(((b[2] - b[0]) - height).abs() <= 2, "{a:?} → {b:?}");
-    assert!(((b[3] - b[1]) - width).abs() <= 2, "{a:?} → {b:?}");
+    let variance = |img: &Image| {
+        let mut mass = 0.0;
+        let mut first = [0.0; 2];
+        let mut second = [0.0; 2];
+        for (i, pixel) in img.data.iter().enumerate() {
+            let a = f64::from(pixel[3]);
+            mass += a;
+            for (axis, v) in [(i % img.width as usize) as f64, (i / img.width as usize) as f64].into_iter().enumerate() {
+                first[axis] += a * v;
+                second[axis] += a * v * v;
+            }
+        }
+        [0, 1].map(|axis| second[axis] / mass - (first[axis] / mass).powi(2))
+    };
+    for angle in [0.0, 90.0] {
+        let l = &mut p.comp_mut(cid).unwrap().layers[0];
+        set(l, "text/animators/#1/properties/rotation", Value::Scalar(angle));
+        set(l, "text/animators/#1/properties/blur", Value::Vec2([0.0, 0.0]));
+        let sharp = variance(&image(&p));
+        set(&mut p.comp_mut(cid).unwrap().layers[0], "text/animators/#1/properties/blur", Value::Vec2([80.0, 10.0]));
+        let blurred = variance(&image(&p));
+        // A Gaussian adds sigma squared to the spatial variance on each layer axis.
+        // Neither the character's nonuniform scale nor its rotation changes sigma.
+        for axis in 0..2 {
+            let expected = [1600.0, 25.0][axis];
+            assert!(((blurred[axis] - sharp[axis]) / expected - 1.0).abs() < 0.12, "angle={angle}: {sharp:?} -> {blurred:?}");
+        }
+    }
+}
+
+#[test]
+fn selector_amount_weights_scale_opacity_and_blur_before_compositing() {
+    let (mut p, cid, comp) = setup(600, 200);
+    let mut l = text_layer(&mut p, &comp, doc("AB", 40.0));
+    animator(&mut p, &mut l, &["scale", "opacity", "blur"], &["range"]);
+    set(&mut l, "text/animators/#1/properties/scale", Value::Vec3([20.0, 3000.0, 100.0]));
+    set(&mut l, "text/animators/#1/properties/opacity", Value::Scalar(0.0));
+    set(&mut l, "text/animators/#1/properties/blur", Value::Vec2([200.0, 20.0]));
+    set(&mut l, "text/animators/#1/selectors/#1/advanced/amount", Value::Scalar(25.0));
+    p.comp_mut(cid).unwrap().layers.push(l);
+    let c = ctx(&p, cid, 0.0);
+    let geom = text_geom(&c, &p.comp(cid).unwrap().layers[0]).unwrap();
+    for glyph in geom.glyphs {
+        assert_eq!(glyph.xf.scale, [80.0, 825.0, 100.0]);
+        assert_eq!(glyph.xf.opacity, 75.0);
+        assert_eq!(glyph.xf.blur, [50.0, 5.0]);
+    }
 }
 
 #[test]
