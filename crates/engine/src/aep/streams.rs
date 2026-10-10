@@ -375,6 +375,14 @@ fn collect_transform_properties(nodes: &[ChunkNode<'_>], depth: usize, inherited
 
 pub(crate) fn install_transforms(decoded: &[DecodedTransform], layer: &mut Layer, ids: &mut Ids<'_>) -> Result<Vec<String>, String> {
     let mut warnings = Vec::new();
+    // AE nulls are anchored at their upper-left corner. An untouched anchor may
+    // be absent from the file; do not inherit the native builder's centred anchor.
+    // Install explicit values, keys and expressions over this default below.
+    if layer.source == effectcraft_project::LayerSource::Null
+        && let Some(anchor) = layer.props.prop_mut("transform/anchor")
+    {
+        anchor.value = Value::Vec3([0.0; 3]);
+    }
     for entry in decoded {
         let path = if entry.path.contains('/') || entry.path == "timeRemap" {
             entry.path.clone()

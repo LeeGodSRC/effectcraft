@@ -286,6 +286,31 @@ fn orientation_conversion_preserves_plane_basis_including_gimbal_lock() {
 }
 
 #[test]
+fn imported_null_uses_top_left_anchor_unless_explicitly_authored() {
+    let mut session = crate::Session::new();
+    session.execute("comp.new", serde_json::json!({"width":200,"height":100})).unwrap();
+    session.execute("layer.newNull", serde_json::json!({})).unwrap();
+    let mut null = session.project.comps().next().unwrap().1.layers[0].clone();
+    let mut next_id = session.project.next_id;
+    assert_eq!(null.source, effectcraft_project::LayerSource::Null);
+    install_transforms(&[], &mut null, &mut Ids(&mut next_id)).unwrap();
+    assert_eq!(null.props.prop("transform/anchor").unwrap().value, Value::Vec3([0.0; 3]));
+
+    let anchor = DecodedTransform {
+        path: "anchor".into(),
+        stream: DecodedStream {
+            value: Some(Value::Vec3([12.0, 34.0, 0.0])),
+            keys: vec![Keyframe::new(Tick::ZERO, Value::Vec3([5.0, 6.0, 0.0]))],
+            ..Default::default()
+        },
+    };
+    install_transforms(&[anchor], &mut null, &mut Ids(&mut next_id)).unwrap();
+    let anchor = null.props.prop("transform/anchor").unwrap();
+    assert_eq!(anchor.value, Value::Vec3([12.0, 34.0, 0.0]));
+    assert_eq!(anchor.keys[0].value, Value::Vec3([5.0, 6.0, 0.0]));
+}
+
+#[test]
 fn omitted_camera_position_uses_imported_lens_and_preserves_explicit_position() {
     let mut session = crate::Session::new();
     session.execute("comp.new", serde_json::json!({"width":1920,"height":1080})).unwrap();
