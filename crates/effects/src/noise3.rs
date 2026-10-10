@@ -406,10 +406,7 @@ pub fn fractal_gpu(ctx: &EffectCtx, offset: [f64; 2], scale: f64, turbulent: boo
         sub_rotation: fr.sub_rotation != 0.0,
         norm,
         octaves,
-        mode: match ctx.params.get("blendingMode").map(Value::as_enum).unwrap_or(BLEND_NONE) {
-            BLEND_NONE => None,
-            m => Some(BLEND_MODES.get(m as usize).and_then(|l| BlendMode::from_name(l)).unwrap_or(BlendMode::Normal)),
-        },
+        mode: blend_mode(ctx.params.get("blendingMode").map(Value::as_enum).unwrap_or(BLEND_NONE)),
         opacity: (ctx.params.f("opacity") as f32 / 100.0).clamp(0.0, 1.0),
         blend: ctx.params.f("blend") as f32 / 100.0,
     }
@@ -428,16 +425,22 @@ pub fn overflow(v: f32, mode: u32) -> f32 {
     }
 }
 
-/// Composite grey noise `val` over the original pixel by Blending Mode, Opacity and (ours) Blend
-/// With Original.
-pub(crate) fn composite(orig: [f32; 4], val: f32, opacity: f32, mode: u32, blend_orig: f32) -> [f32; 4] {
+/// The Blending Mode option `mode` as a blend mode (`None` = the noise alone).
+fn blend_mode(mode: u32) -> Option<BlendMode> {
+    match mode {
+        BLEND_NONE => None,
+        m => Some(BLEND_MODES.get(m as usize).and_then(|l| BlendMode::from_name(l)).unwrap_or(BlendMode::Normal)),
+    }
+}
+
+/// Composite grey noise `val` over the original pixel by Blending Mode (resolved once per image
+/// by [`blend_mode`]), Opacity and (ours) Blend With Original.
+#[inline]
+pub(crate) fn composite(orig: [f32; 4], val: f32, opacity: f32, mode: Option<BlendMode>, blend_orig: f32) -> [f32; 4] {
     let src = [val * opacity, val * opacity, val * opacity, opacity];
     let out = match mode {
-        BLEND_NONE => src,
-        m => {
-            let bm = BLEND_MODES.get(m as usize).and_then(|l| BlendMode::from_name(l)).unwrap_or(BlendMode::Normal);
-            blend_pixel(bm, orig, src, 0.5)
-        }
+        None => src,
+        Some(bm) => blend_pixel(bm, orig, src, 0.5),
     };
     let k = 1.0 - blend_orig;
     [0, 1, 2, 3].map(|c| orig[c] * blend_orig + out[c] * k)
@@ -446,7 +449,7 @@ pub(crate) fn composite(orig: [f32; 4], val: f32, opacity: f32, mode: u32, blend
 fn render(ctx: &EffectCtx, mut b: Buf, turbulent: bool) -> Buf {
     let fr = Fractal::from_params(ctx, &b, turbulent);
     let opacity = (ctx.params.f("opacity") as f32 / 100.0).clamp(0.0, 1.0);
-    let mode = ctx.params.get("blendingMode").map(Value::as_enum).unwrap_or(BLEND_NONE);
+    let mode = blend_mode(ctx.params.get("blendingMode").map(Value::as_enum).unwrap_or(BLEND_NONE));
     let blend = ctx.params.f("blend") as f32 / 100.0;
     b.img.rows_mut().for_each(|(y, row)| {
         for (x, px) in row.iter_mut().enumerate() {
