@@ -1085,6 +1085,10 @@ pub(crate) struct Enc<'g> {
     pending: usize,
     /// [`GpuContext::oom_epoch`] when this work started.
     epoch: u64,
+    /// Nested comp frames rendered on the device for this frame, by
+    /// `Renderer::plain_precomp`'s key: a comp several layers show at the same time is rendered
+    /// once (`walk::draw_precomp`).
+    pub nested: HashMap<u64, GpuImage>,
 }
 
 impl Drop for Enc<'_> {
@@ -1100,7 +1104,7 @@ impl Drop for Enc<'_> {
 
 impl<'g> Enc<'g> {
     pub fn new(g: &'g GpuContext) -> Enc<'g> {
-        Enc { g, enc: None, pending: 0, epoch: g.oom_epoch() }
+        Enc { g, enc: None, pending: 0, epoch: g.oom_epoch(), nested: HashMap::new() }
     }
 
     /// This work cannot finish: the device failed or was lost, or ran out of video memory

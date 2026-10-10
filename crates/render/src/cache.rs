@@ -454,7 +454,7 @@ pub(crate) fn effect_revision(group: &PropGroup) -> u64 {
 
 /// Time-based layer content: does any part of the source/effects read the clock directly
 /// (rather than through property values)?
-fn time_dependent(layer: &Layer) -> bool {
+pub(crate) fn time_dependent(layer: &Layer) -> bool {
     if layer.switches.effects
         && let Some(fx) = layer.effects()
     {
@@ -837,7 +837,7 @@ fn still(f: &effectcraft_project::Footage) -> bool {
 }
 
 /// Any keyframes or expression in the group.
-fn animated(g: &PropGroup) -> bool {
+pub(crate) fn animated(g: &PropGroup) -> bool {
     g.children.iter().any(|c| match c {
         Node::Prop(p) => !p.keys.is_empty() || p.has_expression(),
         Node::Group(sub) => animated(sub),

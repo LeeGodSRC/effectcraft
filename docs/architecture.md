@@ -282,7 +282,15 @@ mattes), the GPU packs the buffers into one atlas texture and one kernel does th
 fragment sort (intersecting planes, coplanar stack order), Blinn-Phong lighting, ray-cast shadows
 against the caster planes (Shadow Diffusion, Light Transmission) and blending. Adjustment layers
 run their effect stacks on the GPU-resident comp (`Renderer::run_effects_on` with an `FxTarget`):
-runs of GPU effects stay on the device and only non-GPU effects read back and upload. Advanced 3D
+runs of GPU effects stay on the device and only non-GPU effects read back and upload. Two more
+kinds of layer keep their pixels on the device (`gpu::walk`): a precomp layer that shows its
+nested comp as it is has that comp composited by the same walk (`draw_precomp`,
+`Renderer::plain_precomp`; layers showing the same frame share it, and a comp nothing moves in
+still comes from the layer cache), and a 2D layer whose effect stack changes every frame and runs
+on the GPU in full has it run on its uploaded input and composited from there
+(`resident_layer`, `Renderer::resident_effects`), with no readback and second upload. A 3D track
+matte of a 2D layer is drawn through the camera by the CPU renderer and uploaded
+(`Renderer::matte_3d`). Advanced 3D
 runs render on the GPU end to end (`gpu::adv3d`, `Renderer::prepare_adv_run` /
 `Accelerator::render_3d`): each motion-blur sub-sample's scene is rasterised (`advanced3d.wgsl`),
 then compute kernels (`adv3d.wgsl`) resolve the 2×2 supersampling, average the sub-samples

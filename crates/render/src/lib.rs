@@ -1317,6 +1317,35 @@ impl<'a> Renderer<'a> {
         Some(sub.nested_frame(*item, t, false))
     }
 
+    /// A precomp layer that shows its nested comp's frame as it is ([`Self::shared_precomp`]), for
+    /// a compositor that renders the nested comp itself (the GPU, which then keeps the frame on
+    /// the device instead of taking it from the CPU): the nested renderer, the comp, its time,
+    /// and a key that is equal for the layers of one top-level frame showing the same picture.
+    /// `None` for every other layer, and for a nested frame that does not change with time (the
+    /// layer cache keeps that one across frames, see [`Self::nested_frame`]).
+    pub fn plain_precomp(&self, ctx: &EvalCtx, layer: &Layer) -> Option<(Renderer<'a>, ItemId, Tick, u64)> {
+        let LayerSource::Comp { item } = &layer.source else { return None };
+        if layer.masks().is_some_and(|m| !m.children.is_empty()) || (layer.switches.effects && layer.effects().is_some_and(|fx| fx.groups().any(|g| g.enabled)))
+        {
+            return None;
+        }
+        if self.project.comp_contains(*item, ctx.comp_id) || self.proxy_for(*item).is_some() || !essential_overrides(ctx, layer).is_empty() {
+            return None;
+        }
+        let lt = ctx.nested_time(layer);
+        if !self.project.comp(*item).is_some_and(|nc| nc.covers(lt)) {
+            return None;
+        }
+        let (sub, NestedFrames::One(t)) = self.nested_frames(ctx, layer, *item, lt) else { return None };
+        if sub.cache.is_some() && sub.still_frame_key(*item, t).is_some() {
+            return None;
+        }
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        memo::Key::new(*item, t, sub.opts.scale, sub.depth, sub.inherited).hash(&mut h);
+        Some((sub, *item, t, h.finish()))
+    }
+
     /// Render the nested comp frames that several of `layers` (precomp layers of this comp, about
     /// to be drawn in parallel) share, each once, so that every one of them finds it in the
     /// [`memo`] instead of all rendering it at the same time.
@@ -2426,6 +2455,36 @@ impl<'a> Renderer<'a> {
         out
     }
 
+    /// A 2D layer whose effects an accelerator can run on its own device and keep there, instead
+    /// of each frame's result being read back for the layer cache and uploaded again to be
+    /// composited: the layer's input (source → masks, in effect space) and where effect space
+    /// starts in layer coordinates. Only for a stack that changes from frame to frame (a still
+    /// one is rendered once and kept by the layer cache) and whose every effect the accelerator
+    /// supports; no layer styles, no motion-blurred content.
+    pub fn resident_effects(&self, ctx: &EvalCtx, layer: &Layer) -> Option<(Arc<Buf>, [f64; 2])> {
+        let a = self.active_accel()?;
+        if layer.switches.adjustment || layer.is_3d() || !layer.switches.effects || styles::active(ctx, layer) || self.content_times(ctx, layer).is_some() {
+            return None;
+        }
+        let fx = layer.effects()?;
+        let mut stack = fx.groups().filter(|g| g.enabled).peekable();
+        stack.peek()?;
+        let runs_there = |g: &effectcraft_project::PropGroup| match &g.kind {
+            GroupKind::Effect { effect } => effectcraft_effects::find(effect).is_some_and(|s| s.gpu && a.supports_effect(s.id)),
+            _ => false,
+        };
+        if !stack.all(runs_there) || !(cache::animated(fx) || cache::time_dependent(layer)) {
+            return None;
+        }
+        Some((self.layer_input(ctx, layer, 0)?, ctx.effect_bounds(layer).1))
+    }
+
+    /// [`Self::run_effects_on`] for a layer's own pixels in effect space
+    /// ([`Self::resident_effects`]).
+    pub fn run_layer_effects_on(&self, ctx: &EvalCtx, layer: &Layer, target: &mut dyn FxTarget) {
+        self.run_effect_stack(ctx, layer, false, usize::MAX, None, ctx.effect_bounds(layer).1, target);
+    }
+
     /// Run the layer's effect stack on `target` (an accelerator's resident image): GPU-capable
     /// runs through [`FxTarget::gpu`], the others through [`FxTarget::cpu`], with the CPU's
     /// parameters and environment. `adjustment`: the stack runs on the comp below (adjustment
@@ -2476,6 +2535,19 @@ impl<'a> Renderer<'a> {
             }
         }
         st
+    }
+
+    /// What the 3D track matte layer `m` of `layer` shows through the camera, at `out` size: a 3D
+    /// matte is seen where the layer appears on screen, whatever the matted layer is (see
+    /// `composite_iso_with`). For an accelerator compositing a 2D layer with such a matte.
+    pub fn matte_3d(&self, ctx: &EvalCtx, layer: &Layer, m: &Layer, out: (u32, u32)) -> Image {
+        if three_d::adv::active(self, ctx) {
+            three_d::adv::matte_image(self, ctx, layer, out).unwrap_or_else(|| Image::new(out.0, out.1))
+        } else if m.is_active_at(ctx.time) {
+            three_d::compose::matte_image(self, ctx, m, out)
+        } else {
+            Image::new(out.0, out.1)
+        }
     }
 
     /// Opacity the layer composites with (its Opacity × collapsed precomps' opacity).

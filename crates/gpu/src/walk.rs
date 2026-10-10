@@ -219,10 +219,21 @@ fn draw_layer(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &
     if opacity <= 0.0 {
         return Some(());
     }
+    if let Some(done) = draw_precomp(e, r, ctx, layer, canvas, opacity) {
+        return done;
+    }
     e.park();
+    if let Some((img, head)) = resident_layer(e, r, ctx, layer) {
+        return composite_layer(e, r, ctx, layer, &head, Some(img), canvas, opacity);
+    }
     let Some(st) = r.styled_layer(ctx, layer) else { return Some(()) };
     if st.plain {
-        return composite_layer(e, r, ctx, layer, &st.body, canvas, opacity);
+        // (Nothing to draw, and nothing to upload.)
+        if st.body.img.is_empty() {
+            return Some(());
+        }
+        let src = e.g.upload_buf(&st.body);
+        return composite_layer(e, r, ctx, layer, &st.body, src, canvas, opacity);
     }
     // Layer styles: exterior passes with their own modes, then the body; the layer's opacity
     // fades the whole stack; knockout and channel switches as on the CPU.
@@ -277,15 +288,75 @@ fn draw_adjustment(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canv
     Some(())
 }
 
-fn composite_layer(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, buf: &Arc<Buf>, canvas: &mut GpuImage, opacity: f32) -> Option<()> {
+/// A precomp layer that shows its nested comp as it is (no masks, effects or styles): the nested
+/// comp is composited here, on the device, and its frame placed like a layer buffer, instead of
+/// the CPU compositing it and the result being uploaded. Layers showing the same frame share it.
+/// The outer `None`: not such a layer, or the nested comp cannot render here (the caller takes
+/// the layer's pixels from the CPU renderer).
+fn draw_precomp(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &mut GpuImage, opacity: f32) -> Option<Option<()>> {
+    // (Deferred readbacks render in passes keyed per step: left to the CPU path.)
+    // (Nor a linear blending space: layer buffers are converted to it on the CPU.)
+    if e.g.deferred.is_some() || r.pipe().to_blend().is_some() || styles::active(ctx, layer) {
+        return None;
+    }
+    let (sub, item, t, key) = r.plain_precomp(ctx, layer)?;
+    let img = match e.nested.get(&key) {
+        Some(img) => img.clone(),
+        None => {
+            let img = render(e, &sub, item, t)?;
+            e.nested.insert(key, img.clone());
+            img
+        }
+    };
+    // The frame as a layer buffer: its size and scale are all the placement reads.
+    let head = Arc::new(Buf { img: Image { width: img.width, height: img.height, data: Vec::new() }, offset: [0.0; 2], scale: sub.opts.scale });
+    Some(composite_layer(e, r, ctx, layer, &head, Some(img), canvas, opacity))
+}
+
+/// A layer whose effect stack changes every frame and runs here in full
+/// (`Renderer::resident_effects`): its input is uploaded (once, while the layer cache keeps it),
+/// the effects run on the device, and the result stays there to be composited: no readback and
+/// no second upload. Returns the texture and the buffer it stands for (size, offset, scale).
+/// `None`: not such a layer, or a kernel declined (the caller takes the CPU renderer's pixels).
+fn resident_layer(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer) -> Option<(GpuImage, Arc<Buf>)> {
+    // (Deferred readbacks render in passes keyed per step: left to the CPU path.)
+    // (Nor a linear blending space: layer buffers are converted to it on the CPU.)
+    if e.g.deferred.is_some() || r.pipe().to_blend().is_some() {
+        return None;
+    }
+    let (input, origin) = r.resident_effects(ctx, layer)?;
+    let src = e.g.upload_buf(&input)?;
+    let mut fx = crate::effects::GpuFx::new(e, src, input.offset, input.scale, r.pipe().levels);
+    r.run_layer_effects_on(ctx, layer, &mut fx);
+    let (img, offset, scale) = fx.finish()?;
+    // Back from effect space to layer space (`Buf::rebase`).
+    let offset = [offset[0] - origin[0] * scale, offset[1] - origin[1] * scale];
+    let head = Arc::new(Buf { img: Image { width: img.width, height: img.height, data: Vec::new() }, offset, scale });
+    Some((img, head))
+}
+
+/// Composite a layer buffer: `src` is its texture (`buf` then only describes it: size, offset,
+/// scale), `None` when it could not be uploaded.
+#[allow(clippy::too_many_arguments)]
+fn composite_layer(
+    e: &mut Enc,
+    r: &Renderer,
+    ctx: &EvalCtx,
+    layer: &Layer,
+    buf: &Arc<Buf>,
+    src: Option<GpuImage>,
+    canvas: &mut GpuImage,
+    opacity: f32,
+) -> Option<()> {
+    let src = src?;
     let matte = r.track_matte(ctx, layer).is_some();
     if !matte && !layer.preserve_transparency {
         // The comp is quantised after the layer (8/16 bpc) in the same pass.
-        *canvas = place(e, r, ctx, layer, buf, canvas, layer.blend_mode, opacity, r.pipe().levels)?;
+        *canvas = place_src(e, r, ctx, layer, buf, &src, canvas, layer.blend_mode, opacity, r.pipe().levels)?;
         return Some(());
     }
     // Render in isolation, then matte / preserve transparency, then blend.
-    let iso = place(e, r, ctx, layer, buf, &e.zeros(canvas.width, canvas.height), BlendMode::Normal, 1.0, None)?;
+    let iso = place_src(e, r, ctx, layer, buf, &src, &e.zeros(canvas.width, canvas.height), BlendMode::Normal, 1.0, None)?;
     composite_iso(e, r, ctx, layer, iso, canvas, opacity)
 }
 
@@ -311,6 +382,12 @@ fn composite_iso_with(
     if let Some((m, kind)) = r.track_matte(ctx, layer) {
         let mimg = match matte_img.filter(|i| (i.width, i.height) == (canvas.width, canvas.height)) {
             Some(i) => i,
+            // A 3D matte layer is seen through the camera (drawn by the CPU renderer), not
+            // placed like a 2D layer.
+            None if m.is_3d() => {
+                e.park();
+                e.g.upload_image(&r.matte_3d(ctx, layer, m, (canvas.width, canvas.height)))?
+            }
             None => {
                 let mut mimg = e.zeros(canvas.width, canvas.height);
                 if m.is_active_at(ctx.time)
@@ -353,14 +430,34 @@ fn place(
         return Some(target.clone());
     }
     let src = e.g.upload_buf(buf)?;
+    place_src(e, r, ctx, layer, buf, &src, target, mode, opacity, levels)
+}
+
+/// [`place`] of a buffer whose texture is `src` (`buf` describes it: size, offset, scale).
+#[allow(clippy::too_many_arguments)]
+fn place_src(
+    e: &mut Enc,
+    r: &Renderer,
+    ctx: &EvalCtx,
+    layer: &Layer,
+    buf: &Buf,
+    src: &GpuImage,
+    target: &GpuImage,
+    mode: BlendMode,
+    opacity: f32,
+    levels: Option<f32>,
+) -> Option<GpuImage> {
+    if buf.img.is_empty() || opacity <= 0.0 {
+        return Some(target.clone());
+    }
     let pl = r.placement(ctx, layer, buf);
     if let [m] = pl.matrices.as_slice() {
-        return Some(ops::warp_q(e, target, &src, m, pl.sampling, mode, opacity, pl.seed, None, levels));
+        return Some(ops::warp_q(e, target, src, m, pl.sampling, mode, opacity, pl.seed, None, levels));
     }
     let mut acc = e.zeros(target.width, target.height);
     let k = 1.0 / pl.matrices.len() as f32;
     for m in &pl.matrices {
-        acc = ops::warp(e, &acc, &src, m, pl.sampling, BlendMode::Normal, 1.0, 0, Some(k));
+        acc = ops::warp(e, &acc, src, m, pl.sampling, BlendMode::Normal, 1.0, 0, Some(k));
     }
     Some(ops::blend_full(e, target, &acc, mode, opacity, pl.seed, levels))
 }
