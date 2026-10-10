@@ -1935,13 +1935,26 @@ impl<'a> Renderer<'a> {
     }
 
     /// [`Self::composite_iso`] with the track matte's pixels already drawn (`matte`, e.g. a 3D
-    /// matte seen through the camera); otherwise the matte layer is placed in 2D.
+    /// matte seen through the camera); otherwise a 3D matte layer is drawn through
+    /// the camera here and a 2D one is placed in 2D.
     pub(crate) fn composite_iso_with(&self, ctx: &EvalCtx, layer: &Layer, mut iso: Image, canvas: &mut Image, opacity: f32, matte_img: Option<Image>) {
         let matte = layer.track_matte.and_then(|tm| ctx.comp.layer(tm.layer).filter(|m| m.id != layer.id).map(|m| (m, tm.kind)));
         let preserve = layer.preserve_transparency;
         if let Some((m, kind)) = matte {
             let mimg = match matte_img {
                 Some(i) if i.width == canvas.width && i.height == canvas.height => i,
+                // A 3D matte layer is seen through the camera, whatever the matted layer is (a
+                // 2D layer too takes the matte where the 3D layer appears on screen).
+                _ if m.is_3d() => {
+                    let out = (canvas.width, canvas.height);
+                    if three_d::adv::active(self, ctx) {
+                        three_d::adv::matte_image(self, ctx, layer, out).unwrap_or_else(|| Image::new(out.0, out.1))
+                    } else if m.is_active_at(ctx.time) {
+                        three_d::compose::matte_image(self, ctx, m, out)
+                    } else {
+                        Image::new(out.0, out.1)
+                    }
+                }
                 _ => {
                     let mut mimg = Image::new(canvas.width, canvas.height);
                     if m.is_active_at(ctx.time)
