@@ -14,6 +14,7 @@ pub mod control;
 pub mod credits;
 pub mod dock;
 pub mod dock_ui;
+mod frame_memory;
 pub mod frames;
 pub mod gpu_failure;
 pub mod header;

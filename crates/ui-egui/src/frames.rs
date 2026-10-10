@@ -367,6 +367,8 @@ pub struct Frames {
     pub last_ms: Arc<Mutex<f64>>,
     content_keys: ContentKeys,
     gpu_retired: Arc<AtomicBool>,
+    /// Frames start only while the system has memory for them.
+    memory: Arc<crate::frame_memory::FrameMemory>,
     /// [`comp_content`] identities by (revision, comp), with the project that keeps an identity
     /// found by [`Frames::identity`] in another project.
     identities: Mutex<HashMap<(u64, u64), Identity>>,
@@ -401,6 +403,7 @@ impl Default for Frames {
             last_ms: Arc::new(Mutex::new(0.0)),
             content_keys: Arc::default(),
             gpu_retired: Arc::default(),
+            memory: crate::frame_memory::FrameMemory::new(),
             identities: Mutex::default(),
             bases: Mutex::default(),
             keepers: Mutex::default(),
@@ -747,6 +750,7 @@ impl Frames {
             last: self.last_ms.clone(),
             content_keys: self.content_keys.clone(),
             gpu_retired: self.gpu_retired.clone(),
+            memory: self.memory.clone(),
         }
     }
 
@@ -876,12 +880,15 @@ struct Worker {
     last: Arc<Mutex<f64>>,
     content_keys: ContentKeys,
     gpu_retired: Arc<AtomicBool>,
+    memory: Arc<crate::frame_memory::FrameMemory>,
 }
 
 impl Worker {
     /// Render the queued job that matters most right now. `false` when the queue was empty.
     fn run_next(&self) -> bool {
         let Worker { queue, content_keys, .. } = self;
+        // Held until this frame is done: frames start only while the system has memory for them.
+        let _memory = self.memory.admit();
         let job = {
             let Ok(mut q) = queue.lock() else { return false };
             let Some(i) = Queue::best(&q.jobs) else { return false };
