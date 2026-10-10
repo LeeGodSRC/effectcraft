@@ -1,6 +1,6 @@
 //! Bounded reader for the dictionary stored in AEP's opaque text-document blob.
 use super::ChunkNode;
-use effectcraft_keyframe::{Justify, ParaStyle, StyleRun, TextDoc};
+use effectcraft_keyframe::{Composer, Justify, ParaStyle, StyleRun, TextDoc};
 use std::collections::BTreeMap;
 
 #[derive(Clone, Debug)]
@@ -208,10 +208,11 @@ fn decode_blob(bytes: &[u8]) -> Result<TextDoc, String> {
         return Err("AEP text document exceeds 8 MiB".into());
     }
     let root = Parser { bytes, at: 0, count: 0 }.dictionary(0, false)?;
-    let story = path(&root, &["1", "1"]).and_then(|a| a.at(0)).and_then(|e| e.get("0")).ok_or("missing AEP text story")?;
+    let element = path(&root, &["1", "1"]).and_then(|a| a.at(0));
+    let story = element.and_then(|e| e.get("0")).ok_or("missing AEP text story")?;
     let source = story.get("0").and_then(Entry::string).ok_or("missing AEP source text")?;
     let text = source.strip_suffix('\r').unwrap_or(source).replace('\r', "\n");
-    let mut doc = TextDoc { text, ..Default::default() };
+    let mut doc = TextDoc { text, composer: Composer::SingleLine, ..Default::default() };
     if let Some(style) = story.get("6").and_then(first_run).and_then(|e| e.get("6")) {
         apply_style(&root, style, &mut doc);
     }
@@ -247,6 +248,7 @@ fn decode_blob(bytes: &[u8]) -> Result<TextDoc, String> {
         doc.indent_right = para.indent_right;
         doc.space_before = para.space_before;
         doc.space_after = para.space_after;
+        doc.composer = para.composer;
     }
     if let Some(Entry::Array(runs)) = path(story, &["5", "0"]) {
         let mut characters = doc.text.chars().peekable();
@@ -269,6 +271,27 @@ fn decode_blob(bytes: &[u8]) -> Result<TextDoc, String> {
             }
         }
     }
+    // Paragraph text: the first frame of the story's view carries the box as its origin (from
+    // the layer's anchor) and a rectangle; point text has neither.
+    if let Some(frame) = element.and_then(|e| path(e, &["1", "2"])).and_then(|views| views.at(0)).and_then(|view| view.get("6")).and_then(|frames| frames.at(0))
+    {
+        let number = |e: Option<&Entry>| e.and_then(Entry::number).filter(|n| n.is_finite() && n.abs() <= 1.0e7);
+        let origin = path(frame, &["0", "0"]);
+        let rect = frame.get("1");
+        if let (Some(x), Some(y), Some(left), Some(top), Some(right), Some(bottom)) = (
+            number(origin.and_then(|o| o.at(0))),
+            number(origin.and_then(|o| o.at(1))),
+            number(rect.and_then(|r| r.at(0))),
+            number(rect.and_then(|r| r.at(1))),
+            number(rect.and_then(|r| r.at(2))),
+            number(rect.and_then(|r| r.at(3))),
+        ) && right - left >= 1.0
+            && bottom - top >= 1.0
+        {
+            doc.box_pos = [x + left, y + top];
+            doc.box_size = Some([right - left, bottom - top]);
+        }
+    }
     Ok(doc)
 }
 
@@ -289,6 +312,9 @@ fn paragraph_style(paragraph: &Entry) -> ParaStyle {
         indent_right: number("3"),
         space_before: number("4"),
         space_after: number("5"),
+        // The composer choice is not decoded yet. After Effects' default fills each line in
+        // turn, and so do the line breaks stored with observed paragraph text.
+        composer: Composer::SingleLine,
         ..Default::default()
     }
 }
@@ -389,6 +415,15 @@ mod tests {
         assert_eq!(layout.line_boxes.len(), 2);
         assert_eq!(layout.line_boxes[0][1], 0.0);
         assert_eq!(layout.line_boxes[1][1], 23.0);
+    }
+    #[test]
+    fn paragraph_text_keeps_its_box() {
+        let blob = b"/1 << /1 [ << /0 << /0 (Box\r) >> /1 << /2 [ << /6 [ << /0 << /0 [ -218.0 -277.0 ] >> /1 [ 0.0 0.0 344.0 562.0 ] >> ] >> ] >> >> ] >>";
+        let doc = decode_blob(blob).unwrap();
+        assert_eq!(doc.box_size, Some([344.0, 562.0]));
+        assert_eq!(doc.box_pos, [-218.0, -277.0]);
+        let point = decode_blob(b"/1 << /1 [ << /0 << /0 (Point\r) >> /1 << /2 [ << /6 [ << /5 2 >> ] >> ] >> >> ] >>").unwrap();
+        assert_eq!(point.box_size, None);
     }
     #[test]
     fn malformed_text_is_an_error() {
