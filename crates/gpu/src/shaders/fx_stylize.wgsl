@@ -272,10 +272,10 @@ fn fxs_warp(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let a0 = atan2(dx, -dy);
                 let a = a0 - floor(a0 / FXS_TAU) * FXS_TAU;
                 let r = sqrt(dx * dx + dy * dy) / rmax;
-                pp = vec2<f32>(a / FXS_TAU * w, h - r * h);
+                pp = vec2<f32>(a / FXS_TAU * w, r * h);
             } else {
                 let a = x / w * FXS_TAU;
-                let r = (h - y) / h * rmax;
+                let r = y / h * rmax;
                 pp = vec2<f32>(cx + r * sin(a), cy - r * cos(a));
             }
             let amt = P.f[1].y;

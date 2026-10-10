@@ -236,7 +236,9 @@ fn offset(ctx: &EffectCtx, mut b: Buf) -> Buf {
 
 fn polar(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let amt = ctx.params.f("interpolation") / 100.0;
-    let to_polar = ctx.params.e("conversion") == 1;
+    // Rect to Polar bends the rectangle into a disc: its top edge becomes the centre, its
+    // bottom edge the rim, and x runs clockwise from 12 o'clock. Polar to Rect is the inverse.
+    let to_polar = ctx.params.e("conversion") == 0;
     let (w, h) = (b.img.width as f64, b.img.height as f64);
     let (cx, cy) = (w / 2.0, h / 2.0);
     let rmax = cx.min(cy);
@@ -247,10 +249,10 @@ fn polar(ctx: &EffectCtx, mut b: Buf) -> Buf {
             let dy = y - cy;
             let a = dx.atan2(-dy).rem_euclid(std::f64::consts::TAU);
             let r = (dx * dx + dy * dy).sqrt() / rmax;
-            (a / std::f64::consts::TAU * w, h - r * h)
+            (a / std::f64::consts::TAU * w, r * h)
         } else {
             let a = x / w * std::f64::consts::TAU;
-            let r = (h - y) / h * rmax;
+            let r = y / h * rmax;
             (cx + r * a.sin(), cy - r * a.cos())
         };
         (x + (px - x) * amt, y + (py - y) * amt)

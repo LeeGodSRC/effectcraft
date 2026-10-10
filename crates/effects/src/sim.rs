@@ -1098,21 +1098,47 @@ fn pw_state(ctx: &EffectCtx, phys: &Phys) -> std::sync::Arc<PState> {
     if revision == 0 { run(&SimCache::new(1)) } else { run(&PW_CACHE) }
 }
 
-fn pw_color(ctx: &EffectCtx, q: &Particle, birth: [f32; 4], death: [f32; 4], opacity: f32) -> [f32; 4] {
+/// How much of a textured polygon's hue reaches its pixels (the rest stays the texture's own).
+const PW_TEXTURE_TINT: f32 = 0.33;
+/// The opacity of a textured polygon at Max Opacity 100.
+const PW_TEXTURE_OPACITY: f32 = 0.8;
+
+/// A particle's colour at its age, by Color Map (Birth to Death, Origin to Death, Birth to
+/// Origin, Origin Constant, Custom); Origin is the particle's own (white) colour.
+///
+/// Textured polygons (`textured`) take a pastel tint whose hue runs once round the colour wheel
+/// from the first colour's hue up to the second's, at [`PW_TEXTURE_OPACITY`]. This is fitted to
+/// rendered frames, not derived from a published description.
+fn pw_color(ctx: &EffectCtx, q: &Particle, birth: [f32; 4], death: [f32; 4], opacity: f32, textured: bool) -> [f32; 4] {
     let u = (q.age / q.life.max(1e-4)).clamp(0.0, 1.0);
-    let mut color = if ctx.params.e("particle/colorMap") == 0 {
-        let stops =
-            ["particle/colorAtBirth", "particle/colorAt25", "particle/colorAt50", "particle/colorAt75", "particle/colorAtDeath"].map(|id| ctx.params.color(id));
-        let t = u * 4.0;
-        let i = (t.floor() as usize).min(3);
-        let f = t - i as f32;
-        let a = stops.get(i).copied().unwrap_or(birth);
-        let b = stops.get(i + 1).copied().unwrap_or(death);
-        std::array::from_fn(|k| a[k] + (b[k] - a[k]) * f)
-    } else {
-        std::array::from_fn(|k| birth[k] + (death[k] - birth[k]) * u)
+    let white = [1.0f32; 4];
+    let between = |a: [f32; 4], b: [f32; 4], f: f32| -> [f32; 4] {
+        if !textured {
+            return std::array::from_fn(|k| a[k] + (b[k] - a[k]) * f);
+        }
+        let (ha, sa, _) = effectcraft_color::rgb_to_hsl(a[0], a[1], a[2]);
+        let (hb, sb, _) = effectcraft_color::rgb_to_hsl(b[0], b[1], b[2]);
+        let hb = if hb <= ha && sb > 0.0 && sa > 0.0 { hb + 1.0 } else { hb };
+        let k = (sa + (sb - sa) * f).clamp(0.0, 1.0) * PW_TEXTURE_TINT;
+        let (r, g, bl) = effectcraft_color::hsl_to_rgb(ha + (hb - ha) * f, 1.0, 0.5);
+        [1.0 + (r - 1.0) * k, 1.0 + (g - 1.0) * k, 1.0 + (bl - 1.0) * k, 1.0]
     };
-    color[3] = opacity;
+    let mut color = match ctx.params.e("particle/colorMap") {
+        1 => between(white, death, u),
+        2 => between(birth, white, u),
+        3 => white,
+        4 => {
+            let stops = ["particle/colorAtBirth", "particle/colorAt25", "particle/colorAt50", "particle/colorAt75", "particle/colorAtDeath"]
+                .map(|id| ctx.params.color(id));
+            let t = u * 4.0;
+            let i = (t.floor() as usize).min(3);
+            let a = stops.get(i).copied().unwrap_or(birth);
+            let b = stops.get(i + 1).copied().unwrap_or(death);
+            between(a, b, t - i as f32)
+        }
+        _ => between(birth, death, u),
+    };
+    color[3] = if textured { opacity * PW_TEXTURE_OPACITY } else { opacity };
     color
 }
 
@@ -1249,6 +1275,9 @@ fn particle_world_layout(ctx: &EffectCtx, b: &Buf) -> Option<WorldPlan> {
     let max_op = pr.f("particle/maxOpacity") as f32 / 100.0;
     let scale = b.scale as f32;
     let cam = PwCamera::new(ctx, b);
+    let textured = matches!(kind, 9 | 10) && particle_world_textured(ctx);
+    // A textured particle's quad per unit of size, in layer widths (fitted to rendered frames).
+    let quad = if particle_world_textured(ctx) { 0.09 } else { 0.25 };
     let initial = pr.f("particle/initialRotation") as f32;
     let spin = pr.f("particle/rotationSpeed") as f32;
     let mut list: Vec<(f32, WorldSprite)> = st
@@ -1257,8 +1286,8 @@ fn particle_world_layout(ctx: &EffectCtx, b: &Buf) -> Option<WorldPlan> {
         .filter_map(|q| {
             let PwSeen { depth, x, y, k, v } = cam.see(q.p, q.v, lw, lh, b)?;
             let (c, size) = particle_look(q, birth, death, bs, ds, svar, max_op);
-            let color = pw_color(ctx, q, birth, death, c[3]);
-            let radius = size * 0.5 * lw * k * scale * 0.25;
+            let color = pw_color(ctx, q, birth, death, c[3], textured);
+            let radius = size * 0.5 * lw * k * scale * quad;
             let mut rotation = (q.rnd * initial + q.age * spin).to_radians();
             if pr.b("texture/align") {
                 rotation += v[1].atan2(v[0]);
@@ -1338,13 +1367,14 @@ fn texture_particles(ctx: &EffectCtx, mut b: Buf, plan: &WorldPlan) -> Buf {
                 let sample = texture.buf.img.sample_bilinear(tx, ty);
                 let fade = if kind == 12 { (1.0 - u * u - v * v).max(0.0) as f32 } else { 1.0 };
                 let alpha = sp.c[3] * fade;
-                // Polygon textures retain their own colors. Square/disc textures are
-                // multiplied by the particle color map (Cycore's public behavior manual).
-                let tint = if matches!(kind, 9 | 10) { [1.0; 3] } else { [sp.c[0], sp.c[1], sp.c[2]] };
+                // The texture is multiplied by the particle's colour ([`pw_color`]).
+                let tint = [sp.c[0], sp.c[1], sp.c[2]];
                 let c = [sample[0] * tint[0] * alpha, sample[1] * tint[1] * alpha, sample[2] * tint[2] * alpha, sample[3] * alpha];
                 let d = fx.get(x as i64, y as i64);
                 let out = if plan.mode == 2 {
                     [d[0] + c[0], d[1] + c[1], d[2] + c[2], (d[3] + c[3]).min(1.0)]
+                } else if plan.mode == 1 {
+                    std::array::from_fn(|k| d[k] + c[k] - d[k] * c[k])
                 } else {
                     let inv = 1.0 - c[3];
                     [c[0] + d[0] * inv, c[1] + d[1] * inv, c[2] + d[2] * inv, c[3] + d[3] * inv]
@@ -1728,8 +1758,8 @@ pub fn specs() -> Vec<EffectSpec> {
                 p(
                     "particle/colorMap",
                     "Color Map",
-                    Value::Enum(1),
-                    popup(&["Custom", "Birth to Death", "Origin to Death", "Birth to Origin", "Origin Constant"]),
+                    Value::Enum(0),
+                    popup(&["Birth to Death", "Origin to Death", "Birth to Origin", "Origin Constant", "Custom"]),
                 ),
                 p("particle/colorAtBirth", "Color At Birth", col(1.0, 1.0, 0.0), ParamUi::Color),
                 p("particle/colorAt25", "Color At 25%", col(1.0, 0.6, 0.0), ParamUi::Color),
