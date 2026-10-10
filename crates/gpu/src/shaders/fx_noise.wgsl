@@ -656,7 +656,7 @@ fn fxn_fractal(@builtin(global_invocation_id) gid: vec3<u32>) {
     let orig = textureLoad(src, p, 0);
     var r = s;
     if (P.u[2].x != 255u) {
-        r = blend_pixel(P.u[2].x, orig, s, 0.5);
+        r = blend_pixel(P.u[2].x, orig, s * orig.a, 0.5);
     }
     let bo = P.f[1].w;
     textureStore(out, p, orig * bo + r * (1.0 - bo));

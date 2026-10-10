@@ -441,7 +441,9 @@ pub(crate) fn composite(orig: [f32; 4], val: f32, opacity: f32, mode: Option<Ble
     let src = [val * opacity, val * opacity, val * opacity, opacity];
     let out = match mode {
         None => src,
-        Some(bm) => blend_pixel(bm, orig, src, 0.5),
+        // Blended with the original, the noise stays inside the layer's own alpha (a masked
+        // solid keeps its mask); only None replaces the whole layer.
+        Some(bm) => blend_pixel(bm, orig, src.map(|c| c * orig[3]), 0.5),
     };
     let k = 1.0 - blend_orig;
     [0, 1, 2, 3].map(|c| orig[c] * blend_orig + out[c] * k)
@@ -606,6 +608,22 @@ mod tests {
         assert!(none.data.iter().all(|p| (p[0] - p[2]).abs() < 1e-6));
         assert!(mul.data.iter().all(|p| p[2] >= p[0]));
         assert!(mul.data.iter().any(|p| p[2] > p[0] + 0.01));
+    }
+
+    /// A masked solid keeps its mask under blended noise; only None fills the whole layer.
+    #[test]
+    fn blended_noise_stays_inside_the_layer_alpha() {
+        let mut img = Image::filled(40, 24, [0.0, 0.0, 0.0, 0.0]);
+        for y in 0..24 {
+            for x in 0..20 {
+                img.set(x, y, [1.0, 1.0, 1.0, 1.0]);
+            }
+        }
+        let go = |mode: u32| run_fx("ec.noise.fractal", &[("blendingMode", Value::Enum(mode))], img.clone(), 0.0, EffectEnv::default()).img;
+        let normal = go(1);
+        assert_eq!(normal.get(30, 12)[3], 0.0);
+        assert!((normal.get(5, 12)[3] - 1.0).abs() < 1e-6);
+        assert!((go(BLEND_NONE).get(30, 12)[3] - 1.0).abs() < 1e-6);
     }
 
     #[test]
