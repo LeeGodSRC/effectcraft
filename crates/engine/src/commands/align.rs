@@ -51,16 +51,7 @@ fn placed(s: &Session, cid: ItemId, ids: &[LayerId]) -> Result<Vec<Placed>> {
 
 /// Comp space → the space of `l`'s Position (its parent's).
 fn to_parent(ctx: &EvalCtx, l: &Layer) -> Mat4 {
-    // Parent chain: world(layer) = local(pn) ⋯ local(p1) · local(layer).
-    let mut par = Mat4::IDENTITY;
-    let mut cur = l.parent;
-    let mut guard = 0;
-    while let Some(pid) = cur {
-        guard += 1;
-        let Some(p) = ctx.comp.layer(pid).filter(|_| guard < 64) else { break };
-        par = ctx.local_matrix(p) * par;
-        cur = p.parent;
-    }
+    let par = ctx.parent_matrix(l);
     par.inverse().unwrap_or(Mat4::IDENTITY)
 }
 
