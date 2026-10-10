@@ -234,13 +234,13 @@ impl State<'_> {
 /// which is why only a quarter of the available memory is planned for.
 const FRAME_BUFFERS: u64 = 28;
 
-/// Frames per parallel batch: one for every four threads, as many as `available` bytes of
+/// Frames per parallel batch: one for every four threads (2 to 4), as many as `available` bytes of
 /// memory hold. Each frame's pixel loops are parallel themselves, so the threads stay busy with
 /// few frames in flight, and an effect-heavy frame is bound by memory traffic rather than by
 /// cores: measured on 28 threads, 2 to 12 frames at a time rendered at the same rate, the larger
 /// batches only holding more memory.
 pub(crate) fn batch_size(width: u32, height: u32, available: Option<u64>) -> u64 {
-    let threads = (rayon::current_num_threads() as u64 / 4).clamp(2, 6);
+    let threads = (rayon::current_num_threads() as u64 / 4).clamp(2, 4);
     let Some(available) = available else { return threads };
     let frame = (width.max(1) as u64).saturating_mul(height.max(1) as u64).saturating_mul(16 * FRAME_BUFFERS);
     threads.min((available / 4 / frame).max(1))
