@@ -584,23 +584,30 @@ impl Plan<'_> {
                 *o = if max { o.max(n) } else { *o + n };
             };
             let hashed = |u: f32, v: f32| fr.layer(u, v, oc.of, oc.z, oc.seed);
+            // Block steps at every cell edge, and with the default settings pixel centres sit
+            // exactly on edges: there the coordinates come from the per-pixel formula (as on the
+            // GPU), since a rounding error in the stepped ones picks the other cell.
+            let block = fr.noise_type == 0;
+            let at = |x: usize| if block { fr.lattice_uv(oc, x as f32 + 0.5, y) } else { (u0 + x as f32 * du, v0 + x as f32 * dv) };
             match &oc.grid {
                 // Along the lattice the vertical half of the interpolation is the same for the
                 // whole row.
                 Some(g) if dv == 0.0 && self.column(g, v0, col).is_some() => {
                     for (x, o) in out.iter_mut().enumerate() {
-                        let u = u0 + x as f32 * du;
-                        put(o, self.along(col, g.x0, u).unwrap_or_else(|| hashed(u, v0)));
+                        let (u, v) = at(x);
+                        put(o, self.along(col, g.x0, u).unwrap_or_else(|| hashed(u, v)));
                     }
                 }
                 Some(g) => {
                     for (x, o) in out.iter_mut().enumerate() {
-                        put(o, self.layer(oc, g, u0 + x as f32 * du, v0 + x as f32 * dv));
+                        let (u, v) = at(x);
+                        put(o, self.layer(oc, g, u, v));
                     }
                 }
                 None => {
                     for (x, o) in out.iter_mut().enumerate() {
-                        put(o, hashed(u0 + x as f32 * du, v0 + x as f32 * dv));
+                        let (u, v) = at(x);
+                        put(o, hashed(u, v));
                     }
                 }
             }
