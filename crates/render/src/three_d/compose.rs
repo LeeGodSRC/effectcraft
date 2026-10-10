@@ -820,8 +820,13 @@ pub(crate) fn gpu_run_of(r: &Renderer, ctx: &EvalCtx, layer: &Layer, out: (u32, 
         return None;
     }
     let rd = Renderer { defer_dof: true, ..*r };
-    let plane = plane_of(prepare_with(&rd, ctx, layer, 0, out, true, buf, Mat4::IDENTITY)?);
     let lights = scene_lights(&r.collapse3d.map_or(*ctx, |c| c.parent));
+    // Out of the camera's sight (or empty): a run that draws nothing, not a reason to ask the
+    // CPU renderer for the layer.
+    let Some(item) = prepare_with(&rd, ctx, layer, 0, out, true, buf, Mat4::IDENTITY) else {
+        return Some(Run3d { planes: vec![], casters: vec![], lights, seed: layer.id.0 as u32 });
+    };
+    let plane = plane_of(item);
     let casters = if r.opts.shadows() && plane.mat.casts_shadows != 0 && !plane.geos.is_empty() { vec![0] } else { vec![] };
     Some(Run3d { planes: vec![plane], casters, lights, seed: layer.id.0 as u32 })
 }
