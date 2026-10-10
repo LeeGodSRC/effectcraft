@@ -753,7 +753,7 @@ fn fallback_cache() -> &'static RwLock<std::collections::HashMap<(u32, FaceId), 
     CACHE.get_or_init(Default::default)
 }
 
-/// A face that covers `c`, preferring `prefer`. Bundled faces and faces already loaded are tried
+/// A face that covers `c`, preferring `prefer`. Bundled faces are tried
 /// first (cheap); then, for CJK characters, the platform's usual family for that language, in the
 /// preferred face's style; then any installed face that covers the character. `prefer` when
 /// nothing does (the glyph renders as the missing-glyph box).
@@ -763,13 +763,10 @@ pub fn fallback_for(c: char, prefer: FaceId) -> FaceId {
         return prefer;
     }
     let faces = all_faces();
-    // prefer a face of the same italic-ness that is bundled (cheap), then anything loaded already
+    // Loading a font for an earlier layer must not change later layers' fallback family
+    // or weight. In particular a loaded Mincho face must not override Japanese Gothic,
+    // and a loaded Regular face must not override a requested Bold face.
     for f in faces.iter().filter(|f| f.info.origin == "bundled") {
-        if f.has_char(c) {
-            return f.id;
-        }
-    }
-    for f in faces.iter().filter(|f| f.info.origin != "bundled" && f.bytes.get().is_some()) {
         if f.has_char(c) {
             return f.id;
         }
