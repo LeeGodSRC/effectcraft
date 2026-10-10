@@ -9,35 +9,81 @@ use rayon::prelude::*;
 
 use crate::{Image, Px};
 
+/// What a box pass sums: a pixel, or the single channel of a mask (a feathered mask is blurred
+/// as one float per pixel, a quarter of the memory traffic of blurring it as an image).
+pub(crate) trait Sample: Copy + Default + Send + Sync {
+    fn add(self, o: Self) -> Self;
+    fn sub(self, o: Self) -> Self;
+    fn scale(self, k: f32) -> Self;
+    /// A buffer of `n` samples for a pass to write in full.
+    fn scratch(n: usize) -> Vec<Self>;
+    /// Give a buffer back.
+    fn recycle(_buf: Vec<Self>) {}
+}
+
+impl Sample for Px {
+    #[inline(always)]
+    fn add(self, o: Px) -> Px {
+        [self[0] + o[0], self[1] + o[1], self[2] + o[2], self[3] + o[3]]
+    }
+    #[inline(always)]
+    fn sub(self, o: Px) -> Px {
+        [self[0] - o[0], self[1] - o[1], self[2] - o[2], self[3] - o[3]]
+    }
+    #[inline(always)]
+    fn scale(self, k: f32) -> Px {
+        self.map(|v| v * k)
+    }
+    fn scratch(n: usize) -> Vec<Px> {
+        crate::pool::scratch(n)
+    }
+    fn recycle(buf: Vec<Px>) {
+        crate::pool::recycle(buf);
+    }
+}
+
+impl Sample for f32 {
+    #[inline(always)]
+    fn add(self, o: f32) -> f32 {
+        self + o
+    }
+    #[inline(always)]
+    fn sub(self, o: f32) -> f32 {
+        self - o
+    }
+    #[inline(always)]
+    fn scale(self, k: f32) -> f32 {
+        self * k
+    }
+    fn scratch(n: usize) -> Vec<f32> {
+        vec![0.0; n]
+    }
+}
+
 /// One horizontal box pass of radius `r > 0` (window 2r+1) over `row` into `o` (same length);
 /// `repeat` = edge pixels extend, otherwise transparent.
 #[inline]
-fn box_row(row: &[Px], o: &mut [Px], r: usize, repeat: bool) {
+fn box_row<T: Sample>(row: &[T], o: &mut [T], r: usize, repeat: bool) {
     let w = row.len();
     let norm = 1.0 / (2 * r + 1) as f32;
-    let get = |i: isize| -> Px {
+    let get = |i: isize| -> T {
         if i < 0 {
-            if repeat { row[0] } else { [0.0; 4] }
+            if repeat { row[0] } else { T::default() }
         } else if i as usize >= w {
-            if repeat { row[w - 1] } else { [0.0; 4] }
+            if repeat { row[w - 1] } else { T::default() }
         } else {
             row[i as usize]
         }
     };
-    let mut acc = [0.0f32; 4];
+    let mut acc = T::default();
     for i in -(r as isize)..=(r as isize) {
-        let p = get(i);
-        for c in 0..4 {
-            acc[c] += p[c];
-        }
+        acc = acc.add(get(i));
     }
     for x in 0..w {
-        o[x] = acc.map(|v| v * norm);
+        o[x] = acc.scale(norm);
         let add = get(x as isize + r as isize + 1);
         let sub = get(x as isize - r as isize);
-        for c in 0..4 {
-            acc[c] += add[c] - sub[c];
-        }
+        acc = acc.add(add.sub(sub));
     }
 }
 
@@ -45,13 +91,13 @@ fn box_row(row: &[Px], o: &mut [Px], r: usize, repeat: bool) {
 /// each row of `src` (width `w`) into `out`. All of a row's passes run while the row is in the
 /// cache, between two row-sized scratch buffers, so the image is read and written once however
 /// many passes there are (each pass computes what a whole-image pass would).
-fn box_h_into(src: &[Px], out: &mut [Px], w: usize, radii: &[usize], repeat: bool) {
+fn box_h_into<T: Sample>(src: &[T], out: &mut [T], w: usize, radii: &[usize], repeat: bool) {
     let Some((&last, first)) = radii.split_last() else {
         out.copy_from_slice(src);
         return;
     };
     out.par_chunks_mut(w).zip(src.par_chunks(w)).for_each_init(
-        || (vec![[0.0f32; 4]; if first.is_empty() { 0 } else { w }], vec![[0.0f32; 4]; if first.len() > 1 { w } else { 0 }]),
+        || (vec![T::default(); if first.is_empty() { 0 } else { w }], vec![T::default(); if first.len() > 1 { w } else { 0 }]),
         |(a, b), (o, row)| {
             let n = row.len();
             if first.is_empty() {
@@ -74,15 +120,19 @@ fn box_h_into(src: &[Px], out: &mut [Px], w: usize, radii: &[usize], repeat: boo
     );
 }
 
-/// One vertical box pass (same semantics as [`box_h_into`] along columns).
-fn box_v_into(src: &[Px], out: &mut [Px], w: usize, h: usize, r: usize, repeat: bool) {
+/// One vertical box pass of radius `r` over `src` (`w` × `h`) into `out`: blocks of rows in
+/// parallel, each with a running sum per column.
+fn box_v_into<T: Sample>(src: &[T], out: &mut [T], w: usize, h: usize, r: usize, repeat: bool) {
     if r == 0 {
         out.copy_from_slice(src);
         return;
     }
     let norm = 1.0 / (2 * r + 1) as f32;
-    let block = (4 * r).clamp(32, 256);
-    let row = |i: isize| -> Option<&[Px]> {
+    // Each block of rows starts by summing the 2r + 1 rows around its first one: with blocks of
+    // 4r rows that read half as much again as the blur itself, and a large blur is bound by
+    // the memory it streams, not by how many blocks run at once.
+    let block = (8 * r).clamp(64, 1024);
+    let row = |i: isize| -> Option<&[T]> {
         if i < 0 {
             repeat.then(|| &src[0..w])
         } else if i as usize >= h {
@@ -93,41 +143,33 @@ fn box_v_into(src: &[Px], out: &mut [Px], w: usize, h: usize, r: usize, repeat: 
     };
     out.par_chunks_mut(w * block).enumerate().for_each(|(bi, chunk)| {
         let ya = (bi * block) as isize;
-        let mut acc = vec![[0.0f32; 4]; w];
+        let mut acc = vec![T::default(); w];
         for i in ya - r as isize..=ya + r as isize {
             if let Some(rw) = row(i) {
                 for (a, p) in acc.iter_mut().zip(rw) {
-                    for c in 0..4 {
-                        a[c] += p[c];
-                    }
+                    *a = a.add(*p);
                 }
             }
         }
         for (yy, o) in chunk.chunks_mut(w).enumerate() {
             let y = ya + yy as isize;
             for (o, a) in o.iter_mut().zip(&acc) {
-                *o = a.map(|v| v * norm);
+                *o = a.scale(norm);
             }
             match (row(y + r as isize + 1), row(y - r as isize)) {
                 (Some(add), Some(sub)) => {
                     for ((a, p), q) in acc.iter_mut().zip(add).zip(sub) {
-                        for c in 0..4 {
-                            a[c] += p[c] - q[c];
-                        }
+                        *a = a.add(p.sub(*q));
                     }
                 }
                 (Some(add), None) => {
                     for (a, p) in acc.iter_mut().zip(add) {
-                        for c in 0..4 {
-                            a[c] += p[c];
-                        }
+                        *a = a.add(*p);
                     }
                 }
                 (None, Some(sub)) => {
                     for (a, q) in acc.iter_mut().zip(sub) {
-                        for c in 0..4 {
-                            a[c] -= q[c];
-                        }
+                        *a = a.sub(*q);
                     }
                 }
                 (None, None) => {}
@@ -171,9 +213,9 @@ fn radii(rx: &[usize], ry: &[usize]) -> (Vec<usize>, Vec<usize>) {
 /// The first stage of a blur of `src` into a new buffer: all the horizontal passes
 /// ([`box_h_into`]), or without any the first vertical pass. Returns the buffer and how many
 /// vertical passes are done.
-fn first_stage(src: &[Px], w: usize, h: usize, h_radii: &[usize], v_radii: &[usize], repeat: bool) -> (Vec<Px>, usize) {
+fn first_stage<T: Sample>(src: &[T], w: usize, h: usize, h_radii: &[usize], v_radii: &[usize], repeat: bool) -> (Vec<T>, usize) {
     // (Every pass writes all of its output.)
-    let mut out = crate::pool::scratch(src.len());
+    let mut out = T::scratch(src.len());
     if !h_radii.is_empty() {
         box_h_into(src, &mut out, w, h_radii, repeat);
         return (out, 0);
@@ -192,14 +234,14 @@ fn first_stage(src: &[Px], w: usize, h: usize, h_radii: &[usize], v_radii: &[usi
 
 /// Vertical passes of `radii` over `cur`, ping-ponging with `spare` (a buffer of the same
 /// length, allocated when a pass needs one and none is given).
-fn v_stages(mut cur: Vec<Px>, mut spare: Option<Vec<Px>>, w: usize, h: usize, radii: &[usize], repeat: bool) -> Vec<Px> {
+fn v_stages<T: Sample>(mut cur: Vec<T>, mut spare: Option<Vec<T>>, w: usize, h: usize, radii: &[usize], repeat: bool) -> Vec<T> {
     for &r in radii {
-        let out = spare.get_or_insert_with(|| crate::pool::scratch(cur.len()));
+        let out = spare.get_or_insert_with(|| T::scratch(cur.len()));
         box_v_into(&cur, out, w, h, r, repeat);
         std::mem::swap(&mut cur, out);
     }
     if let Some(spare) = spare {
-        crate::pool::recycle(spare);
+        T::recycle(spare);
     }
     cur
 }
@@ -230,6 +272,31 @@ pub fn box_blur(img: &Image, rx: usize, ry: usize, iterations: usize, repeat: bo
 pub fn box_blur_owned(img: Image, rx: usize, ry: usize, iterations: usize, repeat: bool) -> Image {
     let n = iterations.max(1);
     box_passes_owned(img, &vec![rx; n], &vec![ry; n], repeat)
+}
+
+/// [`box_blur`] of a mask (transparent outside), one channel instead of four: the same values
+/// as blurring it as an image's alpha.
+pub fn box_blur_mask(mask: &crate::Mask, rx: usize, ry: usize, iterations: usize) -> crate::Mask {
+    let n = iterations.max(1);
+    mask_passes(mask, &vec![rx; n], &vec![ry; n])
+}
+
+/// [`gaussian_blur`] of a mask (transparent outside), one channel instead of four.
+pub fn gaussian_blur_mask(mask: &crate::Mask, sigma_x: f64, sigma_y: f64) -> crate::Mask {
+    let rx = if sigma_x > 0.05 { box_radii(sigma_x, 3) } else { vec![] };
+    let ry = if sigma_y > 0.05 { box_radii(sigma_y, 3) } else { vec![] };
+    mask_passes(mask, &rx, &ry)
+}
+
+fn mask_passes(mask: &crate::Mask, rx: &[usize], ry: &[usize]) -> crate::Mask {
+    let (w, h) = (mask.width as usize, mask.height as usize);
+    let (h_radii, v_radii) = radii(rx, ry);
+    if (h_radii.is_empty() && v_radii.is_empty()) || w == 0 || h == 0 || mask.data.len() != w * h {
+        return crate::Mask { width: mask.width, height: mask.height, data: mask.data.clone() };
+    }
+    let (cur, done) = first_stage(&mask.data, w, h, &h_radii, &v_radii, false);
+    let data = v_stages(cur, None, w, h, v_radii.get(done..).unwrap_or_default(), false);
+    crate::Mask { width: mask.width, height: mask.height, data }
 }
 
 /// Gaussian blur with standard deviations in pixels (3 box passes per axis).
@@ -395,6 +462,21 @@ mod tests {
             }
         }
         out
+    }
+
+    /// A mask blurred as one channel is the alpha of the same mask blurred as an image.
+    #[test]
+    fn a_mask_blurs_like_the_alpha_of_an_image() {
+        let (w, h) = (61u32, 47u32);
+        let mask =
+            crate::Mask { width: w, height: h, data: (0..w * h).map(|i| if (i / 5 + i / w) % 3 == 0 { ((i * 31) % 17) as f32 / 16.0 } else { 0.0 }).collect() };
+        let img = mask.to_image();
+        for (sx, sy) in [(0.0, 3.5), (6.0, 0.0), (4.2, 9.7), (40.0, 40.0)] {
+            assert_eq!(gaussian_blur_mask(&mask, sx, sy).data, crate::Mask::from_alpha(&gaussian_blur(&img, sx, sy, false)).data, "sigma {sx}, {sy}");
+        }
+        for (rx, ry) in [(1, 0), (0, 2), (5, 3), (70, 70)] {
+            assert_eq!(box_blur_mask(&mask, rx, ry, 1).data, crate::Mask::from_alpha(&box_blur(&img, rx, ry, 1, false)).data, "radius {rx}, {ry}");
+        }
     }
 
     #[test]

@@ -17,7 +17,7 @@ pub mod warp;
 use effectcraft_color::{BlendMode, blend_pixel};
 use rayon::prelude::*;
 
-pub use blur::{box_blur, box_blur_owned, directional_blur, gaussian_blur, gaussian_blur_owned, radial_blur};
+pub use blur::{box_blur, box_blur_mask, box_blur_owned, directional_blur, gaussian_blur, gaussian_blur_mask, gaussian_blur_owned, radial_blur};
 pub use channels3d::AuxChannels;
 pub use warp::{Sampling, WarpOpts, accumulate_warp, composite_warp, composite_warp_quantized, composite_warp_reference, resample};
 
@@ -334,13 +334,23 @@ impl Image {
     }
     /// Map every pixel through `f` on straight colour (keeps alpha).
     pub fn map_straight(&mut self, f: impl Fn([f32; 3]) -> [f32; 3] + Sync) {
+        self.map_straight_quantized(None, f);
+    }
+    /// [`Self::map_straight`], rounding the pixels it writes to `levels` steps ([`quantize_px`])
+    /// in the same pass.
+    pub fn map_straight_quantized(&mut self, levels: Option<f32>, f: impl Fn([f32; 3]) -> [f32; 3] + Sync) {
+        let inv = levels.map_or(1.0, |l| 1.0 / l);
         self.data.par_iter_mut().for_each(|p| {
             let a = p[3];
             if a <= 0.0 {
                 return;
             }
             let c = f([p[0] / a, p[1] / a, p[2] / a]);
-            *p = [c[0] * a, c[1] * a, c[2] * a, a];
+            let px = [c[0] * a, c[1] * a, c[2] * a, a];
+            *p = match levels {
+                Some(l) => quantize_px(px, l, inv),
+                None => px,
+            };
         });
     }
     /// Blend `src` (same size) onto self with a mode and opacity.

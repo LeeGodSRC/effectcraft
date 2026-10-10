@@ -725,6 +725,10 @@ fn blend_mode(mode: u32) -> Option<BlendMode> {
 #[inline]
 pub(crate) fn composite(orig: [f32; 4], val: f32, opacity: f32, mode: Option<BlendMode>, blend_orig: f32) -> [f32; 4] {
     let src = [val * opacity, val * opacity, val * opacity, opacity];
+    // The noise alone: the pixel below takes no part.
+    if mode.is_none() && blend_orig == 0.0 {
+        return src;
+    }
     let out = match mode {
         None => src,
         // Blended with the original, the noise stays inside the layer's own alpha (a masked
@@ -741,13 +745,20 @@ fn render(ctx: &EffectCtx, mut b: Buf, turbulent: bool) -> Buf {
     let mode = blend_mode(ctx.params.get("blendingMode").map(Value::as_enum).unwrap_or(BLEND_NONE));
     let blend = ctx.params.f("blend") as f32 / 100.0;
     let plan = fr.plan(b.img.width, b.img.height);
+    let levels = ctx.env.levels.map(|l| (l, 1.0 / l));
+    let solid = ctx.env.solid_input;
     b.img.rows_mut().for_each_init(
         || (Vec::new(), Vec::new()),
         |(col, raw), (y, row)| {
             raw.resize(row.len(), 0.0);
             plan.row(y as f32 + 0.5, col, raw);
             for (px, r) in row.iter_mut().zip(raw.iter()) {
-                *px = composite(*px, plan.finish(*r), opacity, mode, blend);
+                // (On a solid the pixel below is its colour: the buffer may not hold it.)
+                let out = composite(solid.unwrap_or(*px), plan.finish(*r), opacity, mode, blend);
+                *px = match levels {
+                    Some((l, inv)) => effectcraft_raster::quantize_px(out, l, inv),
+                    None => out,
+                };
             }
         },
     );

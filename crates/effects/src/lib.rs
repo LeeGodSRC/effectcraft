@@ -403,7 +403,24 @@ pub struct EffectEnv<'a> {
     /// comp's and the layer's motion blur switches are on (Transform's Use Composition's
     /// Shutter Angle).
     pub shutter: Option<(f64, f64, u32)>,
+    /// Set for the effects in [`QUANTIZES`] when the comp is 8 or 16 bpc: the number of levels
+    /// to round the output to ([`effectcraft_raster::quantize_px`]) while writing it, which
+    /// saves the renderer a pass over the buffer after the effect.
+    pub levels: Option<f32>,
+    /// Set for the effects in [`TAKES_SOLID_INPUT`] when their input is one colour everywhere
+    /// (the first effect on an unmasked solid): that pixel. The buffer then has the right size
+    /// but unspecified pixels, which the effect must not read and must all write.
+    pub solid_input: Option<[f32; 4]>,
 }
+
+/// Effects that write every pixel and can take their input as one colour
+/// ([`EffectEnv::solid_input`]) instead of reading it: the renderer then skips filling the solid
+/// they run on, a pass over the whole layer.
+pub const TAKES_SOLID_INPUT: [&str; 2] = ["ec.noise.fractal", "ec.noise.turbulent"];
+
+/// Effects that round their output to [`EffectEnv::levels`] themselves. The renderer gives them
+/// pixels already on that grid; each must leave every pixel on it.
+pub const QUANTIZES: [&str; 5] = ["ec.noise.fractal", "ec.noise.turbulent", "ec.color.tritone", "ec.color.colorbalancehls", "ec.color.curves"];
 
 /// What an effect gets to render with.
 pub struct EffectCtx<'a> {
@@ -1238,6 +1255,57 @@ pub(crate) fn run_fx(id: &str, vals: &[(&str, Value)], img: Image, time: f64, en
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An effect told its input is one colour ([`TAKES_SOLID_INPUT`]) never reads the buffer:
+    /// whatever the buffer holds, it writes what it would on a buffer filled with that colour.
+    #[test]
+    fn solid_input_effects_do_not_read_their_buffer() {
+        let px = [0.2, 0.4, 0.6, 1.0];
+        let junk = || {
+            let mut img = Image::new(40, 24);
+            img.data.iter_mut().enumerate().for_each(|(i, p)| *p = [f32::NAN, i as f32, -3.0, 0.5]);
+            img
+        };
+        for id in TAKES_SOLID_INPUT {
+            for vals in [
+                vec![],
+                vec![("blendingMode", Value::Enum(1))],
+                vec![("blendingMode", Value::Enum(3)), ("opacity", Value::Scalar(40.0)), ("blend", Value::Scalar(25.0))],
+            ] {
+                let filled = run_fx(id, &vals, Image::filled(40, 24, px), 0.25, EffectEnv::default()).img;
+                let told = run_fx(id, &vals, junk(), 0.25, EffectEnv { solid_input: Some(px), ..Default::default() }).img;
+                assert!(told == filled, "{id} {vals:?}");
+            }
+        }
+    }
+
+    /// An effect that rounds its own output ([`QUANTIZES`]) leaves the pixels the renderer's
+    /// pass over its output would: every one on the grid, bit for bit.
+    #[test]
+    fn self_quantising_effects_match_a_pass_over_their_output() {
+        let (levels, inv) = (255.0f32, 1.0 / 255.0);
+        let mut img = Image::new(48, 32);
+        for (i, p) in img.data.iter_mut().enumerate() {
+            let a = [0.0, 0.25, 0.6, 1.0][(i / 7) % 4];
+            *p = effectcraft_raster::quantize_px([a * ((i % 11) as f32 / 10.0), a * ((i % 5) as f32 / 4.0), a * 0.37, a], levels, inv);
+        }
+        let cases: [(&str, Vec<(&str, Value)>); 7] = [
+            ("ec.noise.fractal", vec![]),
+            ("ec.noise.fractal", vec![("blendingMode", Value::Enum(5)), ("opacity", Value::Scalar(60.0))]),
+            ("ec.noise.turbulent", vec![]),
+            ("ec.color.tritone", vec![("blend", Value::Scalar(30.0))]),
+            ("ec.color.colorbalancehls", vec![("hue", Value::Scalar(40.0)), ("lightness", Value::Scalar(-20.0)), ("saturation", Value::Scalar(35.0))]),
+            ("ec.color.curves", vec![]),
+            ("ec.color.curves", vec![("rgb", Value::Str("0,0.1;0.5,0.7;1,0.9".into())), ("alpha", Value::Str("0,0.2;1,1".into()))]),
+        ];
+        assert!(QUANTIZES.iter().all(|id| cases.iter().any(|c| c.0 == *id)), "every self-quantising effect is checked");
+        for (id, vals) in &cases {
+            let mut two = run_fx(id, vals, img.clone(), 0.5, EffectEnv::default()).img;
+            two.data.iter_mut().for_each(|p| *p = effectcraft_raster::quantize_px(*p, levels, inv));
+            let one = run_fx(id, vals, img.clone(), 0.5, EffectEnv { levels: Some(levels), ..Default::default() }).img;
+            assert!(one == two, "{id} {vals:?}");
+        }
+    }
 
     #[test]
     fn run_fx_passthrough() {

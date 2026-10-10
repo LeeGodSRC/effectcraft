@@ -1073,7 +1073,10 @@ impl<'a> Renderer<'a> {
             working_space: self.pipe.space,
             working_linear: self.pipe.linear,
             shutter: self.mb_on(ctx, layer).then_some((ctx.comp.shutter_angle, ctx.comp.shutter_phase, ctx.comp.motion_blur_samples)),
+            levels: None,
+            solid_input: None,
         };
+        let solid = self.solid_first_effect(ctx, layer).filter(|_| !adjustment);
         // Video effects in stack order (index, group, spec); disabled and audio effects skipped.
         let stack: Vec<(usize, &effectcraft_project::PropGroup, &'static effectcraft_effects::EffectSpec)> = fx
             .groups()
@@ -1118,13 +1121,17 @@ impl<'a> Renderer<'a> {
             k += 1;
             let params = self.effect_params(ctx, layer, g);
             host.index.store(i, std::sync::atomic::Ordering::Relaxed);
-            let env = EffectEnv { effect_index: i, ..env };
+            // 8/16 bpc effects write integer pixels: rounded by the effect itself where it can
+            // (as it writes them), else in a pass over its output.
+            let rounds = effectcraft_effects::QUANTIZES.contains(&spec.id);
+            let env = EffectEnv { effect_index: i, levels: self.pipe.levels.filter(|_| rounds), solid_input: solid.filter(|s| s.0 == i).map(|s| s.1), ..env };
             let ectx = EffectCtx { params: &params, time: lt.seconds(), layer_size, seed: g.uid as u32, adjustment, env };
             let t0 = web_time::Instant::now();
             target.cpu(&mut |buf| {
                 let mut buf = effectcraft_effects::apply(spec, &ectx, buf);
-                // 8/16 bpc effects write integer pixels.
-                self.pipe.quantize(&mut buf.img);
+                if !rounds {
+                    self.pipe.quantize(&mut buf.img);
+                }
                 buf
             });
             if let Some(v) = timing.as_deref_mut() {
@@ -1433,11 +1440,48 @@ impl<'a> Renderer<'a> {
         self.footage.frame(item, f, t)
     }
 
+    /// An unmasked solid whose first effect takes its input as one colour instead of reading it
+    /// ([`effectcraft_effects::TAKES_SOLID_INPUT`], on the CPU): that effect's index in the stack,
+    /// the solid's pixel and its buffer size. Filling a full-frame solid that Fractal Noise
+    /// overwrites at once is a pass over 33 MB per noise layer.
+    fn solid_first_effect(&self, ctx: &EvalCtx, layer: &Layer) -> Option<(usize, [f32; 4], u32, u32)> {
+        let LayerSource::Solid { item } = &layer.source else { return None };
+        if layer.switches.adjustment || !layer.switches.effects || self.active_accel().is_some() || self.content_times(ctx, layer).is_some() {
+            return None;
+        }
+        if layer.masks().is_some_and(|m| !m.children.is_empty()) {
+            return None;
+        }
+        let ItemKind::Solid(sol) = &self.project.item(*item)?.kind else { return None };
+        let (i, first) = layer.effects()?.groups().enumerate().find(|(_, g)| g.enabled)?;
+        let GroupKind::Effect { effect } = &first.kind else { return None };
+        if !effectcraft_effects::TAKES_SOLID_INPUT.contains(&effect.as_str()) {
+            return None;
+        }
+        let mut c = sol.color;
+        if let Some(conv) = self.pipe.authored_in() {
+            c = conv.apply(c);
+        }
+        let s = self.opts.scale;
+        let (w, h) = (((sol.width as f64 * s).ceil() as u32).max(1), ((sol.height as f64 * s).ceil() as u32).max(1));
+        Some((i, self.pipe.quantize_px([c[0], c[1], c[2], 1.0]), w, h))
+    }
+
     /// Source → masks, clamped/quantised to the project depth.
     fn masked_source(&self, ctx: &EvalCtx, layer: &Layer) -> Option<Buf> {
+        self.masked_source_for(ctx, layer, false)
+    }
+
+    /// [`Self::masked_source`]; `all_effects`: the layer's whole effect stack runs on the result
+    /// next (so a solid its first effect overwrites need not be filled).
+    fn masked_source_for(&self, ctx: &EvalCtx, layer: &Layer, all_effects: bool) -> Option<Buf> {
         let mut buf = match self.content_times(ctx, layer) {
             Some(times) => self.blurred_source(ctx, layer, &times)?,
-            None => self.source(ctx, layer)?,
+            None => match all_effects.then(|| self.solid_first_effect(ctx, layer)).flatten() {
+                // (Its first effect writes every pixel without reading any.)
+                Some((_, _, w, h)) => return Some(Buf { img: Image::scratch(w, h), offset: [0.0; 2], scale: self.opts.scale }),
+                None => self.source(ctx, layer)?,
+            },
         };
         // A solid is filled with a quantised colour and a nested comp's frame is quantised after
         // every layer: only masks can take them off the grid.
@@ -1528,7 +1572,7 @@ impl<'a> Renderer<'a> {
         if let Some(buf) = self.shared_precomp(ctx, layer) {
             return Some((buf, key));
         }
-        let buf = self.masked_source(ctx, layer)?;
+        let buf = self.masked_source_for(ctx, layer, true)?;
         let buf = Arc::new(self.apply_effects_timed(ctx, layer, buf, false, usize::MAX, timing.map(|t| &mut t.effects)));
         if let (Some(c), Some(k)) = (self.cache, key) {
             // (Content that animates within the shutter is keyed by its times.)
@@ -2004,8 +2048,7 @@ impl<'a> Renderer<'a> {
             return Region::Empty;
         }
         if layer.switches.adjustment {
-            self.draw_adjustment(ctx, layer, canvas, opacity);
-            return Region::Full;
+            return self.draw_adjustment(ctx, layer, canvas, opacity);
         }
         let mut timing = self.profile.map(|_| LayerTiming { depth: self.depth, layer: layer.name.clone(), ..Default::default() });
         let t0 = web_time::Instant::now();
@@ -2152,11 +2195,24 @@ impl<'a> Renderer<'a> {
     }
 
     /// Adjustment layer: effects applied to the comp below, limited to the layer's footprint.
-    fn draw_adjustment(&self, ctx: &EvalCtx, layer: &Layer, canvas: &mut Image, opacity: f32) {
-        let Some(mut foot) = self.source(ctx, layer) else { return };
-        let _ = masks::apply(ctx, layer, &mut foot, self.mask_blur(ctx, layer));
-        let mut matte = Image::new(canvas.width, canvas.height);
-        self.place(ctx, layer, &foot, &mut matte, BlendMode::Normal, 1.0);
+    /// Returns the region left to quantise.
+    fn draw_adjustment(&self, ctx: &EvalCtx, layer: &Layer, canvas: &mut Image, opacity: f32) -> Region {
+        let Some(mut foot) = self.source(ctx, layer) else { return Region::Empty };
+        let masked = masks::apply(ctx, layer, &mut foot, self.mask_blur(ctx, layer));
+        // An unmasked solid at 100% that lands on whole pixels and spans the frame (the usual
+        // adjustment layer) weighs every pixel 1: the adjusted picture is the result, with no
+        // footprint to draw and no blend with the picture below.
+        let whole = opacity == 1.0
+            && !masked
+            && matches!(layer.source, LayerSource::Solid { .. })
+            && self.aligned(ctx, layer, &foot).is_some_and(|(dx, dy)| {
+                dx <= 0 && dy <= 0 && dx + foot.img.width as i64 >= canvas.width as i64 && dy + foot.img.height as i64 >= canvas.height as i64
+            });
+        let mut matte = Image::new(if whole { 0 } else { canvas.width }, if whole { 0 } else { canvas.height });
+        if !whole {
+            self.place(ctx, layer, &foot, &mut matte, BlendMode::Normal, 1.0);
+        }
+        drop(foot);
         let o = self.roi_offset().map(|(x, y, _, _)| [-x, -y]).unwrap_or([0.0; 2]);
         let mut below = Buf { img: canvas.clone(), offset: o, scale: self.opts.scale };
         // Effects run in the working space, not the linear blending space.
@@ -2168,7 +2224,13 @@ impl<'a> Renderer<'a> {
             color::convert(&mut adjusted.img, &c);
         }
         if adjusted.img.width != canvas.width || adjusted.img.height != canvas.height {
-            return;
+            return Region::Empty;
+        }
+        if whole {
+            *canvas = adjusted.img;
+            // (Every effect leaves integer pixels; only the way back to a linear blending space
+            // takes them off the grid.)
+            return if self.pipe.to_blend().is_none() { Region::Empty } else { Region::Full };
         }
         canvas.data.par_iter_mut().zip(adjusted.img.data.par_iter()).zip(matte.data.par_iter()).for_each(|((c, a), m)| {
             let k = m[3] * opacity;
@@ -2176,6 +2238,7 @@ impl<'a> Renderer<'a> {
                 c[i] += (a[i] - c[i]) * k;
             }
         });
+        Region::Full
     }
 }
 

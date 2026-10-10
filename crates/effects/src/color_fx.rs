@@ -31,7 +31,7 @@ fn tritone(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let mid = ctx.params.color("midtones");
     let sh = ctx.params.color("shadows");
     let blend = 1.0 - ctx.params.f("blend") as f32 / 100.0;
-    b.img.map_straight(|c| {
+    b.img.map_straight_quantized(ctx.env.levels, |c| {
         let l = luminance(c[0], c[1], c[2]).clamp(0.0, 1.0);
         let t = if l < 0.5 {
             mix([sh[0], sh[1], sh[2]], [mid[0], mid[1], mid[2]], l * 2.0)
