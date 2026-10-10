@@ -1038,6 +1038,14 @@ fn type_sprite(kind: u32, x: f32, y: f32, r: f32, c: [f32; 4], vx: f32, vy: f32,
     Sprite { x, y, r: rr, c, shape, rot }
 }
 
+/// Particle World Line is an antialiased hairline. Size sets its length, not a
+/// capsule's thickness. Length (0.6 radii) and width (0.5 layer pixels) are fitted
+/// to rendered dust; neither conversion is specified by the public manual.
+fn pw_line_sprite(x: f32, y: f32, r: f32, c: [f32; 4], vx: f32, vy: f32, scale: f32) -> Sprite {
+    let speed = vx.hypot(vy).max(1e-6);
+    Sprite::new(x, y, if r > 0.0 { 0.25 * scale } else { 0.0 }, c, Shape::Line { dx: -vx / speed * r * 0.6, dy: -vy / speed * r * 0.6 })
+}
+
 // ------------------------------------------------------------------ CC Particle World
 
 static PW_CACHE: SimCache<PState> = SimCache::new(6);
@@ -1046,7 +1054,9 @@ static PW_CACHE: SimCache<PState> = SimCache::new(6);
 fn pw_phys(ctx: &EffectCtx) -> Phys {
     let pr = ctx.params;
     Phys {
-        rate: pr.f("birthRate").max(0.0) * 120.0,
+        // Line dust needs a denser emitter than the separately calibrated polygons.
+        // The multiplier is fitted; Cycore documents density, not particles/second.
+        rate: pr.f("birthRate").max(0.0) * if pr.e("particle/particleType") == 0 { 6_000.0 } else { 120.0 },
         life: pr.f("longevity").max(0.0) as f32,
         producer: [pr.f("producer/producerX") as f32, pr.f("producer/producerY") as f32, pr.f("producer/producerZ") as f32],
         radius: [pr.f("producer/radiusX").max(0.0) as f32, pr.f("producer/radiusY").max(0.0) as f32, pr.f("producer/radiusZ").max(0.0) as f32],
@@ -1287,7 +1297,11 @@ fn particle_world_layout(ctx: &EffectCtx, b: &Buf) -> Option<WorldPlan> {
             if pr.b("texture/align") {
                 rotation += v[1].atan2(v[0]);
             }
-            let sp = type_sprite(kind, x, y, radius, color, v[0] * lw * k * scale, v[1] * lw * k * scale, rotation);
+            let sp = if kind == 0 {
+                pw_line_sprite(x, y, radius, color, v[0] * lw * k * scale, v[1] * lw * k * scale, scale)
+            } else {
+                type_sprite(kind, x, y, radius, color, v[0] * lw * k * scale, v[1] * lw * k * scale, rotation)
+            };
             Some((depth, WorldSprite { sprite: sp, age: q.age as f64, id: q.id }))
         })
         .collect();
@@ -1955,6 +1969,37 @@ mod tests {
             ("particle/birthSize", num(0.3)),
             ("particle/deathSize", num(0.3)),
         ]
+    }
+
+    #[test]
+    fn particle_world_line_keeps_hairline_width_and_subpixel_energy() {
+        let a = pw_line_sprite(20.0, 20.0, 20.0, [1.0; 4], 3.0, 4.0, 1.0);
+        let b = pw_line_sprite(10.0, 10.0, 10.0, [1.0; 4], 1.5, 2.0, 0.5);
+        let large = pw_line_sprite(20.0, 20.0, 100.0, [1.0; 4], 3.0, 4.0, 1.0);
+        assert_eq!(a.r, large.r, "size must not make a thick capsule");
+        assert_eq!(a.r, 2.0 * b.r);
+        let Shape::Line { dx, dy } = a.shape else { panic!("line") };
+        assert!((dx.hypot(dy) - 12.0).abs() < 1e-5);
+        let full = splat(40, 40, &[a], Acc::Over);
+        let half = splat(20, 20, &[b], Acc::Over);
+        let alpha = |im: &Image| im.data.iter().map(|p| p[3]).sum::<f32>();
+        assert!((alpha(&full) / alpha(&half) - 4.0).abs() < 0.6, "coverage scales with pixel area");
+        let zero = pw_line_sprite(20.0, 20.0, 0.0, [1.0; 4], 0.0, 0.0, 1.0);
+        assert_eq!(alpha(&splat(40, 40, &[zero], Acc::Over)), 0.0);
+    }
+
+    #[test]
+    fn particle_world_line_density_leaves_polygons_unchanged() {
+        let mut params = pw_params();
+        params.values.insert("birthRate".into(), num(0.01));
+        params.values.insert("particle/particleType".into(), Value::Enum(0));
+        let ctx = EffectCtx { params: &params, time: 1.0, layer_size: [64.0; 2], seed: 1, adjustment: false, env: EffectEnv::default() };
+        assert!((pw_phys(&ctx).rate - 60.0).abs() < 1e-9);
+        for kind in [1, 8, 9, 10, 12] {
+            params.values.insert("particle/particleType".into(), Value::Enum(kind));
+            let ctx = EffectCtx { params: &params, time: 1.0, layer_size: [64.0; 2], seed: 1, adjustment: false, env: EffectEnv::default() };
+            assert!((pw_phys(&ctx).rate - 1.2).abs() < 1e-9);
+        }
     }
 
     #[test]
