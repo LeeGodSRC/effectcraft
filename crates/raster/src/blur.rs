@@ -251,6 +251,11 @@ pub fn directional_blur(img: &Image, angle_deg: f64, length: f64) -> Image {
     let a = angle_deg.to_radians();
     let (dx, dy) = (a.sin(), -a.cos());
     let n = (length.ceil() as usize * 2 + 1).clamp(3, 257);
+    // Along an image axis every pixel takes the same taps, so the samples fold into one 1-D kernel.
+    if dx.abs() < 1e-9 || dy.abs() < 1e-9 {
+        let d = if dy.abs() < 1e-9 { dx.signum() } else { dy.signum() };
+        return axis_blur(img, &axis_kernel(d, length, n), dy.abs() < 1e-9);
+    }
     let mut out = Image::new(img.width, img.height);
     out.rows_mut().for_each(|(y, row)| {
         for (x, px) in row.iter_mut().enumerate() {
@@ -263,6 +268,67 @@ pub fn directional_blur(img: &Image, angle_deg: f64, length: f64) -> Image {
                 }
             }
             *px = acc.map(|v| v / n as f32);
+        }
+    });
+    out
+}
+
+/// The taps of [`directional_blur`] along one axis as `(first offset, weights)`: each bilinear
+/// sample splits between the two pixels it falls between.
+fn axis_kernel(d: f64, length: f64, n: usize) -> (i64, Vec<f32>) {
+    let reach = (length * 0.5).ceil() as i64 + 1;
+    let mut k = vec![0.0f64; (2 * reach + 1) as usize];
+    for i in 0..n {
+        let t = d * (i as f64 / (n - 1) as f64 - 0.5) * length;
+        let f = t.floor();
+        let (i0, frac) = ((f as i64 + reach) as usize, t - f);
+        if let Some(w) = k.get_mut(i0) {
+            *w += 1.0 - frac;
+        }
+        if let Some(w) = k.get_mut(i0 + 1) {
+            *w += frac;
+        }
+    }
+    (-reach, k.into_iter().map(|w| (w / n as f64) as f32).collect())
+}
+
+/// Convolves the rows (`horizontal`) or columns with `kernel`; transparent outside the image.
+fn axis_blur(img: &Image, kernel: &(i64, Vec<f32>), horizontal: bool) -> Image {
+    let (first, weights) = kernel;
+    let (w, h) = (img.width as i64, img.height as i64);
+    let mut out = Image::new(img.width, img.height);
+    let stride = img.width.max(1) as usize;
+    out.rows_mut().for_each(|(y, row)| {
+        if horizontal {
+            let Some(src) = img.data.get(y * stride..(y + 1) * stride) else { return };
+            for (x, px) in row.iter_mut().enumerate() {
+                // Kernel index j reads source column x + first + j.
+                let j0 = (-(x as i64 + first)).clamp(0, weights.len() as i64) as usize;
+                let j1 = (w - (x as i64 + first)).clamp(0, weights.len() as i64) as usize;
+                let s0 = (x as i64 + first + j0 as i64).max(0) as usize;
+                let mut acc = [0.0f32; 4];
+                if let (Some(ws), Some(ps)) = (weights.get(j0..j1), src.get(s0..)) {
+                    for (wt, p) in ws.iter().zip(ps) {
+                        for c in 0..4 {
+                            acc[c] += p[c] * wt;
+                        }
+                    }
+                }
+                *px = acc;
+            }
+        } else {
+            for (j, wt) in weights.iter().enumerate() {
+                let sy = y as i64 + first + j as i64;
+                if sy < 0 || sy >= h || *wt == 0.0 {
+                    continue;
+                }
+                let Some(src) = img.data.get(sy as usize * stride..(sy as usize + 1) * stride) else { continue };
+                for (px, p) in row.iter_mut().zip(src) {
+                    for c in 0..4 {
+                        px[c] += p[c] * wt;
+                    }
+                }
+            }
         }
     });
     out
@@ -302,6 +368,45 @@ pub fn radial_blur(img: &Image, center: (f64, f64), amount: f64, zoom: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The reference sampling loop the axis-aligned path replaces.
+    fn directional_by_samples(img: &Image, dx: f64, dy: f64, length: f64) -> Image {
+        let n = (length.ceil() as usize * 2 + 1).clamp(3, 257);
+        let mut out = Image::new(img.width, img.height);
+        for y in 0..img.height {
+            for x in 0..img.width {
+                let mut acc = [0.0f32; 4];
+                for i in 0..n {
+                    let t = (i as f64 / (n - 1) as f64 - 0.5) * length;
+                    let p = img.sample_bilinear(x as f64 + 0.5 + dx * t, y as f64 + 0.5 + dy * t);
+                    for c in 0..4 {
+                        acc[c] += p[c];
+                    }
+                }
+                out.set(x, y, acc.map(|v| v / n as f32));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn axis_aligned_directional_blur_matches_the_sampled_one() {
+        let mut img = Image::new(37, 23);
+        for (i, p) in img.data.iter_mut().enumerate() {
+            let v = ((i * 7919) % 101) as f32 / 100.0;
+            *p = [v, 1.0 - v, v * 0.5, 0.25 + v * 0.5];
+        }
+        for (angle, dx, dy) in [(0.0, 0.0, -1.0), (90.0, 1.0, 0.0), (180.0, 0.0, 1.0), (270.0, -1.0, 0.0)] {
+            for length in [0.7, 3.0, 9.4, 158.0] {
+                let (fast, slow) = (directional_blur(&img, angle, length), directional_by_samples(&img, dx, dy, length));
+                for (a, b) in fast.data.iter().zip(&slow.data) {
+                    for c in 0..4 {
+                        assert!((a[c] - b[c]).abs() < 1e-4, "angle {angle} length {length}: {a:?} vs {b:?}");
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn gaussian_preserves_mass() {
