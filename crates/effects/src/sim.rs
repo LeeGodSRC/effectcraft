@@ -1299,6 +1299,70 @@ fn particle_world_layout(ctx: &EffectCtx, b: &Buf) -> Option<WorldPlan> {
     })
 }
 
+/// One textured particle ready to draw: its texture frame, crop and footprint.
+struct Stamp {
+    frame: i64,
+    sp: Sprite,
+    crop_origin: [f64; 2],
+    radius: f64,
+    ry: f64,
+    sin: f64,
+    cos: f64,
+    x: (u32, u32),
+    y: (u32, u32),
+}
+
+/// Draw `stamps` into `fx` in order. Rows are independent, so bands of rows are drawn in
+/// parallel, each walking the stamps in the same (far to near) order: every pixel sees the same
+/// sequence of blends as a serial pass.
+fn draw_stamps(fx: &mut Image, frames: &std::collections::HashMap<i64, crate::LayerPixels>, stamps: &[Stamp], kind: u32, mode: u32, crop: f64) {
+    const BAND: usize = 8;
+    let w = fx.width as usize;
+    if w == 0 || stamps.is_empty() {
+        return;
+    }
+    fx.data.par_chunks_mut(w * BAND).enumerate().for_each(|(i, band)| {
+        let b0 = (i * BAND) as u32;
+        let b1 = b0 + (band.len() / w) as u32;
+        for st in stamps.iter().filter(|st| st.y.0 < b1 && st.y.1 > b0) {
+            let Some(texture) = frames.get(&st.frame) else { continue };
+            let sp = &st.sp;
+            for y in st.y.0.max(b0)..st.y.1.min(b1) {
+                let Some(row) = band.get_mut((y - b0) as usize * w..(y - b0 + 1) as usize * w) else { continue };
+                for x in st.x.0..st.x.1 {
+                    let dx = x as f64 + 0.5 - sp.x as f64;
+                    let dy = y as f64 + 0.5 - sp.y as f64;
+                    let u = (dx * st.cos + dy * st.sin) / st.radius;
+                    let v = (-dx * st.sin + dy * st.cos) / st.ry.max(1e-8);
+                    if u.abs() > 1.0 || v.abs() > 1.0 || matches!(kind, 11 | 12) && u * u + v * v > 1.0 || kind == 10 && v < 2.0 * u.abs() - 1.0 {
+                        continue;
+                    }
+                    let (tx, ty) = texture.buf.to_px([
+                        (st.crop_origin[0] + (u + 1.0) * 0.5 * crop) * texture.size[0],
+                        (st.crop_origin[1] + (v + 1.0) * 0.5 * crop) * texture.size[1],
+                    ]);
+                    let sample = texture.buf.img.sample_bilinear(tx, ty);
+                    let fade = if kind == 12 { (1.0 - u * u - v * v).max(0.0) as f32 } else { 1.0 };
+                    let alpha = sp.c[3] * fade;
+                    // The texture is multiplied by the particle's colour ([`pw_color`]).
+                    let tint = [sp.c[0], sp.c[1], sp.c[2]];
+                    let c = [sample[0] * tint[0] * alpha, sample[1] * tint[1] * alpha, sample[2] * tint[2] * alpha, sample[3] * alpha];
+                    let Some(px) = row.get_mut(x as usize) else { continue };
+                    let d = *px;
+                    *px = if mode == 2 {
+                        [d[0] + c[0], d[1] + c[1], d[2] + c[2], (d[3] + c[3]).min(1.0)]
+                    } else if mode == 1 {
+                        std::array::from_fn(|k| d[k] + c[k] - d[k] * c[k])
+                    } else {
+                        let inv = 1.0 - c[3];
+                        [c[0] + d[0] * inv, c[1] + d[1] * inv, c[2] + d[2] * inv, c[3] + d[3] * inv]
+                    };
+                }
+            }
+        }
+    });
+}
+
 fn texture_particles(ctx: &EffectCtx, mut b: Buf, plan: &WorldPlan) -> Buf {
     let mut fx = Image::new(b.img.width, b.img.height);
     let texture_id = ctx.params.get("texture/layer").and_then(Value::as_layer);
@@ -1308,6 +1372,11 @@ fn texture_particles(ctx: &EffectCtx, mut b: Buf, plan: &WorldPlan) -> Buf {
     let source = ctx.params.get("texture/layerSource").map(Value::as_enum).unwrap_or(2) != 0;
     let mut frames = std::collections::HashMap::<i64, crate::LayerPixels>::new();
     let fps = ctx.fps().clamp(1.0, 240.0);
+    // Scatter selects a random crop of the texture, not a different animation frame.
+    let scatter = (ctx.params.f("texture/scatter") * 0.01).clamp(0.0, 1.0);
+    let crop = (1.0 - scatter).max(1e-6);
+    // Particles wait here until the texture frames they sample are about to change.
+    let mut stamps: Vec<Stamp> = Vec::new();
     for item in &plan.sprites {
         let time = match time_mode {
             0 => ctx.env.comp_time - item.age,
@@ -1318,9 +1387,17 @@ fn texture_particles(ctx: &EffectCtx, mut b: Buf, plan: &WorldPlan) -> Buf {
         if !frames.contains_key(&frame)
             && let Some(pixels) = host.layer_at(id, frame as f64 / fps, source).or_else(|| host.layer(id, source))
         {
-            while !frames.is_empty()
-                && (frames.len() >= 64 || frames.values().map(|p| p.buf.img.data.len()).sum::<usize>().saturating_add(pixels.buf.img.data.len()) > 16_777_216)
-            {
+            let full = |frames: &std::collections::HashMap<i64, crate::LayerPixels>| {
+                !frames.is_empty()
+                    && (frames.len() >= 64
+                        || frames.values().map(|p| p.buf.img.data.len()).sum::<usize>().saturating_add(pixels.buf.img.data.len()) > 16_777_216)
+            };
+            if full(&frames) {
+                // Frames are about to be dropped: draw the particles that sample them first.
+                draw_stamps(&mut fx, &frames, &stamps, kind, plan.mode, crop);
+                stamps.clear();
+            }
+            while full(&frames) {
                 if let Some(old) = frames.keys().next().copied() {
                     frames.remove(&old);
                 } else {
@@ -1330,9 +1407,6 @@ fn texture_particles(ctx: &EffectCtx, mut b: Buf, plan: &WorldPlan) -> Buf {
             frames.insert(frame, pixels);
         }
         let Some(texture) = frames.get(&frame) else { continue };
-        // Scatter selects a random crop of the texture, not a different animation frame.
-        let scatter = (ctx.params.f("texture/scatter") * 0.01).clamp(0.0, 1.0);
-        let crop = (1.0 - scatter).max(1e-6);
         let crop_origin = [h(item.id, 71, ctx.seed) as f64 * scatter, h(item.id, 72, ctx.seed) as f64 * scatter];
         let sp = item.sprite;
         let radius = sp.r as f64;
@@ -1347,37 +1421,9 @@ fn texture_particles(ctx: &EffectCtx, mut b: Buf, plan: &WorldPlan) -> Buf {
         let y0 = (sp.y as f64 - bound).floor().max(0.0) as u32;
         let y1 = (sp.y as f64 + bound).ceil().clamp(0.0, fx.height as f64) as u32;
         let (sin, cos) = (sp.rot as f64).sin_cos();
-        for y in y0..y1 {
-            for x in x0..x1 {
-                let dx = x as f64 + 0.5 - sp.x as f64;
-                let dy = y as f64 + 0.5 - sp.y as f64;
-                let u = (dx * cos + dy * sin) / radius;
-                let v = (-dx * sin + dy * cos) / ry.max(1e-8);
-                if u.abs() > 1.0 || v.abs() > 1.0 || matches!(kind, 11 | 12) && u * u + v * v > 1.0 || kind == 10 && v < 2.0 * u.abs() - 1.0 {
-                    continue;
-                }
-                let (tx, ty) = texture
-                    .buf
-                    .to_px([(crop_origin[0] + (u + 1.0) * 0.5 * crop) * texture.size[0], (crop_origin[1] + (v + 1.0) * 0.5 * crop) * texture.size[1]]);
-                let sample = texture.buf.img.sample_bilinear(tx, ty);
-                let fade = if kind == 12 { (1.0 - u * u - v * v).max(0.0) as f32 } else { 1.0 };
-                let alpha = sp.c[3] * fade;
-                // The texture is multiplied by the particle's colour ([`pw_color`]).
-                let tint = [sp.c[0], sp.c[1], sp.c[2]];
-                let c = [sample[0] * tint[0] * alpha, sample[1] * tint[1] * alpha, sample[2] * tint[2] * alpha, sample[3] * alpha];
-                let d = fx.get(x as i64, y as i64);
-                let out = if plan.mode == 2 {
-                    [d[0] + c[0], d[1] + c[1], d[2] + c[2], (d[3] + c[3]).min(1.0)]
-                } else if plan.mode == 1 {
-                    std::array::from_fn(|k| d[k] + c[k] - d[k] * c[k])
-                } else {
-                    let inv = 1.0 - c[3];
-                    [c[0] + d[0] * inv, c[1] + d[1] * inv, c[2] + d[2] * inv, c[3] + d[3] * inv]
-                };
-                fx.set(x, y, out);
-            }
-        }
+        stamps.push(Stamp { frame, sp, crop_origin, radius, ry, sin, cos, x: (x0, x1), y: (y0, y1) });
     }
+    draw_stamps(&mut fx, &frames, &stamps, kind, plan.mode, crop);
     b.img = if plan.mode == 3 {
         combine(&Image::filled(fx.width, fx.height, [0.0, 0.0, 0.0, 1.0]), &fx, 0)
     } else if plan.original {

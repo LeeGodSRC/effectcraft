@@ -9,40 +9,69 @@ use rayon::prelude::*;
 
 use crate::{Image, Px};
 
-/// One horizontal box pass of radius `r` (window 2r+1) over each row of `src` (width `w`) into
-/// `out`; `repeat` = edge pixels extend, otherwise transparent.
-fn box_h_into(src: &[Px], out: &mut [Px], w: usize, r: usize, repeat: bool) {
-    if r == 0 {
+/// One horizontal box pass of radius `r > 0` (window 2r+1) over `row` into `o` (same length);
+/// `repeat` = edge pixels extend, otherwise transparent.
+#[inline]
+fn box_row(row: &[Px], o: &mut [Px], r: usize, repeat: bool) {
+    let w = row.len();
+    let norm = 1.0 / (2 * r + 1) as f32;
+    let get = |i: isize| -> Px {
+        if i < 0 {
+            if repeat { row[0] } else { [0.0; 4] }
+        } else if i as usize >= w {
+            if repeat { row[w - 1] } else { [0.0; 4] }
+        } else {
+            row[i as usize]
+        }
+    };
+    let mut acc = [0.0f32; 4];
+    for i in -(r as isize)..=(r as isize) {
+        let p = get(i);
+        for c in 0..4 {
+            acc[c] += p[c];
+        }
+    }
+    for x in 0..w {
+        o[x] = acc.map(|v| v * norm);
+        let add = get(x as isize + r as isize + 1);
+        let sub = get(x as isize - r as isize);
+        for c in 0..4 {
+            acc[c] += add[c] - sub[c];
+        }
+    }
+}
+
+/// Horizontal box passes of radii `radii` (each > 0, at least one), one after the other, over
+/// each row of `src` (width `w`) into `out`. All of a row's passes run while the row is in the
+/// cache, between two row-sized scratch buffers, so the image is read and written once however
+/// many passes there are (each pass computes what a whole-image pass would).
+fn box_h_into(src: &[Px], out: &mut [Px], w: usize, radii: &[usize], repeat: bool) {
+    let Some((&last, first)) = radii.split_last() else {
         out.copy_from_slice(src);
         return;
-    }
-    let norm = 1.0 / (2 * r + 1) as f32;
-    out.par_chunks_mut(w).zip(src.par_chunks(w)).for_each(|(o, row)| {
-        let get = |i: isize| -> Px {
-            if i < 0 {
-                if repeat { row[0] } else { [0.0; 4] }
-            } else if i as usize >= w {
-                if repeat { row[w - 1] } else { [0.0; 4] }
-            } else {
-                row[i as usize]
+    };
+    out.par_chunks_mut(w).zip(src.par_chunks(w)).for_each_init(
+        || (vec![[0.0f32; 4]; if first.is_empty() { 0 } else { w }], vec![[0.0f32; 4]; if first.len() > 1 { w } else { 0 }]),
+        |(a, b), (o, row)| {
+            let n = row.len();
+            if first.is_empty() {
+                box_row(row, o, last, repeat);
+                return;
             }
-        };
-        let mut acc = [0.0f32; 4];
-        for i in -(r as isize)..=(r as isize) {
-            let p = get(i);
-            for c in 0..4 {
-                acc[c] += p[c];
+            let Some(mut a) = a.get_mut(..n) else { return };
+            let mut b = b.get_mut(..n).unwrap_or_default();
+            // `a` holds the latest pass, `b` the one before.
+            for (i, &r) in first.iter().enumerate() {
+                if i == 0 {
+                    box_row(row, a, r, repeat);
+                } else {
+                    std::mem::swap(&mut a, &mut b);
+                    box_row(b, a, r, repeat);
+                }
             }
-        }
-        for x in 0..w {
-            o[x] = acc.map(|v| v * norm);
-            let add = get(x as isize + r as isize + 1);
-            let sub = get(x as isize - r as isize);
-            for c in 0..4 {
-                acc[c] += add[c] - sub[c];
-            }
-        }
-    });
+            box_row(a, o, last, repeat);
+        },
+    );
 }
 
 /// One vertical box pass (same semantics as [`box_h_into`] along columns).
@@ -110,22 +139,65 @@ fn box_v_into(src: &[Px], out: &mut [Px], w: usize, h: usize, r: usize, repeat: 
 /// Run horizontal passes with radii `rx` then vertical passes with radii `ry`.
 fn box_passes(img: &Image, rx: &[usize], ry: &[usize], repeat: bool) -> Image {
     let (w, h) = (img.width as usize, img.height as usize);
-    let passes: Vec<(bool, usize)> = rx.iter().map(|&r| (false, r)).chain(ry.iter().map(|&r| (true, r))).filter(|p| p.1 > 0).collect();
-    if passes.is_empty() || w == 0 || h == 0 {
+    let (h_radii, v_radii) = radii(rx, ry);
+    if (h_radii.is_empty() && v_radii.is_empty()) || w == 0 || h == 0 {
         return img.clone();
     }
-    let mut a = Image::new(img.width, img.height);
-    let mut b = Image::new(img.width, img.height);
-    for (i, &(vertical, r)) in passes.iter().enumerate() {
-        let src: &[Px] = if i == 0 { &img.data } else { &a.data };
-        if vertical {
-            box_v_into(src, &mut b.data, w, h, r, repeat);
-        } else {
-            box_h_into(src, &mut b.data, w, r, repeat);
-        }
-        std::mem::swap(&mut a, &mut b);
+    let (cur, done) = first_stage(&img.data, w, h, &h_radii, &v_radii, repeat);
+    let data = v_stages(cur, None, w, h, v_radii.get(done..).unwrap_or_default(), repeat);
+    Image { width: img.width, height: img.height, data }
+}
+
+/// [`box_passes`] on an image the caller is done with: once the first stage has read it, its
+/// buffer takes the later passes, so a blur holds two images at its peak instead of three.
+fn box_passes_owned(mut img: Image, rx: &[usize], ry: &[usize], repeat: bool) -> Image {
+    let (w, h) = (img.width as usize, img.height as usize);
+    let (h_radii, v_radii) = radii(rx, ry);
+    if (h_radii.is_empty() && v_radii.is_empty()) || w == 0 || h == 0 {
+        return img;
     }
-    a
+    let src = std::mem::take(&mut img.data);
+    let (cur, done) = first_stage(&src, w, h, &h_radii, &v_radii, repeat);
+    img.data = v_stages(cur, Some(src), w, h, v_radii.get(done..).unwrap_or_default(), repeat);
+    img
+}
+
+/// The horizontal and vertical radii that blur at all.
+fn radii(rx: &[usize], ry: &[usize]) -> (Vec<usize>, Vec<usize>) {
+    let keep = |r: &[usize]| r.iter().copied().filter(|&r| r > 0).collect::<Vec<_>>();
+    (keep(rx), keep(ry))
+}
+
+/// The first stage of a blur of `src` into a new buffer: all the horizontal passes
+/// ([`box_h_into`]), or without any the first vertical pass. Returns the buffer and how many
+/// vertical passes are done.
+fn first_stage(src: &[Px], w: usize, h: usize, h_radii: &[usize], v_radii: &[usize], repeat: bool) -> (Vec<Px>, usize) {
+    let mut out = vec![[0.0; 4]; src.len()];
+    if !h_radii.is_empty() {
+        box_h_into(src, &mut out, w, h_radii, repeat);
+        return (out, 0);
+    }
+    match v_radii.first() {
+        Some(&r) => {
+            box_v_into(src, &mut out, w, h, r, repeat);
+            (out, 1)
+        }
+        None => {
+            out.copy_from_slice(src);
+            (out, 0)
+        }
+    }
+}
+
+/// Vertical passes of `radii` over `cur`, ping-ponging with `spare` (a buffer of the same
+/// length, allocated when a pass needs one and none is given).
+fn v_stages(mut cur: Vec<Px>, mut spare: Option<Vec<Px>>, w: usize, h: usize, radii: &[usize], repeat: bool) -> Vec<Px> {
+    for &r in radii {
+        let out = spare.get_or_insert_with(|| vec![[0.0; 4]; cur.len()]);
+        box_v_into(&cur, out, w, h, r, repeat);
+        std::mem::swap(&mut cur, out);
+    }
+    cur
 }
 
 /// Box radii for `n` passes approximating a Gaussian of `sigma` (Kovesi / "boxes for Gauss").
@@ -150,11 +222,24 @@ pub fn box_blur(img: &Image, rx: usize, ry: usize, iterations: usize, repeat: bo
     box_passes(img, &vec![rx; n], &vec![ry; n], repeat)
 }
 
+/// [`box_blur`] of an image the caller is done with (its buffer is reused).
+pub fn box_blur_owned(img: Image, rx: usize, ry: usize, iterations: usize, repeat: bool) -> Image {
+    let n = iterations.max(1);
+    box_passes_owned(img, &vec![rx; n], &vec![ry; n], repeat)
+}
+
 /// Gaussian blur with standard deviations in pixels (3 box passes per axis).
 pub fn gaussian_blur(img: &Image, sigma_x: f64, sigma_y: f64, repeat: bool) -> Image {
     let rx = if sigma_x > 0.05 { box_radii(sigma_x, 3) } else { vec![] };
     let ry = if sigma_y > 0.05 { box_radii(sigma_y, 3) } else { vec![] };
     box_passes(img, &rx, &ry, repeat)
+}
+
+/// [`gaussian_blur`] of an image the caller is done with (its buffer is reused).
+pub fn gaussian_blur_owned(img: Image, sigma_x: f64, sigma_y: f64, repeat: bool) -> Image {
+    let rx = if sigma_x > 0.05 { box_radii(sigma_x, 3) } else { vec![] };
+    let ry = if sigma_y > 0.05 { box_radii(sigma_y, 3) } else { vec![] };
+    box_passes_owned(img, &rx, &ry, repeat)
 }
 
 /// Motion blur along `angle_deg` (0 = vertical in AE's Directional Blur, measured clockwise from
@@ -226,6 +311,42 @@ mod tests {
         let sum: f32 = b.data.iter().map(|p| p[3]).sum();
         assert!((sum - 1.0).abs() < 1e-3, "{sum}");
         assert!(b.get(32, 32)[3] < 0.05);
+    }
+
+    fn noisy(w: u32, h: u32) -> Image {
+        let mut img = Image::new(w, h);
+        for (i, p) in img.data.iter_mut().enumerate() {
+            let n = |k: u32| crate::hash_noise(i as u32, k, 7);
+            *p = [n(0), n(1), n(2), n(3)];
+        }
+        img
+    }
+
+    /// Horizontal passes run together per row give, bit for bit, what whole-image passes one
+    /// after the other give; and a blur that reuses its input's buffer is the borrowing one.
+    #[test]
+    fn fused_and_buffer_reusing_passes_match_separate_ones() {
+        let img = noisy(37, 23);
+        let (w, h) = (37usize, 23usize);
+        for repeat in [false, true] {
+            for radii in [&[2usize][..], &[3, 1], &[4, 4, 5], &[1, 7, 2, 3]] {
+                let mut fused = vec![[0.0; 4]; w * h];
+                box_h_into(&img.data, &mut fused, w, radii, repeat);
+                let mut cur = img.data.clone();
+                for &r in radii {
+                    let mut next = vec![[0.0; 4]; w * h];
+                    box_h_into(&cur, &mut next, w, &[r], repeat);
+                    cur = next;
+                }
+                assert_eq!(fused, cur, "radii {radii:?} repeat {repeat}");
+            }
+            for (sx, sy) in [(2.5, 2.5), (3.0, 0.0), (0.0, 1.7), (0.0, 0.0), (6.0, 0.3)] {
+                assert_eq!(gaussian_blur_owned(img.clone(), sx, sy, repeat), gaussian_blur(&img, sx, sy, repeat), "sigma {sx} {sy} repeat {repeat}");
+            }
+            for (rx, ry, n) in [(2, 3, 1), (0, 2, 3), (4, 0, 2), (0, 0, 2), (1, 1, 4)] {
+                assert_eq!(box_blur_owned(img.clone(), rx, ry, n, repeat), box_blur(&img, rx, ry, n, repeat), "box {rx} {ry} x{n} repeat {repeat}");
+            }
+        }
     }
 
     #[test]
