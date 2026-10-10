@@ -165,6 +165,31 @@ editing one layer re-renders only that layer. Each Render Queue job keeps its ow
 for its frames. Effects that read the clock directly are declared in
 `effects::TIME_DEPENDENT`, and a test checks every registered effect against that list.
 
+**Memory traffic bounds a frame, not cores.** An effect-heavy 1080p frame makes hundreds of
+passes over 33 MB RGBA f32 buffers; measured on 28 threads, 10 threads rendered as fast as 28 and
+two processes slowed each other by the same factor. Pixel loops are row-parallel (rayon), but
+what makes a frame faster is touching less memory, and `perf stat -e cache-misses` on an export
+is the number to watch (it repeats to 1%; wall time on a busy machine does not). What keeps the
+traffic down:
+
+- Dropped images of 1 MB and more wait in a pool for the next image of about their size
+  (`raster::pool`); a buffer the caller writes in full is taken uncleared (`Image::scratch`).
+  A 1080p buffer is above the allocator's mmap threshold, so without the pool every one is
+  mapped, paged in and unmapped.
+- A layer is quantised to the comp's bit depth as it is blended (`composite_warp_quantized`), a
+  layer with a 2D track matte composites in one pass that reads buffers landing on whole pixels
+  in place (`Renderer::composite_matted`), and an unmasked whole-frame adjustment layer at 100%
+  replaces the canvas.
+- Effects listed in `effects::QUANTIZES` round their own output, and those in
+  `effects::TAKES_SOLID_INPUT` take an unmasked solid as one colour, so the renderer neither
+  fills the solid nor passes over the result again.
+- Mask feather blurs one channel, not four (`gaussian_blur_mask`).
+- A comp several layers show at the same time renders once per frame (`prewarm_precomps`), and a
+  still precomp may take half the layer cache so it is not rendered again for every frame.
+- Exports render their first frame alone (it fills the cache with what every frame shares), then
+  at most 4 frames at a time within a quarter of the available memory, and encode a batch while
+  the next one renders (`export::batch_size`, `export::encode::movie`).
+
 The viewer's **RAM preview** (`ui-egui/src/frames.rs`) keeps finished frames keyed by project
 revision, comp, frame, scale, 3D view / region of interest and a hash of the other render
 options (Draft / Fast Previews, shadows, nested switches), so frames rendered under other
