@@ -203,6 +203,30 @@ fn quantize_px(p: &mut [f32; 4], levels: f32, inv: f32) {
     p[3] = a;
 }
 
+/// [`quantize_px`] without integer conversions, for `levels` below [`FLOAT_LEVELS`]: the
+/// saturating float → integer casts keep the row loop from vectorising, and every value rounded
+/// is in `0..=levels + 0.5`, where truncation is exact in `f32` arithmetic (see [`trunc_small`]).
+/// Bit-identical to [`quantize_px`].
+#[allow(clippy::manual_clamp)] // max/min map NaN to 0; clamp would keep NaN
+#[inline(always)]
+fn quantize_px_float(p: &mut [f32; 4], levels: f32, inv: f32) {
+    let a = trunc_small(p[3].max(0.0).min(1.0) * levels + 0.5) * inv;
+    let c = [p[0], p[1], p[2]].map(|v| trunc_small(v.max(0.0).min(a) * levels + 0.5) * inv);
+    *p = [c[0], c[1], c[2], a];
+}
+
+/// `t` rounded down, for `0 ≤ t < 2²³`: adding and subtracting 2²³ rounds to the nearest whole
+/// number (ties to even), one too many when that rounded up.
+#[inline(always)]
+fn trunc_small(t: f32) -> f32 {
+    const M: f32 = 8_388_608.0;
+    let r = (t + M) - M;
+    if r > t { r - 1.0 } else { r }
+}
+
+/// Bit depths below this many levels quantise in float arithmetic (8 and 16 bpc do).
+const FLOAT_LEVELS: f32 = 4_000_000.0;
+
 /// [`quantize`] restricted to a rectangle (already clamped to the image), row-parallel.
 fn quantize_rect(img: &mut Image, r: PxRect, levels: f32) {
     if r.x0 >= r.x1 || r.y0 >= r.y1 {
@@ -211,9 +235,16 @@ fn quantize_rect(img: &mut Image, r: PxRect, levels: f32) {
     let inv = 1.0 / levels;
     let w = img.width as usize;
     let (x0, x1) = (r.x0 as usize, r.x1 as usize);
+    let float = levels < FLOAT_LEVELS;
     img.data[r.y0 as usize * w..r.y1 as usize * w].par_chunks_mut(w).for_each(|row| {
-        for p in &mut row[x0..x1] {
-            quantize_px(p, levels, inv);
+        if float {
+            for p in &mut row[x0..x1] {
+                quantize_px_float(p, levels, inv);
+            }
+        } else {
+            for p in &mut row[x0..x1] {
+                quantize_px(p, levels, inv);
+            }
         }
     });
 }
@@ -267,4 +298,37 @@ pub fn output_hdr(img: &mut Image, to_linear: Option<Conversion>, mode: HdrMode,
         let o = encode.apply(c);
         *p = [o[0] * a, o[1] * a, o[2] * a, a];
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The float quantiser is the integer one, bit for bit: every level and the values around
+    /// it and around the rounding ties, out-of-range, infinite and NaN channels.
+    #[test]
+    fn float_quantise_matches_integer_quantise() {
+        for levels in [255.0f32, 32768.0, 65535.0] {
+            let inv = 1.0 / levels;
+            let mut values = vec![-1.0, -0.0, 0.0, f32::MIN_POSITIVE, 1.0, 1.5, 2.0, 1e9, f32::MAX, f32::INFINITY, f32::NEG_INFINITY, f32::NAN];
+            for k in 0..=levels as u32 {
+                for base in [k as f32 * inv, (k as f32 + 0.5) * inv, k as f32 / levels] {
+                    values.extend([f32::from_bits(base.to_bits().saturating_sub(1)), base, f32::from_bits(base.to_bits() + 1)]);
+                }
+            }
+            let mut seed = 0x2545_f491u32;
+            for (i, &v) in values.iter().enumerate() {
+                // Colour against a few alphas: itself, opaque and a pseudo-random one.
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let other = values[seed as usize % values.len()];
+                for a in [v, 1.0, other] {
+                    let p = [v, other, values[i / 2], a];
+                    let (mut x, mut y) = (p, p);
+                    quantize_px(&mut x, levels, inv);
+                    quantize_px_float(&mut y, levels, inv);
+                    assert_eq!(x.map(f32::to_bits), y.map(f32::to_bits), "{p:?} at {levels} levels");
+                }
+            }
+        }
+    }
 }
