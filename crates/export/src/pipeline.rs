@@ -29,6 +29,8 @@ pub(crate) struct Cx<'a> {
     /// Files written to an overflow folder.
     pub overflowed: Mutex<Vec<String>>,
     written: Mutex<Vec<String>>,
+    /// A frame has rendered, so the layer cache holds what every frame shares.
+    warm: std::sync::atomic::AtomicBool,
 }
 
 impl<'a> std::ops::Deref for Cx<'a> {
@@ -76,7 +78,7 @@ impl<'a> Cx<'a> {
         let cache = LayerCache::default();
         // With deferred readbacks, buffers computed from a missed pass's placeholders are not kept.
         cache.set_gate(job.accel.and_then(|a| a.miss_gate()));
-        Cx { job, project, cache, frame_times, overflowed: Mutex::new(vec![]), written: Mutex::new(vec![]) }
+        Cx { job, project, cache, frame_times, overflowed: Mutex::new(vec![]), written: Mutex::new(vec![]), warm: std::sync::atomic::AtomicBool::new(false) }
     }
 
     pub fn comp(&self) -> Option<&Comp> {
@@ -133,7 +135,25 @@ impl<'a> Cx<'a> {
             return out;
         }
         use rayon::prelude::*;
-        ks.into_par_iter().map(|k| f(k, self.frame(comp, k))).collect()
+        // The job's first frame renders on its own: what every frame shares (still layers, the
+        // frames of comps nothing moves in, simulation checkpoints) is then in the cache once,
+        // instead of every frame of the first batch rendering its own copy at the same time.
+        let mut ks = ks.into_iter();
+        let mut out = Vec::with_capacity(ks.len());
+        if !self.warm.swap(true, std::sync::atomic::Ordering::AcqRel)
+            && let Some(k) = ks.next()
+        {
+            out.push(f(k, self.frame(comp, k)));
+        }
+        out.par_extend(ks.collect::<Vec<_>>().into_par_iter().map(|k| f(k, self.frame(comp, k))));
+        out
+    }
+
+    /// Frames rendered at the same time ([`crate::batch_size`]).
+    pub fn batch(&self) -> u64 {
+        let (w, h) = self.comp().map_or((1, 1), |c| (c.width, c.height));
+        let s = self.job.settings.resolution.clamp(0.01, 4.0);
+        crate::batch_size((w as f64 * s).ceil() as u32, (h as f64 * s).ceil() as u32, self.job.options.available_memory)
     }
 
     /// Output frame `i`: sampled (fields, pulldown), at the colour depth, cropped and resized.

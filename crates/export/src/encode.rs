@@ -10,7 +10,7 @@ use effectcraft_time::{FrameRate, TICKS_PER_SECOND, Tick};
 use filmcraft_isobmff::{Brand, FourCc, Mp4Writer, PcmConfig, SampleEntry, TrackConfig, WriteSample, WriterOptions};
 use rayon::prelude::*;
 
-use crate::{Cx, ExportError, Report, Result, State, batch_size, wants_audio};
+use crate::{Cx, ExportError, Report, Result, State, wants_audio};
 
 fn enc(e: impl std::fmt::Display) -> ExportError {
     ExportError::Encode(e.to_string())
@@ -263,7 +263,7 @@ pub(crate) async fn movie(job: &Cx<'_>, comp: &Comp, w: u32, h: u32, st: &mut St
         _ => Box::new(ProRes::new(w, h, job.output.prores_profile, if channels == Channels::Alpha { Channels::Rgb } else { channels })),
     };
     let brand = if fmt == OutputFormat::ProRes { Brand::Mov } else { Brand::Mp4 };
-    let batch = batch_size();
+    let batch = job.batch();
     let render = |_: u64, img: effectcraft_raster::Image| -> Vec<u8> { job.pixels(&img, comp, channels, w, h) };
 
     // Encode the first batch before creating tracks: encoders finalise their config on frame 1.

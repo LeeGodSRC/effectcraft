@@ -56,6 +56,7 @@ impl Exporter for FileExporter {
                     label: job.label.clone(),
                     storage: job.storage,
                     overflow: job.project.render_prefs.overflow_folders.clone(),
+                    available_memory: effectcraft_engine::sysinfo::memory().map(|m| m.available),
                 },
                 nested_switches: job.nested_switches,
             };
