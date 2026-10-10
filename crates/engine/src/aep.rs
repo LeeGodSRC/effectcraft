@@ -1014,15 +1014,18 @@ fn build_project(
                 }
             };
 
+            // A null object still points at its solid in the project: unnamed, the layer shows
+            // that item's name (expressions address it by it), and its effect points and anchor
+            // are measured in that solid's size.
+            let source_item = source.item().or_else(|| matches!(source, LayerSource::Null).then(|| footage_ids.get(&dlayer.source_item_id).copied()).flatten());
             let layer_name = if dlayer.name == "Layer" {
-                source
-                    .item()
+                source_item
                     .and_then(|id| project.item(id).map(|i| i.name.clone()).or_else(|| comp_names.get(&id).cloned()))
                     .unwrap_or_else(|| dlayer.name.clone())
             } else {
                 dlayer.name.clone()
             };
-            let source_size = source.item().and_then(|id| source_sizes.get(&id)).copied();
+            let source_size = source_item.and_then(|id| source_sizes.get(&id)).copied();
             let size = source_size.unwrap_or((dcomp.width, dcomp.height));
             let mut layer = build::layer(&mut project, &comp, &layer_name, source, size, Some(duration));
             // Imports preserve names, including duplicates used by expressions. The interactive
@@ -1052,11 +1055,46 @@ fn build_project(
                 return Err(format!("AEP layer {} references a missing parent", layer.name));
             }
             layer.preserve_transparency = dlayer.preserve_transparency;
+            // The stored number is the transfer mode of the public After Effects SDK
+            // (`PF_Xfer_*` in the effect API documentation).
             layer.blend_mode = match dlayer.blend {
                 0 | 2 => effectcraft_color::BlendMode::Normal,
+                3 => effectcraft_color::BlendMode::Dissolve,
                 4 => effectcraft_color::BlendMode::Add,
                 5 => effectcraft_color::BlendMode::Multiply,
                 6 => effectcraft_color::BlendMode::Screen,
+                7 => effectcraft_color::BlendMode::Overlay,
+                8 => effectcraft_color::BlendMode::SoftLight,
+                9 => effectcraft_color::BlendMode::HardLight,
+                10 => effectcraft_color::BlendMode::Darken,
+                11 => effectcraft_color::BlendMode::Lighten,
+                12 => effectcraft_color::BlendMode::ClassicDifference,
+                13 => effectcraft_color::BlendMode::Hue,
+                14 => effectcraft_color::BlendMode::Saturation,
+                15 => effectcraft_color::BlendMode::Color,
+                16 => effectcraft_color::BlendMode::Luminosity,
+                17 => effectcraft_color::BlendMode::StencilAlpha,
+                18 => effectcraft_color::BlendMode::StencilLuma,
+                19 => effectcraft_color::BlendMode::SilhouetteAlpha,
+                20 => effectcraft_color::BlendMode::SilhouetteLuma,
+                21 => effectcraft_color::BlendMode::LuminescentPremul,
+                22 => effectcraft_color::BlendMode::AlphaAdd,
+                23 => effectcraft_color::BlendMode::ClassicColorDodge,
+                24 => effectcraft_color::BlendMode::ClassicColorBurn,
+                25 => effectcraft_color::BlendMode::Exclusion,
+                26 => effectcraft_color::BlendMode::Difference,
+                27 => effectcraft_color::BlendMode::ColorDodge,
+                28 => effectcraft_color::BlendMode::ColorBurn,
+                29 => effectcraft_color::BlendMode::LinearDodge,
+                30 => effectcraft_color::BlendMode::LinearBurn,
+                31 => effectcraft_color::BlendMode::LinearLight,
+                32 => effectcraft_color::BlendMode::VividLight,
+                33 => effectcraft_color::BlendMode::PinLight,
+                34 => effectcraft_color::BlendMode::HardMix,
+                35 => effectcraft_color::BlendMode::LighterColor,
+                36 => effectcraft_color::BlendMode::DarkerColor,
+                37 => effectcraft_color::BlendMode::Subtract,
+                38 => effectcraft_color::BlendMode::Divide,
                 value => {
                     import_warnings.push(format!("{}: unsupported AEP blending mode {value}; using Normal", layer.name));
                     effectcraft_color::BlendMode::Normal

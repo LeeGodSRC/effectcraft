@@ -386,3 +386,37 @@ fn aep_camera_aims_at_its_point_of_interest_only_when_flagged() {
         assert!(!layer.switches.motion_blur, "a camera has no motion blur switch");
     }
 }
+
+#[test]
+fn aep_blending_modes_follow_the_documented_transfer_mode_numbers() {
+    use effectcraft_color::BlendMode;
+    for (stored, mode) in [
+        (2u32, BlendMode::Normal),
+        (4, BlendMode::Add),
+        (7, BlendMode::Overlay),
+        (9, BlendMode::HardLight),
+        (27, BlendMode::ColorDodge),
+        (38, BlendMode::Divide),
+    ] {
+        let mut bytes = fixture::project();
+        let offset = bytes.windows(4).position(|tag| tag == b"ldta").unwrap() + 8;
+        bytes[offset + 96..offset + 100].copy_from_slice(&stored.to_be_bytes());
+        let (project, report) = aep::from_aep_or_aepx_with_report(&bytes, None).unwrap();
+        let main = project.items.values().find(|item| item.name == "Main").unwrap().as_comp().unwrap();
+        assert_eq!(main.layers[0].blend_mode, mode, "stored {stored}");
+        assert!(!report.warnings.iter().any(|w| w.contains("blending mode")));
+    }
+}
+
+/// A null object is named after its solid (expressions address it by that name) and stays a null.
+#[test]
+fn aep_null_object_takes_the_name_of_its_solid() {
+    let mut bytes = fixture::project();
+    let nested = bytes.windows(6).position(|w| w == b"Nested").unwrap();
+    let offset = nested + bytes[nested..].windows(4).position(|tag| tag == b"ldta").unwrap() + 8;
+    bytes[offset + 36..offset + 40].copy_from_slice(&(7u32 | 0x8000).to_be_bytes());
+    let (project, _) = aep::from_aep_or_aepx_with_report(&bytes, None).unwrap();
+    let comp = project.items.values().find(|item| item.name == "Nested").unwrap().as_comp().unwrap();
+    assert!(matches!(comp.layers[0].source, LayerSource::Null));
+    assert_eq!(comp.layers[0].name, "Original solid");
+}
