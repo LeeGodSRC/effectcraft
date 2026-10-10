@@ -1098,31 +1098,23 @@ fn pw_state(ctx: &EffectCtx, phys: &Phys) -> std::sync::Arc<PState> {
     if revision == 0 { run(&SimCache::new(1)) } else { run(&PW_CACHE) }
 }
 
-/// How much of a textured polygon's hue reaches its pixels (the rest stays the texture's own).
-const PW_TEXTURE_TINT: f32 = 0.33;
+/// How strongly a textured polygon's Color Map colour shades its texture.
+const PW_TEXTURE_SHADE: f32 = 0.5;
 /// The opacity of a textured polygon at Max Opacity 100.
 const PW_TEXTURE_OPACITY: f32 = 0.8;
 
 /// A particle's colour at its age, by Color Map (Birth to Death, Origin to Death, Birth to
 /// Origin, Origin Constant, Custom); Origin is the particle's own (white) colour.
 ///
-/// Textured polygons (`textured`) take a pastel tint whose hue runs once round the colour wheel
-/// from the first colour's hue up to the second's, at [`PW_TEXTURE_OPACITY`]. This is fitted to
-/// rendered frames, not derived from a published description.
+/// Textured polygons (`textured`) are shaded instead of coloured: the map's colour, read from
+/// its death end at birth to its birth end at death, is taken out of the texture at
+/// [`PW_TEXTURE_SHADE`], and they draw at [`PW_TEXTURE_OPACITY`]. Both are fitted to rendered
+/// frames, not derived from a published description.
 fn pw_color(ctx: &EffectCtx, q: &Particle, birth: [f32; 4], death: [f32; 4], opacity: f32, textured: bool) -> [f32; 4] {
     let u = (q.age / q.life.max(1e-4)).clamp(0.0, 1.0);
+    let u = if textured { 1.0 - u } else { u };
     let white = [1.0f32; 4];
-    let between = |a: [f32; 4], b: [f32; 4], f: f32| -> [f32; 4] {
-        if !textured {
-            return std::array::from_fn(|k| a[k] + (b[k] - a[k]) * f);
-        }
-        let (ha, sa, _) = effectcraft_color::rgb_to_hsl(a[0], a[1], a[2]);
-        let (hb, sb, _) = effectcraft_color::rgb_to_hsl(b[0], b[1], b[2]);
-        let hb = if hb <= ha && sb > 0.0 && sa > 0.0 { hb + 1.0 } else { hb };
-        let k = (sa + (sb - sa) * f).clamp(0.0, 1.0) * PW_TEXTURE_TINT;
-        let (r, g, bl) = effectcraft_color::hsl_to_rgb(ha + (hb - ha) * f, 1.0, 0.5);
-        [1.0 + (r - 1.0) * k, 1.0 + (g - 1.0) * k, 1.0 + (bl - 1.0) * k, 1.0]
-    };
+    let between = |a: [f32; 4], b: [f32; 4], f: f32| -> [f32; 4] { std::array::from_fn(|k| a[k] + (b[k] - a[k]) * f) };
     let mut color = match ctx.params.e("particle/colorMap") {
         1 => between(white, death, u),
         2 => between(birth, white, u),
@@ -1138,6 +1130,9 @@ fn pw_color(ctx: &EffectCtx, q: &Particle, birth: [f32; 4], death: [f32; 4], opa
         }
         _ => between(birth, death, u),
     };
+    if textured {
+        color = color.map(|c| 1.0 - PW_TEXTURE_SHADE * c.clamp(0.0, 1.0));
+    }
     color[3] = if textured { opacity * PW_TEXTURE_OPACITY } else { opacity };
     color
 }
