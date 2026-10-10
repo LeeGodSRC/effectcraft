@@ -53,6 +53,8 @@ fn turbulent_displace_and_cc_lens() {
     effect_case("ec.distort.cclens", &[("size", n(70.0))]);
     effect_case("ec.distort.cclens", &[("size", n(45.0)), ("convergence", n(60.0)), ("center", Value::Vec2([30.0, 20.0]))]);
     effect_case("ec.distort.cclens", &[("convergence", n(-70.0))]);
+    effect_case("ec.distort.cclens", &[("size", n(230.0)), ("convergence", n(100.0))]);
+    effect_case("ec.distort.cclens", &[("size", n(0.0))]);
 }
 
 /// Effect `id` on a shape layer, whose comp-sized bounds are centred on its origin and whose

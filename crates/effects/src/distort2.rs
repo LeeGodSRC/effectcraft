@@ -605,19 +605,27 @@ fn bend_it(ctx: &EffectCtx, mut b: Buf) -> Buf {
 
 fn cc_lens(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let c = b.to_px(ctx.params.v2("center"));
-    let (_, _, lw, lh) = layer_rect(ctx, &b);
-    let r = (ctx.params.f("size") / 100.0 * lw.max(lh) * 0.5).max(0.5);
-    let k = 2f64.powf(ctx.params.f("convergence") / 50.0);
+    let (_, _, _, lh) = layer_rect(ctx, &b);
+    // Cycore's public manual specifies a circular lens and signed distortion,
+    // but no equation or size units. Height-relative diameter and interpolation
+    // between planar and spherical radii are inferred from reference renders.
+    // Do not exponentiate the radius: that makes the centre's magnification
+    // unbounded and turns a large lens into a nearly constant centre sample.
+    let r = (ctx.params.f("size") / 100.0 * lh * 0.5).max(0.0);
+    let convergence = ctx.params.f("convergence");
+    let convergence = if convergence.is_finite() { (convergence / 100.0).clamp(-1.0, 1.0) } else { 0.0 };
     b.img = remap(&b.img, false, |x, y| {
         let (dx, dy) = (x - c.0, y - c.1);
         let d = (dx * dx + dy * dy).sqrt();
-        if d >= r {
+        if !r.is_finite() || d >= r {
             return None;
         }
-        if d < 1e-9 {
+        if d < 1e-9 || convergence == 0.0 {
             return Some((x, y));
         }
-        let g = ((d / r).asin() / FRAC_PI_2).powf(k);
+        let u = (d / r).clamp(0.0, 1.0);
+        let spherical = if convergence >= 0.0 { u.asin() / FRAC_PI_2 } else { (u * FRAC_PI_2).sin() };
+        let g = u + (spherical - u) * convergence.abs();
         let s = r * g / d;
         Some((c.0 + dx * s, c.1 + dy * s))
     });
@@ -1023,6 +1031,43 @@ mod tests {
         let o = run("ec.distort.cclens", &[], img);
         assert!(o.img.get(0, 0)[3] < 1e-6);
         assert!(o.img.get(16, 16)[3] > 0.99);
+    }
+
+    #[test]
+    fn cc_lens_zero_convergence_preserves_pixels_inside_height_sized_circle() {
+        let img = test_img(80, 40);
+        let out = run("ec.distort.cclens", &[("size", num(100.0)), ("convergence", num(0.0))], img.clone());
+        for y in 0..40 {
+            for x in 0..80 {
+                let inside = (x as f64 + 0.5 - 40.0).hypot(y as f64 + 0.5 - 20.0) < 20.0;
+                if inside {
+                    assert_eq!(out.img.get(x, y), img.get(x, y));
+                } else {
+                    assert_eq!(out.img.get(x, y), [0.0; 4]);
+                }
+            }
+        }
+        let empty = run("ec.distort.cclens", &[("size", num(0.0))], img);
+        assert!(empty.img.data.iter().all(|p| *p == [0.0; 4]));
+    }
+
+    #[test]
+    fn cc_lens_signed_convergence_keeps_centre_detail_and_covers_large_lens() {
+        // Encode source coordinates in colour, so sampling positions can be measured.
+        let mut img = Image::new(80, 40);
+        for y in 0..40 {
+            for x in 0..80 {
+                img.set(x, y, [(x as f32 + 0.5) / 80.0, (y as f32 + 0.5) / 40.0, 0.0, 1.0]);
+            }
+        }
+        let positive = run("ec.distort.cclens", &[("size", num(230.0)), ("convergence", num(100.0))], img.clone());
+        assert!(positive.img.data.iter().all(|p| p[3] > 0.999));
+        let a = positive.img.get(40, 20)[0];
+        let b = positive.img.get(41, 20)[0];
+        assert!((b - a) * 80.0 > 0.6, "finite magnification must retain the centre's slope");
+        let negative = run("ec.distort.cclens", &[("size", num(230.0)), ("convergence", num(-100.0))], img.clone());
+        assert!(positive.img.get(50, 20)[0] < img.get(50, 20)[0]);
+        assert!(negative.img.get(50, 20)[0] > img.get(50, 20)[0]);
     }
 
     /// A host whose every layer is a flat 8×8 image of `px`.
