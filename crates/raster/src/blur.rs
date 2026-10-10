@@ -172,7 +172,8 @@ fn radii(rx: &[usize], ry: &[usize]) -> (Vec<usize>, Vec<usize>) {
 /// ([`box_h_into`]), or without any the first vertical pass. Returns the buffer and how many
 /// vertical passes are done.
 fn first_stage(src: &[Px], w: usize, h: usize, h_radii: &[usize], v_radii: &[usize], repeat: bool) -> (Vec<Px>, usize) {
-    let mut out = vec![[0.0; 4]; src.len()];
+    // (Every pass writes all of its output.)
+    let mut out = crate::pool::scratch(src.len());
     if !h_radii.is_empty() {
         box_h_into(src, &mut out, w, h_radii, repeat);
         return (out, 0);
@@ -193,9 +194,12 @@ fn first_stage(src: &[Px], w: usize, h: usize, h_radii: &[usize], v_radii: &[usi
 /// length, allocated when a pass needs one and none is given).
 fn v_stages(mut cur: Vec<Px>, mut spare: Option<Vec<Px>>, w: usize, h: usize, radii: &[usize], repeat: bool) -> Vec<Px> {
     for &r in radii {
-        let out = spare.get_or_insert_with(|| vec![[0.0; 4]; cur.len()]);
+        let out = spare.get_or_insert_with(|| crate::pool::scratch(cur.len()));
         box_v_into(&cur, out, w, h, r, repeat);
         std::mem::swap(&mut cur, out);
+    }
+    if let Some(spare) = spare {
+        crate::pool::recycle(spare);
     }
     cur
 }
@@ -296,11 +300,15 @@ fn axis_kernel(d: f64, length: f64, n: usize) -> (i64, Vec<f32>) {
 fn axis_blur(img: &Image, kernel: &(i64, Vec<f32>), horizontal: bool) -> Image {
     let (first, weights) = kernel;
     let (w, h) = (img.width as i64, img.height as i64);
-    let mut out = Image::new(img.width, img.height);
+    // (Rows are written whole; columns accumulate from transparent.)
+    let mut out = if horizontal { Image::scratch(img.width, img.height) } else { Image::new(img.width, img.height) };
     let stride = img.width.max(1) as usize;
     out.rows_mut().for_each(|(y, row)| {
         if horizontal {
-            let Some(src) = img.data.get(y * stride..(y + 1) * stride) else { return };
+            let Some(src) = img.data.get(y * stride..(y + 1) * stride) else {
+                row.fill([0.0; 4]);
+                return;
+            };
             for (x, px) in row.iter_mut().enumerate() {
                 // Kernel index j reads source column x + first + j.
                 let j0 = (-(x as i64 + first)).clamp(0, weights.len() as i64) as usize;

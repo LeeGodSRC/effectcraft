@@ -37,7 +37,7 @@ fn half(src: &Image, axes: [bool; 2]) -> Image {
     let w = src.width.div_ceil(step_x).max(1);
     let h = src.height.div_ceil(step_y).max(1);
     let weight = 1.0 / (step_x * step_y) as f32;
-    let mut out = Image::new(w, h);
+    let mut out = Image::scratch(w, h);
     out.rows_mut().for_each(|(y, row)| {
         for (x, px) in row.iter_mut().enumerate() {
             let (sx, sy) = (step_x as i64 * x as i64, step_y as i64 * y as i64);
@@ -62,7 +62,15 @@ fn half(src: &Image, axes: [bool; 2]) -> Image {
 /// bilinear without bounds checks, integer-translation copies, inlined Normal blending); it
 /// matches [`composite_warp_reference`] to float rounding.
 pub fn composite_warp(dst: &mut Image, src: &Image, m: &Mat3, opts: &WarpOpts) {
-    composite_warp_impl(dst, src, m, opts, true, None);
+    composite_warp_impl(dst, src, m, opts, true, None, None);
+}
+
+/// [`composite_warp`] into an integer comp's canvas: every pixel written is rounded to `levels`
+/// steps ([`crate::quantize_px`]) as it is blended, instead of in a second pass over the canvas.
+/// `false` when the transform or mode takes the general path, which does not: the caller then
+/// quantises the pixels the layer may have changed.
+pub fn composite_warp_quantized(dst: &mut Image, src: &Image, m: &Mat3, opts: &WarpOpts, levels: f32) -> bool {
+    composite_warp_impl(dst, src, m, opts, true, None, Some(levels))
 }
 
 /// `dst += warp(src) · weight` (plain sum, no blending): motion-blur sub-samples accumulate
@@ -70,7 +78,7 @@ pub fn composite_warp(dst: &mut Image, src: &Image, m: &Mat3, opts: &WarpOpts) {
 pub fn accumulate_warp(dst: &mut Image, src: &Image, m: &Mat3, sampling: Sampling, weight: f32) {
     let opts = WarpOpts { sampling, ..Default::default() };
     if m.is_affine() && m.inverse().is_some_and(|i| i.is_affine()) {
-        composite_warp_impl(dst, src, m, &opts, true, Some(weight));
+        composite_warp_impl(dst, src, m, &opts, true, Some(weight), None);
         return;
     }
     let mut tmp = Image::new(dst.width, dst.height);
@@ -84,7 +92,7 @@ pub fn accumulate_warp(dst: &mut Image, src: &Image, m: &Mat3, sampling: Samplin
 
 /// The straightforward per-pixel implementation (reference for the fast path's tests).
 pub fn composite_warp_reference(dst: &mut Image, src: &Image, m: &Mat3, opts: &WarpOpts) {
-    composite_warp_impl(dst, src, m, opts, false, None);
+    composite_warp_impl(dst, src, m, opts, false, None, None);
 }
 
 /// Bilinear blend of four taps (same operation order as [`Image::sample_bilinear`]).
@@ -213,11 +221,14 @@ fn affine_rows(
     });
 }
 
-fn composite_warp_impl(dst: &mut Image, src: &Image, m: &Mat3, opts: &WarpOpts, allow_fast: bool, accumulate: Option<f32>) {
+/// `levels`: quantise as it blends (the fast affine paths only). Returns whether it did (also
+/// when there was nothing to draw).
+#[allow(clippy::too_many_arguments)]
+fn composite_warp_impl(dst: &mut Image, src: &Image, m: &Mat3, opts: &WarpOpts, allow_fast: bool, accumulate: Option<f32>, levels: Option<f32>) -> bool {
     if src.is_empty() || dst.is_empty() || opts.opacity <= 0.0 {
-        return;
+        return true;
     }
-    let Some(inv) = m.inverse() else { return };
+    let Some(inv) = m.inverse() else { return true };
     // Measure the destination pixel's footprint along each source axis. A mean
     // scale blurred both axes of highly nonuniform transforms, erasing detail
     // along an unscaled axis (e.g. tick marks on a narrow vertical strip).
@@ -250,7 +261,7 @@ fn composite_warp_impl(dst: &mut Image, src: &Image, m: &Mat3, opts: &WarpOpts, 
         area = area.intersect(&c);
     }
     if area.is_empty() {
-        return;
+        return true;
     }
     let (x0, x1) = (area.x0.max(0.0) as usize, area.x1.min(dst.width as f64) as usize);
     let (y0, y1) = (area.y0.max(0.0) as usize, area.y1.min(dst.height as f64) as usize);
@@ -262,21 +273,26 @@ fn composite_warp_impl(dst: &mut Image, src: &Image, m: &Mat3, opts: &WarpOpts, 
         && affine
     {
         affine_rows(dst, img, &inv, opts.sampling, 1.0, x0, x1, y0, y1, |d, s, _, _| [d[0] + s[0] * k, d[1] + s[1] * k, d[2] + s[2] * k, d[3] + s[3] * k]);
-        return;
+        return false;
     }
     if allow_fast && affine && !mode.is_stencil() {
+        let inv_levels = levels.map_or(1.0, |l| 1.0 / l);
+        let fin = move |p: Px| match levels {
+            Some(l) => crate::quantize_px(p, l, inv_levels),
+            None => p,
+        };
         match mode {
             BlendMode::Normal => affine_rows(dst, img, &inv, opts.sampling, op, x0, x1, y0, y1, |d, s, _, _| {
                 let k = 1.0 - s[3];
-                [s[0] + d[0] * k, s[1] + d[1] * k, s[2] + d[2] * k, s[3] + d[3] * k]
+                fin([s[0] + d[0] * k, s[1] + d[1] * k, s[2] + d[2] * k, s[3] + d[3] * k])
             }),
             BlendMode::Dissolve | BlendMode::DancingDissolve => {
                 let seed = opts.seed;
-                affine_rows(dst, img, &inv, opts.sampling, op, x0, x1, y0, y1, |d, s, x, y| blend_pixel(mode, d, s, hash_noise(x, y, seed)))
+                affine_rows(dst, img, &inv, opts.sampling, op, x0, x1, y0, y1, |d, s, x, y| fin(blend_pixel(mode, d, s, hash_noise(x, y, seed))))
             }
-            _ => affine_rows(dst, img, &inv, opts.sampling, op, x0, x1, y0, y1, |d, s, _, _| blend_pixel(mode, d, s, 0.5)),
+            _ => affine_rows(dst, img, &inv, opts.sampling, op, x0, x1, y0, y1, |d, s, _, _| fin(blend_pixel(mode, d, s, 0.5))),
         }
-        return;
+        return true;
     }
     dst.data.par_chunks_mut(w).enumerate().skip(y0).take(y1 - y0).for_each(|(y, row)| {
         let fy = y as f64 + 0.5;
@@ -323,6 +339,7 @@ fn composite_warp_impl(dst: &mut Image, src: &Image, m: &Mat3, opts: &WarpOpts, 
             }
         }
     }
+    false
 }
 
 /// Resize with bilinear filtering (box pre-filter when shrinking).
@@ -339,6 +356,36 @@ pub fn resample(src: &Image, w: u32, h: u32) -> Image {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Quantising as the layer is blended leaves the canvas as blending and then rounding the
+    /// whole canvas does.
+    #[test]
+    fn quantising_while_blending_matches_a_second_pass() {
+        let (levels, inv) = (255.0f32, 1.0 / 255.0);
+        let mut src = Image::new(40, 30);
+        for (i, p) in src.data.iter_mut().enumerate() {
+            let a = ((i * 37) % 11) as f32 / 10.0;
+            *p = [a * 0.3, a * ((i % 7) as f32 / 6.0), a * 0.9, a];
+        }
+        let mut below = Image::filled(64, 48, [0.25, 0.5, 0.125, 0.75]);
+        below.data.iter_mut().for_each(|p| *p = crate::quantize_px(*p, levels, inv));
+        for m in [Mat3::translate(vec2(7.0, 5.0)), Mat3::translate(vec2(7.4, 5.2)), Mat3::translate(vec2(3.0, 2.0)) * Mat3::scale(vec2(1.7, 0.6))] {
+            for mode in [BlendMode::Normal, BlendMode::Screen, BlendMode::Dissolve] {
+                for sampling in [Sampling::Nearest, Sampling::Bilinear, Sampling::Bicubic] {
+                    let opts = WarpOpts { sampling, opacity: 0.8, mode, seed: 3, clip: None };
+                    let mut two = below.clone();
+                    composite_warp(&mut two, &src, &m, &opts);
+                    two.data.iter_mut().for_each(|p| *p = crate::quantize_px(*p, levels, inv));
+                    let mut one = below.clone();
+                    assert!(composite_warp_quantized(&mut one, &src, &m, &opts, levels));
+                    assert!(one == two, "{mode:?} {sampling:?}");
+                }
+            }
+        }
+        // A stencil mode takes the general path: the caller quantises.
+        let opts = WarpOpts { mode: BlendMode::StencilAlpha, ..Default::default() };
+        assert!(!composite_warp_quantized(&mut below.clone(), &src, &Mat3::translate(vec2(7.0, 5.0)), &opts, levels));
+    }
 
     #[test]
     fn nonuniform_minification_preserves_unscaled_stripes_and_edges() {

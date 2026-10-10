@@ -410,7 +410,7 @@ pub fn sample(img: &Image, x: f64, y: f64, clamp: bool) -> Px {
 
 /// Inverse-mapped warp: each output pixel samples the source at `f(x, y)` (pixel centres +0.5).
 pub fn remap(src: &Image, clamp: bool, f: impl Fn(f64, f64) -> Option<(f64, f64)> + Sync) -> Image {
-    let mut out = Image::new(src.width, src.height);
+    let mut out = Image::scratch(src.width, src.height);
     out.rows_mut().for_each(|(y, row)| {
         for (x, px) in row.iter_mut().enumerate() {
             *px = match f(x as f64 + 0.5, y as f64 + 0.5) {

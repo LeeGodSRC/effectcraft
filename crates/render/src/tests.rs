@@ -639,3 +639,64 @@ fn layer_parameters_see_a_whole_shape_layer() {
         assert!(f.get(x, y)[3] < 0.01, "outside at ({x}, {y}): {:?}", f.get(x, y));
     }
 }
+
+/// A layer with a 2D track matte is composited in one pass over the canvas, reading buffers that
+/// land on whole pixels in place: the same pixels, bit for bit, as drawing the layer and its
+/// matte into canvas-sized images, multiplying, blending and quantising.
+#[test]
+fn matted_layers_composite_in_one_pass_like_the_isolated_way() {
+    use crate::{NoFootage, RenderOpts, Renderer};
+    use effectcraft_raster::Image;
+    for kind in [MatteKind::Alpha, MatteKind::AlphaInverted, MatteKind::Luma, MatteKind::LumaInverted] {
+        // Whole-pixel and sub-pixel matte positions, and a fill larger than the comp or off it.
+        for (matte_pos, fill_size, fill_pos) in [
+            ([50.0, 40.0], (200, 100), [100.0, 50.0]),
+            ([50.3, 40.6], (200, 100), [100.0, 50.0]),
+            ([70.0, 30.0], (260, 140), [90.0, 60.0]),
+            ([70.0, 30.0], (120, 60), [100.5, 50.0]),
+        ] {
+            let mut p = Project::default();
+            p.settings.bit_depth = effectcraft_project::BitDepth::Bpc8;
+            let comp = Comp::new(200, 100, FrameRate::FPS_30, Tick::from_seconds_f64(2.0));
+            let cid = p.add_item("Comp", Label::Sandstone, None, ItemKind::Comp(comp.clone().into()));
+            let mut matte = solid(&mut p, &comp, [0.9, 0.5, 0.1], 60, 40);
+            matte.props.prop_mut("transform/position").unwrap().value = Value::Vec3([matte_pos[0], matte_pos[1], 0.0]);
+            matte.props.prop_mut("transform/opacity").unwrap().value = Value::Scalar(50.0);
+            matte.switches.video = false;
+            let mut fill = solid(&mut p, &comp, [0.2, 0.4, 1.0], fill_size.0, fill_size.1);
+            fill.props.prop_mut("transform/position").unwrap().value = Value::Vec3([fill_pos[0], fill_pos[1], 0.0]);
+            fill.track_matte = Some(TrackMatte { layer: matte.id, kind });
+            fill.blend_mode = BlendMode::Screen;
+            let fill_id = fill.id;
+            let c = p.comp_mut(cid).unwrap();
+            c.layers.push(matte);
+            c.layers.push(fill);
+            let r = Renderer::new(&p, &NoFootage, RenderOpts::default());
+            let ctx = r.eval_ctx(cid, Tick::ZERO).unwrap();
+            let fill = ctx.comp.layer(fill_id).unwrap();
+            let buf = r.layer_buf(&ctx, fill).unwrap();
+            // (A canvas is on the 8 bpc grid before every layer.)
+            let mut below = Image::filled(200, 100, [0.4, 0.2, 0.6, 0.8]);
+            r.pipe.quantize(&mut below);
+
+            let mut expected = below.clone();
+            let mut iso = Image::new(200, 100);
+            r.place(&ctx, fill, &buf, &mut iso, BlendMode::Normal, 1.0);
+            r.composite_iso(&ctx, fill, iso, &mut expected, 0.7);
+            r.pipe.quantize(&mut expected);
+
+            let mut got = below.clone();
+            assert!(r.composite_layer(&ctx, fill, &buf, &mut got, 0.7), "the pixels written are quantised");
+            if let Some(i) = got.data.iter().zip(&expected.data).position(|(a, b)| a != b) {
+                panic!(
+                    "{kind:?}, matte at {matte_pos:?}, fill {fill_size:?} at {fill_pos:?}: pixel ({}, {}) is {:?}, expected {:?}",
+                    i % 200,
+                    i / 200,
+                    got.data[i],
+                    expected.data[i]
+                );
+            }
+            assert!(got != below);
+        }
+    }
+}

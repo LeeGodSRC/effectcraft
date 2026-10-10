@@ -1882,11 +1882,24 @@ impl<'a> Renderer<'a> {
 
     /// Draw a processed layer into `target` (transform, motion blur) with `mode`/`opacity`.
     fn place(&self, ctx: &EvalCtx, layer: &Layer, buf: &Buf, target: &mut Image, mode: BlendMode, opacity: f32) {
+        self.place_quantized(ctx, layer, buf, target, mode, opacity, None);
+    }
+
+    /// [`Self::place`] into an integer comp's canvas, rounding the pixels it writes to `levels`
+    /// steps as it blends them. `false` when it could not (a perspective transform, a stencil
+    /// mode): the caller then quantises the layer's footprint.
+    #[allow(clippy::too_many_arguments)]
+    fn place_quantized(&self, ctx: &EvalCtx, layer: &Layer, buf: &Buf, target: &mut Image, mode: BlendMode, opacity: f32, levels: Option<f32>) -> bool {
         let pl = self.placement(ctx, layer, buf);
         let opts = WarpOpts { sampling: pl.sampling, opacity, mode, seed: pl.seed, clip: None };
         if let [m] = pl.matrices.as_slice() {
-            composite_warp(target, &buf.img, m, &opts);
-            return;
+            return match levels {
+                Some(l) => effectcraft_raster::composite_warp_quantized(target, &buf.img, m, &opts, l),
+                None => {
+                    composite_warp(target, &buf.img, m, &opts);
+                    true
+                }
+            };
         }
         // Sub-samples sum straight into one buffer (each warp is row-parallel).
         let mut acc = Image::new(target.width, target.height);
@@ -1894,7 +1907,90 @@ impl<'a> Renderer<'a> {
         for m in &pl.matrices {
             effectcraft_raster::accumulate_warp(&mut acc, &buf.img, m, opts.sampling, k);
         }
-        target.blend_from(&acc, mode, opacity, pl.seed);
+        target.blend_from_quantized(&acc, mode, opacity, pl.seed, levels);
+        // (Stencil modes change pixels the blend does not visit.)
+        !mode.is_stencil()
+    }
+
+    /// Where `buf` lands in the output when placing it is a whole-pixel shift: every output
+    /// pixel is then one of the buffer's own, and the buffer can be read in place instead of
+    /// being drawn into a canvas-sized copy first.
+    fn aligned(&self, ctx: &EvalCtx, layer: &Layer, buf: &Buf) -> Option<(i64, i64)> {
+        // (Bicubic clamps negative samples even at pixel centres.)
+        if self.sampling(layer) == effectcraft_raster::Sampling::Bicubic {
+            return None;
+        }
+        let pl = self.placement(ctx, layer, buf);
+        let [m] = pl.matrices.as_slice() else { return None };
+        let k = &m.0;
+        let whole = |v: f64| v == v.round() && v.abs() < 1e9;
+        (m.is_affine() && k[0][0] == 1.0 && k[1][1] == 1.0 && k[0][1] == 0.0 && k[1][0] == 0.0 && whole(k[0][2]) && whole(k[1][2]))
+            .then(|| (k[0][2] as i64, k[1][2] as i64))
+    }
+
+    /// Composite a layer through its 2D track matte in one pass over the canvas: source pixel ×
+    /// matte factor, blended and (integer comps) quantised. Buffers that land on whole pixels
+    /// are read in place; the others are drawn into a canvas-sized image first.
+    fn composite_matted(&self, ctx: &EvalCtx, layer: &Layer, buf: &Buf, canvas: &mut Image, opacity: f32, matte: (&Layer, MatteKind)) {
+        let (m, kind) = matte;
+        let (w, h) = (canvas.width, canvas.height);
+        let drawn;
+        let src = match self.aligned(ctx, layer, buf) {
+            Some((dx, dy)) => Rows::Aligned { img: &buf.img, dx, dy, k: 1.0 },
+            None => {
+                let mut iso = Image::new(w, h);
+                self.place(ctx, layer, buf, &mut iso, BlendMode::Normal, 1.0);
+                drawn = iso;
+                Rows::Placed(&drawn)
+            }
+        };
+        let matte_buf = if m.is_active_at(ctx.time) { self.layer_buf(ctx, m) } else { None };
+        let matte_drawn;
+        let matte_rows = match &matte_buf {
+            None => Rows::Empty,
+            Some(mb) => {
+                let mo = ctx.opacity(m) as f32;
+                match self.aligned(ctx, m, mb) {
+                    Some((dx, dy)) if mo > 0.0 => Rows::Aligned { img: &mb.img, dx, dy, k: mo },
+                    _ => {
+                        let mut mimg = Image::new(w, h);
+                        self.place(ctx, m, mb, &mut mimg, BlendMode::Normal, mo);
+                        matte_drawn = mimg;
+                        Rows::Placed(&matte_drawn)
+                    }
+                }
+            }
+        };
+        let (mode, seed) = (layer.blend_mode, layer.id.0 as u32);
+        let levels = self.pipe.levels;
+        let inv = levels.map_or(1.0, |l| 1.0 / l);
+        let (stencil, dissolve) = (mode.is_stencil(), matches!(mode, BlendMode::Dissolve | BlendMode::DancingDissolve));
+        let wu = w.max(1) as usize;
+        canvas.data.par_chunks_mut(wu).enumerate().for_each_init(
+            || (Vec::new(), Vec::new()),
+            |(a, b), (y, row)| {
+                let (s, q) = (src.row(y, row.len(), a), matte_rows.row(y, row.len(), b));
+                for (x, (d, (s, q))) in row.iter_mut().zip(s.iter().zip(q)).enumerate() {
+                    let k = match kind {
+                        MatteKind::Alpha => q[3],
+                        MatteKind::AlphaInverted => 1.0 - q[3],
+                        MatteKind::Luma => effectcraft_color::luminance(q[0], q[1], q[2]),
+                        MatteKind::LumaInverted => 1.0 - effectcraft_color::luminance(q[0], q[1], q[2]),
+                    }
+                    .clamp(0.0, 1.0);
+                    let sp = s.map(|c| c * k);
+                    if sp[3] <= 0.0 && !stencil {
+                        continue;
+                    }
+                    let n = if dissolve { effectcraft_raster::hash_noise(x as u32, y as u32, seed) } else { 0.5 };
+                    let px = effectcraft_color::blend_pixel(mode, *d, sp.map(|c| c * opacity), n);
+                    *d = match levels {
+                        Some(l) => effectcraft_raster::quantize_px(px, l, inv),
+                        None => px,
+                    };
+                }
+            },
+        );
     }
 
     /// Draw a 2D layer into `canvas`; returns the region it may have changed.
@@ -1917,8 +2013,8 @@ impl<'a> Renderer<'a> {
         let st = self.styled_to_blend(st);
         let t1 = web_time::Instant::now();
         let changed = if st.plain {
-            self.composite_layer(ctx, layer, &st.body, canvas, opacity);
-            self.footprint(ctx, layer, &st.body, opacity, blank)
+            // (Quantised while blending: nothing left to round.)
+            if self.composite_layer(ctx, layer, &st.body, canvas, opacity) { Region::Empty } else { self.footprint(ctx, layer, &st.body, opacity, blank) }
         } else {
             self.composite_styled(ctx, layer, &st, canvas, opacity);
             Region::Full
@@ -1972,16 +2068,26 @@ impl<'a> Renderer<'a> {
         });
     }
 
-    fn composite_layer(&self, ctx: &EvalCtx, layer: &Layer, buf: &Buf, canvas: &mut Image, opacity: f32) {
-        let matte = layer.track_matte.is_some_and(|tm| tm.layer != layer.id && ctx.comp.layer(tm.layer).is_some());
-        if !matte && !layer.preserve_transparency {
-            self.place(ctx, layer, buf, canvas, layer.blend_mode, opacity);
-            return;
+    /// Composite a plain (unstyled) layer. `true` when the pixels it wrote are already rounded to
+    /// the comp's bit depth; otherwise the caller quantises the layer's footprint.
+    fn composite_layer(&self, ctx: &EvalCtx, layer: &Layer, buf: &Buf, canvas: &mut Image, opacity: f32) -> bool {
+        let matte = layer.track_matte.and_then(|tm| ctx.comp.layer(tm.layer).filter(|m| m.id != layer.id).map(|m| (m, tm.kind)));
+        if matte.is_none() && !layer.preserve_transparency {
+            return self.place_quantized(ctx, layer, buf, canvas, layer.blend_mode, opacity, self.pipe.levels);
+        }
+        // A 2D matte: one pass. (A 3D matte is seen through the camera, see `composite_iso_with`.)
+        if let Some(matte) = matte
+            && !layer.preserve_transparency
+            && !matte.0.is_3d()
+        {
+            self.composite_matted(ctx, layer, buf, canvas, opacity, matte);
+            return !layer.blend_mode.is_stencil();
         }
         // Render in isolation, then matte / preserve transparency, then blend.
         let mut iso = Image::new(canvas.width, canvas.height);
         self.place(ctx, layer, buf, &mut iso, BlendMode::Normal, 1.0);
         self.composite_iso(ctx, layer, iso, canvas, opacity);
+        false
     }
 
     /// Apply the track matte / preserve transparency to an isolated layer render, then blend.
@@ -2070,6 +2176,52 @@ impl<'a> Renderer<'a> {
                 c[i] += (a[i] - c[i]) * k;
             }
         });
+    }
+}
+
+/// Canvas rows of a layer drawn alone (see [`Renderer::composite_matted`]).
+enum Rows<'i> {
+    /// Nothing: every pixel transparent.
+    Empty,
+    /// A canvas-sized image.
+    Placed(&'i Image),
+    /// A buffer `dx`, `dy` whole pixels into the canvas, its pixels scaled by `k` (opacity).
+    Aligned { img: &'i Image, dx: i64, dy: i64, k: f32 },
+}
+
+impl Rows<'_> {
+    /// The `w` pixels of canvas row `y`: the image's own row where it spans it, else put
+    /// together in `scratch`.
+    fn row<'s>(&'s self, y: usize, w: usize, scratch: &'s mut Vec<effectcraft_raster::Px>) -> &'s [effectcraft_raster::Px] {
+        let (img, dx, dy, k) = match *self {
+            Rows::Empty => (None, 0, 0, 1.0),
+            Rows::Placed(img) => (Some(img), 0, 0, 1.0),
+            Rows::Aligned { img, dx, dy, k } => (Some(img), dx, dy, k),
+        };
+        let src = img.and_then(|img| {
+            let sy = usize::try_from(y as i64 - dy).ok()?;
+            let iw = img.width as usize;
+            img.data.get(sy.checked_mul(iw)?..sy.checked_mul(iw)?.checked_add(iw)?)
+        });
+        // Canvas x of the row's first pixel is `dx`.
+        if let Some(src) = src
+            && k == 1.0
+            && dx <= 0
+            && let Some(part) = src.get(dx.unsigned_abs() as usize..).and_then(|r| r.get(..w))
+        {
+            return part;
+        }
+        scratch.clear();
+        scratch.resize(w, [0.0; 4]);
+        if let Some(src) = src {
+            let (x0, s0) = if dx >= 0 { (dx as usize, 0) } else { (0, dx.unsigned_abs() as usize) };
+            if let (Some(dst), Some(src)) = (scratch.get_mut(x0.min(w)..), src.get(s0.min(src.len())..)) {
+                for (d, s) in dst.iter_mut().zip(src) {
+                    *d = s.map(|c| c * k);
+                }
+            }
+        }
+        scratch
     }
 }
 
