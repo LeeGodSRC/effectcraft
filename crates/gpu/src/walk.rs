@@ -3,7 +3,9 @@
 //! blur, bit-depth quantisation, colour conversions), with layer pixels taken from the CPU
 //! renderer and its layer cache. Classic and Advanced 3D runs (environment skies included) and
 //! adjustment layers run on the GPU; steps without a GPU implementation (anything a kernel
-//! declines) read the canvas back, run on the CPU and upload the result.
+//! declines) read the canvas back, run on the CPU and upload the result. Nested comps shown as
+//! they are (`draw_precomp`) and effect stacks that change every frame (`resident_layer`) are
+//! rendered here and stay on the device.
 
 use std::sync::Arc;
 
@@ -382,11 +384,17 @@ fn composite_iso_with(
     if let Some((m, kind)) = r.track_matte(ctx, layer) {
         let mimg = match matte_img.filter(|i| (i.width, i.height) == (canvas.width, canvas.height)) {
             Some(i) => i,
-            // A 3D matte layer is seen through the camera (drawn by the CPU renderer), not
-            // placed like a 2D layer.
+            // A 3D matte layer is seen through the camera, not placed like a 2D layer.
             None if m.is_3d() => {
                 e.park();
-                e.g.upload_image(&r.matte_3d(ctx, layer, m, (canvas.width, canvas.height)))?
+                let out = (canvas.width, canvas.height);
+                // Classic 3D: the matte layer alone through the device's own compositor; the
+                // CPU renderer draws it otherwise (Advanced 3D).
+                let blank = e.zeros(out.0, out.1);
+                match r.prepare_matte_3d(ctx, m, out).and_then(|prep| crate::classic3d::draw_run(e, &prep, &blank)) {
+                    Some(img) => img,
+                    None => e.g.upload_image(&r.matte_3d(ctx, layer, m, out))?,
+                }
             }
             None => {
                 let mut mimg = e.zeros(canvas.width, canvas.height);

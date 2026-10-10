@@ -2550,6 +2550,22 @@ impl<'a> Renderer<'a> {
         }
     }
 
+    /// [`Self::matte_3d`] for an accelerator's Classic 3D compositor: the matte layer alone (its
+    /// own matte, blend mode and Preserve Transparency ignored) as a prepared run, to draw on an
+    /// empty canvas. `None` (Advanced 3D, an inactive matte, a run the accelerator cannot take):
+    /// use [`Self::matte_3d`].
+    pub fn prepare_matte_3d(&self, ctx: &EvalCtx, m: &Layer, out: (u32, u32)) -> Option<three_d::Run3d> {
+        if !m.is_active_at(ctx.time) {
+            return None;
+        }
+        let mut solo = m.clone();
+        solo.track_matte = None;
+        solo.preserve_transparency = false;
+        solo.blend_mode = BlendMode::Normal;
+        solo.switches.video = true;
+        three_d::compose::gpu_run(self, ctx, &[&solo], out)
+    }
+
     /// Opacity the layer composites with (its Opacity × collapsed precomps' opacity).
     pub fn layer_opacity(&self, ctx: &EvalCtx, layer: &Layer) -> f32 {
         ctx.opacity(layer) as f32 * self.opacity_mul

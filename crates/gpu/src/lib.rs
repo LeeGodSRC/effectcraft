@@ -9,6 +9,10 @@
 //! clamping and quantisation, and converts colour spaces. Classic 3D runs composite here too
 //! (`classic3d`: per-pixel fragment sort, lights, ray-cast shadows), and adjustment layers run
 //! their effect stacks on the GPU-resident comp. Wireframe-quality outlines are drawn here too.
+//! Two kinds of layer content stay on the device instead of coming from the CPU: a nested comp
+//! shown as it is is composited by the same walk, and an effect stack that changes every frame
+//! and runs here in full is run on the layer's uploaded input (`walk::draw_precomp`,
+//! `walk::resident_layer`).
 //!
 //! Advanced 3D comps rasterise on a render pipeline (`advanced3d.wgsl`: depth buffer, PBR,
 //! image-based light, shadow maps) and finish in compute kernels (`adv3d.wgsl`: supersampling

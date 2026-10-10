@@ -1,5 +1,7 @@
 # Roadmap
 
+- 2026-10-11: Rendering an effect-heavy comp is several times faster. On a 600-frame 1080p After Effects project with nested comps, particle textures, 17 Fractal Noise layers and track mattes, a GPU export went from about 0.4 to 3.6 frames per second and a CPU export to 1.85, with the same pixels. The GPU compositor now composites nested comps and runs animated effect stacks without reading them back, and draws a 2D layer's 3D track matte through the camera; exports render at most 4 frames at a time within the available memory. What bounds a frame and how to measure it: [docs/architecture.md](docs/architecture.md) ▸ Rendering.
+
 - 2026-10-09: Settings ▸ General ▸ Language now translates the interface below the menu bar as well: panels, dialogs, buttons and tooltips read their text through `crates/ui-egui/src/i18n/ui.rs`, keyed by the English source string. Simplified and Traditional Chinese are complete (384 strings); Japanese rows can follow in the same file. A test fails when a converted panel gains a hard-coded string, and another keeps the catalog free of unused rows.
 - 2026-10-08: `effectcraft-cli render --out` resolves a relative path against the working directory, like `--project` (it used the project's folder, which doubled a path that already named it). Render Queue outputs set in a project are unchanged.
 - 2026-10-08: Long-press a grouped toolbar button to choose its tools, including Horizontal/Vertical Type; releasing the hold keeps the menu open. Existing point/paragraph text creation is unchanged.
