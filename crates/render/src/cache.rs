@@ -42,6 +42,8 @@ struct Entry {
     buf: Arc<Buf>,
     bytes: usize,
     last_use: u64,
+    /// The key does not change from frame to frame (see [`LayerCache::insert_stable`]).
+    stable: bool,
 }
 
 struct Inner {
@@ -165,13 +167,23 @@ impl LayerCache {
                 // Disk cache: a hit comes back into memory.
                 let (dc, dk) = self.disk_key(key)?;
                 let buf = dc.get_layer(dk)?;
-                self.insert_mem(key, buf.clone());
+                self.insert_mem(key, buf.clone(), false);
                 Some(buf)
             }
         }
     }
 
     pub fn insert(&self, key: u64, buf: Arc<Buf>) {
+        self.insert_as(key, buf, false);
+    }
+
+    /// [`Self::insert`] for a buffer whose key stays the same from frame to frame (a still
+    /// layer, the frame of a comp nothing moves in): kept ahead of the buffers a frame uses once.
+    pub fn insert_stable(&self, key: u64, buf: Arc<Buf>) {
+        self.insert_as(key, buf, true);
+    }
+
+    fn insert_as(&self, key: u64, buf: Arc<Buf>, stable: bool) {
         if self.gated() {
             return;
         }
@@ -182,10 +194,10 @@ impl LayerCache {
                 dc.put_layer(dk, &buf);
             }
         }
-        self.insert_mem(key, buf);
+        self.insert_mem(key, buf, stable);
     }
 
-    fn insert_mem(&self, key: u64, buf: Arc<Buf>) {
+    fn insert_mem(&self, key: u64, buf: Arc<Buf>, stable: bool) {
         let bytes = buf.img.data.len() * std::mem::size_of::<effectcraft_raster::Px>();
         let Ok(mut g) = self.inner.lock() else { return };
         if bytes > g.budget / 4 {
@@ -193,17 +205,21 @@ impl LayerCache {
         }
         g.clock += 1;
         let now = g.clock;
-        if let Some(old) = g.map.insert(key, Entry { buf, bytes, last_use: now }) {
+        if let Some(old) = g.map.insert(key, Entry { buf, bytes, last_use: now, stable }) {
             g.bytes -= old.bytes;
         }
         g.bytes += bytes;
         if g.bytes > g.budget {
-            // Evict least-recently used entries down to 3/4 of the budget.
+            // Evict down to 3/4 of the budget: the buffers one frame used first (least recently
+            // used first), then the ones every frame can use. Playing a comp whose moving layers
+            // fill the budget each frame would otherwise push out the still ones before the next
+            // frame asks for them.
+            // The buffers every frame can use only make room when they alone pass the budget.
             let target = g.budget / 4 * 3;
-            let mut by_age: Vec<(u64, u64)> = g.map.iter().map(|(k, e)| (e.last_use, *k)).collect();
+            let mut by_age: Vec<(bool, u64, u64)> = g.map.iter().map(|(k, e)| (e.stable, e.last_use, *k)).collect();
             by_age.sort_unstable();
-            for (_, k) in by_age {
-                if g.bytes <= target {
+            for (stable, _, k) in by_age {
+                if g.bytes <= if stable { g.budget } else { target } {
                     break;
                 }
                 if let Some(e) = g.map.remove(&k) {
@@ -551,6 +567,25 @@ fn key_any(ctx: &EvalCtx, layer: &Layer, scale: f64, draft: bool, blur: bool, fo
             hash_debug(&mut h, s);
         }
         LayerSource::Text | LayerSource::Shape => {}
+        // A still is the same picture at every time: its processed layer is cached like a
+        // solid's (footage that plays is left to the footage cache).
+        LayerSource::Footage { item } if !footage => {
+            let it = ctx.project.item(*item)?;
+            let ItemKind::Footage(f) = &it.kind else { return None };
+            if it.proxy.is_some() || !still(f) || !f.has_video {
+                return None;
+            }
+            hash_debug(&mut h, f);
+            item.hash(&mut h);
+            // Without masks or effects the layer's pixels are the still itself: every such layer
+            // of the still shares one buffer.
+            let bare = |g: Option<&PropGroup>| g.is_none_or(|g| g.children.is_empty());
+            if bare(layer.masks()) && bare(layer.effects()) {
+                crate::color::Pipe::of(&ctx.project.settings).key().hash(&mut h);
+                scale.to_bits().hash(&mut h);
+                return Some(h.finish());
+            }
+        }
         LayerSource::Footage { item } if footage => {
             let it = ctx.project.item(*item)?;
             let ItemKind::Footage(f) = &it.kind else { return None };
@@ -647,6 +682,168 @@ fn reads_comp_scene(layer: &Layer) -> bool {
                     && matches!(&g.kind, effectcraft_project::GroupKind::Effect { effect } if effectcraft_effects::READS_COMP_SCENE.contains(&effect.as_str()))
             })
         })
+}
+
+/// Nesting limit of [`comp_key`] (deeper comps are not cached).
+const MAX_COMP_KEY_DEPTH: usize = 32;
+
+/// Content key of a whole composition frame — the comp and time of `ctx` — when the frame does
+/// not depend on the time itself: nothing that takes part in it is animated, so the frame is
+/// the same picture for as long as the same layers are shown. Two times with the same key show
+/// the same pixels (at the same render options, which the caller adds), and any edit to the comp,
+/// to a comp nested in it or to a source it uses changes the key.
+///
+/// Conservative: `None` (render it) when any layer that takes part is not still (see
+/// [`still_layer`]). A layer that is not drawn (outside its in/out span, or switched off) and
+/// that no drawn layer refers to takes no part.
+pub fn comp_key(ctx: &EvalCtx, depth: usize) -> Option<u64> {
+    if depth > MAX_COMP_KEY_DEPTH {
+        return None;
+    }
+    let mut h = comp_hasher(ctx);
+    for layer in &ctx.comp.layers {
+        // Not drawn: outside its span, or switched off (cameras and lights have no switch).
+        let hidden = !layer.is_active_at(ctx.time) || (layer.source.is_av() && !layer.switches.video && !layer.environment);
+        if !hidden {
+            still_layer(ctx, layer, depth)?.hash(&mut h);
+        }
+    }
+    Some(h.finish())
+}
+
+/// Content key of the picture the first layers of `drawn` (a comp's layers in drawing order,
+/// bottom first) make on an empty canvas, and how many of them: as many as are still (see
+/// [`still_layer`]) and `eligible`. `None` when the bottom layer is not. As [`comp_key`], for the
+/// part of a comp below its first moving layer.
+pub fn prefix_key(ctx: &EvalCtx, drawn: &[&Layer], eligible: impl Fn(&Layer) -> bool) -> Option<(usize, u64)> {
+    let mut parts = Vec::new();
+    for layer in drawn {
+        if !eligible(layer) {
+            break;
+        }
+        let Some(k) = still_layer(ctx, layer, 0) else { break };
+        parts.push(k);
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    let mut h = comp_hasher(ctx);
+    0x9e37_79b9_u32.hash(&mut h);
+    parts.hash(&mut h);
+    Some((parts.len(), h.finish()))
+}
+
+/// A hasher holding the comp's whole static structure (settings, layers, properties, switches,
+/// spans) and the colour pipeline.
+fn comp_hasher(ctx: &EvalCtx) -> KeyHasher {
+    let mut h = KeyHasher(0xcbf2_9ce4_8422_2325);
+    hash_debug(&mut h, ctx.comp);
+    crate::color::Pipe::of(&ctx.project.settings).key().hash(&mut h);
+    ctx.comp_id.hash(&mut h);
+    h
+}
+
+/// Content key of what `layer` draws at the time of `ctx` — with the layers it refers to
+/// (parents, track matte, layer parameters of its effects), its source and the comp scene its
+/// effects read — when that does not depend on the time itself. `None` when the layer or one it
+/// refers to has keyframes, an expression, a time-dependent effect, a source that plays (video,
+/// sequence, a proxy), Essential Properties overrides, or shows a nested comp whose own frame
+/// has no such key.
+fn still_layer(ctx: &EvalCtx, layer: &Layer, depth: usize) -> Option<u64> {
+    let mut h = KeyHasher(0xcbf2_9ce4_8422_2325);
+    // The layer and, in turn, every layer one of them refers to.
+    let mut ids = vec![layer.id];
+    let mut i = 0;
+    while let Some(&id) = ids.get(i) {
+        i += 1;
+        // (A reference to a layer that is gone draws nothing.)
+        let Some(l) = ctx.comp.layer(id) else { continue };
+        let mut refs: Vec<u64> = Vec::new();
+        refs.extend(l.parent.map(|p| p.0));
+        refs.extend(l.track_matte.map(|m| m.layer.0));
+        layer_refs(&l.props, &mut refs);
+        for r in refs {
+            let r = effectcraft_project::LayerId(r);
+            if !ids.contains(&r) {
+                ids.push(r);
+            }
+        }
+        l.id.hash(&mut h);
+        l.is_active_at(ctx.time).hash(&mut h);
+        if animated(&l.props) || time_dependent(l) || reads_other_times(l) || !effectcraft_project::essential::overridden(l).is_empty() {
+            return None;
+        }
+        if reads_comp_scene(l) {
+            hash_debug(&mut h, &crate::comp_scene(ctx, l));
+        }
+        match &l.source {
+            LayerSource::Solid { item } => {
+                let ItemKind::Solid(sol) = &ctx.project.item(*item)?.kind else { return None };
+                hash_debug(&mut h, sol);
+            }
+            LayerSource::Footage { item } => {
+                let it = ctx.project.item(*item)?;
+                let ItemKind::Footage(f) = &it.kind else { return None };
+                // (Footage without pictures draws nothing.)
+                if f.has_video && (it.proxy.is_some() || !still(f)) {
+                    return None;
+                }
+                hash_debug(&mut h, f);
+            }
+            LayerSource::Comp { item } => {
+                let it = ctx.project.item(*item)?;
+                let nested = ctx.project.comp(*item)?;
+                if it.proxy.is_some() || depth >= MAX_COMP_KEY_DEPTH || ctx.project.comp_contains(*item, ctx.comp_id) {
+                    return None;
+                }
+                let at = EvalCtx { comp_id: *item, comp: nested, time: ctx.nested_time(l), ..*ctx };
+                // Past the nested comp's span the layer shows nothing: the same at every such time.
+                match nested.covers(at.time) {
+                    true => comp_key(&at, depth + 1)?.hash(&mut h),
+                    false => 0u8.hash(&mut h),
+                }
+            }
+            // Text, shapes, cameras, lights and nulls are all in their properties.
+            LayerSource::Text | LayerSource::Shape | LayerSource::Camera | LayerSource::Light { .. } | LayerSource::Null => {}
+            // Other sources (models, primitives…) are left to render.
+            _ => return None,
+        }
+    }
+    Some(h.finish())
+}
+
+/// Whether a layer's processed pixels ([`layer_key`]) stay the same from frame to frame: nothing
+/// but its transform is animated and no effect follows the time or the comp scene. The cache
+/// keeps such buffers ahead of the ones a frame uses once ([`LayerCache::insert_stable`]).
+pub fn stable_layer(layer: &Layer) -> bool {
+    let moving = layer.props.children.iter().any(|c| match c {
+        Node::Group(g) => g.match_id != "transform" && animated(g),
+        Node::Prop(p) => !p.keys.is_empty() || p.has_expression(),
+    });
+    !moving && !time_dependent(layer) && !reads_other_times(layer) && !reads_comp_scene(layer)
+}
+
+/// A footage item whose picture is the same at every time.
+fn still(f: &effectcraft_project::Footage) -> bool {
+    f.kind == effectcraft_project::FootageKind::Still
+}
+
+/// Any keyframes or expression in the group.
+fn animated(g: &PropGroup) -> bool {
+    g.children.iter().any(|c| match c {
+        Node::Prop(p) => !p.keys.is_empty() || p.has_expression(),
+        Node::Group(sub) => animated(sub),
+    })
+}
+
+/// The layers the group's layer parameters point at.
+fn layer_refs(g: &PropGroup, out: &mut Vec<u64>) {
+    for c in &g.children {
+        match c {
+            Node::Prop(p) => out.extend(p.value.as_layer()),
+            Node::Group(sub) => layer_refs(sub, out),
+        }
+    }
 }
 
 /// Cache key for the styled layer (content key + the Layer Styles group: structure, eye

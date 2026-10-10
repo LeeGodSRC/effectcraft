@@ -478,6 +478,10 @@ pub struct Renderer<'a> {
     through_lost: bool,
     /// Nested comp frames already rendered for this top-level frame (see [`memo`]).
     memo: Option<&'a memo::FrameMemo>,
+    /// The picture being drawn is itself kept across frames (a comp nothing moves in, the still
+    /// layers at the bottom of a comp): the layer buffers that go into it are the first to leave
+    /// the layer cache.
+    within_still: bool,
 }
 
 /// One collapsed precomp layer a nested comp is drawn through.
@@ -565,6 +569,7 @@ impl<'a> Renderer<'a> {
             through: [None; MAX_THROUGH],
             through_lost: false,
             memo: None,
+            within_still: false,
         }
     }
 
@@ -877,7 +882,26 @@ impl<'a> Renderer<'a> {
         // Bottom-to-top, with runs of consecutive 3D layers depth-sorted (farthest first).
         let visible = self.visible_layers(ctx);
         let mut i = 0;
+        // The layers at the bottom that nothing moves in make the same picture every frame: it is
+        // kept across frames (the layer cache), and the frame starts from it.
+        let mut still = self.still_prefix(ctx, &visible, canvas, blank);
+        if let Some((n, key)) = still
+            && let Some(kept) = self.cache.and_then(|c| c.get(key))
+            && kept.img.width == canvas.width
+            && kept.img.height == canvas.height
+        {
+            canvas.data.copy_from_slice(&kept.img.data);
+            (i, blank, still) = (n, false, None);
+        }
         while i < visible.len() {
+            if let Some((n, key)) = still
+                && i == n
+            {
+                if let Some(c) = self.cache {
+                    c.insert_stable(key, Arc::new(Buf { img: canvas.clone(), offset: [0.0; 2], scale: self.opts.scale }));
+                }
+                still = None;
+            }
             if visible[i].is_3d() {
                 let mut j = i;
                 while j < visible.len() && visible[j].is_3d() {
@@ -890,6 +914,7 @@ impl<'a> Renderer<'a> {
             } else {
                 let changed = match self.collapsed(ctx, visible[i]) {
                     Some(item) => self.draw_collapsed(ctx, visible[i], item, canvas, blank),
+                    None if still.is_some() => Renderer { within_still: true, ..*self }.draw_layer(ctx, visible[i], canvas, blank),
                     None => self.draw_layer(ctx, visible[i], canvas, blank),
                 };
                 i += 1;
@@ -899,6 +924,29 @@ impl<'a> Renderer<'a> {
                 blank = false;
             }
         }
+    }
+
+    /// The bottom layers of `visible` (drawing order) whose picture on the empty `canvas` is the
+    /// same at every time ([`cache::prefix_key`]): how many, and its layer-cache key. Only for a
+    /// comp drawn on its own canvas (not collapsed into its parent) with a layer cache, and only
+    /// when layers that do change follow (a comp nothing moves in is kept whole, see
+    /// [`Self::nested_frame`]; the top-level frame is the viewer's to keep).
+    fn still_prefix(&self, ctx: &EvalCtx, visible: &[&Layer], canvas: &Image, blank: bool) -> Option<(usize, u64)> {
+        self.cache?;
+        if !blank || self.outer.is_some() || self.collapse3d.is_some() || self.opacity_mul != 1.0 {
+            return None;
+        }
+        // 2D layers drawn through `draw_layer` (a collapsed precomp's layers join this comp).
+        let eligible = |l: &Layer| !l.is_3d() && !(l.switches.collapse && matches!(l.source, LayerSource::Comp { .. }));
+        let (n, content) = cache::prefix_key(ctx, visible, eligible)?;
+        if n >= visible.len() {
+            return None;
+        }
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        use std::hash::{Hash, Hasher};
+        (0x57e1_1b07_u64, content, self.depth, self.top, self.active_accel().is_some(), canvas.width, canvas.height).hash(&mut h);
+        format!("{:?} {:?}", self.opts, self.inherited).hash(&mut h);
+        Some((n, h.finish()))
     }
 
     /// Evaluate an effect instance's parameters.
@@ -1149,7 +1197,21 @@ impl<'a> Renderer<'a> {
     /// top-level frame that show the same one (see [`memo`]). `keep`: more layers are known to
     /// want it; otherwise a frame is kept from the second time it is rendered.
     fn nested_frame(&self, item: ItemId, t: Tick, keep: bool) -> Arc<Buf> {
-        let render = || Arc::new(Buf { img: self.comp_frame(item, t), offset: [0.0; 2], scale: self.opts.scale });
+        let render = || {
+            // A frame that does not change with time is kept across frames (the layer cache).
+            let still = self.cache.zip(self.still_frame_key(item, t));
+            if let Some((cache, k)) = still
+                && let Some(buf) = cache.get(k)
+            {
+                return buf;
+            }
+            let img = Renderer { within_still: self.within_still || still.is_some(), ..*self }.comp_frame(item, t);
+            let buf = Arc::new(Buf { img, offset: [0.0; 2], scale: self.opts.scale });
+            if let Some((cache, k)) = still {
+                cache.insert_stable(k, buf.clone());
+            }
+            buf
+        };
         let Some(shared) = self.memo else { return render() };
         let key = memo::Key::new(item, t, self.opts.scale, self.depth, self.inherited);
         if let Some(buf) = shared.get(&key) {
@@ -1161,6 +1223,20 @@ impl<'a> Renderer<'a> {
             shared.insert(key, buf.clone());
         }
         buf
+    }
+
+    /// Layer-cache key of this (nested) renderer's frame of comp `item` at `t`, when the frame
+    /// is the same at every time around `t` ([`cache::comp_key`]): the comp's content and
+    /// everything of this render that shapes its pixels.
+    fn still_frame_key(&self, item: ItemId, t: Tick) -> Option<u64> {
+        let comp = self.project.comp(item)?;
+        let content = cache::comp_key(&self.ctx(item, comp, t), 0)?;
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        use std::hash::{Hash, Hasher};
+        (0x0c09_f4a3_u64, content, self.depth, self.active_accel().is_some()).hash(&mut h);
+        // Every render option but the region of interest (a nested frame is drawn whole).
+        format!("{:?} {:?}", RenderOpts { roi: None, ..self.opts }, self.inherited).hash(&mut h);
+        Some(h.finish())
     }
 
     /// The processed buffer of a precomp layer that shows its nested comp's frame as it is (no
@@ -1400,7 +1476,12 @@ impl<'a> Renderer<'a> {
         let buf = self.masked_source(ctx, layer)?;
         let buf = Arc::new(self.apply_effects_timed(ctx, layer, buf, false, usize::MAX, timing.map(|t| &mut t.effects)));
         if let (Some(c), Some(k)) = (self.cache, key) {
-            c.insert(k, buf.clone());
+            // (Content that animates within the shutter is keyed by its times.)
+            if !self.within_still && cache::stable_layer(layer) && self.content_times(ctx, layer).is_none() {
+                c.insert_stable(k, buf.clone());
+            } else {
+                c.insert(k, buf.clone());
+            }
         }
         Some((buf, key))
     }
@@ -2286,5 +2367,7 @@ mod tests_mask_blur;
 mod tests_nested;
 #[cfg(test)]
 mod tests_paint;
+#[cfg(test)]
+mod tests_still;
 #[cfg(test)]
 mod tests_time;
