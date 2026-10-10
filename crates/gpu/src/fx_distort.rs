@@ -160,11 +160,13 @@ fn ripple(e: &mut Enc, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
 
 fn cc_lens(e: &mut Enc, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
     let c = b.to_px(ctx.params.v2("center"));
-    let (lw, lh) = (ctx.layer_size[0] * b.scale, ctx.layer_size[1] * b.scale);
-    let r = (ctx.params.f("size") / 100.0 * lw.max(lh) * 0.5).max(0.5);
-    let k = 2f64.powf(ctx.params.f("convergence") / 50.0);
+    let lh = ctx.layer_size[1] * b.scale;
+    let r = (ctx.params.f("size") / 100.0 * lh * 0.5).max(0.0);
+    let r = if r.is_finite() { r } else { 0.0 };
+    let convergence = ctx.params.f("convergence");
+    let convergence = if convergence.is_finite() { (convergence / 100.0).clamp(-1.0, 1.0) } else { 0.0 };
     let mut p = Params::default();
-    p.f[0] = [c.0 as f32, c.1 as f32, r as f32, k as f32];
+    p.f[0] = [c.0 as f32, c.1 as f32, r as f32, convergence as f32];
     run(e, "dst_cclens", &p, b, None)
 }
 
