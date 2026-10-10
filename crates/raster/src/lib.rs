@@ -10,6 +10,7 @@ pub mod channels3d;
 pub mod cuts;
 pub mod flow;
 pub mod inpaint;
+pub mod pool;
 pub mod scopes;
 pub mod warp;
 
@@ -42,7 +43,8 @@ fn pixels_with(n: usize, serial: impl FnOnce() -> Vec<Px>, fill: impl Fn(usize, 
     if n < PARALLEL_PIXELS {
         return serial();
     }
-    let mut data = vec![[0.0; 4]; n];
+    // (A recycled buffer holds old pixels; `fill` writes every one.)
+    let mut data = pool::take(n).unwrap_or_else(|| vec![[0.0; 4]; n]);
     data.par_chunks_mut(FILL_CHUNK).enumerate().for_each(|(i, chunk)| fill(i * FILL_CHUNK, chunk));
     data
 }
@@ -63,9 +65,25 @@ impl Clone for Image {
     }
 }
 
+/// Large pixel buffers are recycled ([`pool`]).
+impl Drop for Image {
+    fn drop(&mut self) {
+        pool::give(std::mem::take(&mut self.data));
+    }
+}
+
 impl Image {
     pub fn new(width: u32, height: u32) -> Image {
-        Image { width, height, data: vec![[0.0; 4]; width as usize * height as usize] }
+        let n = width as usize * height as usize;
+        // A fresh allocation is already zero; a recycled one is cleared.
+        let data = match pool::take(n) {
+            Some(mut data) => {
+                data.par_chunks_mut(FILL_CHUNK).for_each(|chunk| chunk.fill([0.0; 4]));
+                data
+            }
+            None => vec![[0.0; 4]; n],
+        };
+        Image { width, height, data }
     }
     pub fn filled(width: u32, height: u32, px: Px) -> Image {
         let n = width as usize * height as usize;

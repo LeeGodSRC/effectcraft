@@ -124,9 +124,9 @@ impl Lru {
             if let Some(e) = self.map.remove(&k) {
                 self.bytes -= e.bytes;
                 if self.spare.len() < MAX_SPARE
-                    && let Ok(img) = Arc::try_unwrap(e.img)
+                    && let Ok(mut img) = Arc::try_unwrap(e.img)
                 {
-                    self.spare.push(img.data);
+                    self.spare.push(std::mem::take(&mut img.data));
                 }
             }
         }

@@ -1021,7 +1021,7 @@ mod tests {
                 img.set(x, y, [1.0, 1.0, 1.0, 1.0]);
             }
         }
-        let run = |vals: &[(&str, Value)]| run_at("ec.stylize.roughenedges", vals, img.clone(), 0.0).img.data;
+        let run = |vals: &[(&str, Value)]| run_at("ec.stylize.roughenedges", vals, img.clone(), 0.0).img.data.clone();
         let base = run(&[]);
         assert_ne!(base, run(&[("evolutionOptions/randomSeed", num(7.0))]));
         assert_ne!(base, run(&[("stretch", num(3.0))]));
