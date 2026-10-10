@@ -166,11 +166,14 @@ fn displacement_map(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let mh = ctx.params.f("maxHorizontal") * b.scale;
     let mv = ctx.params.f("maxVertical") * b.scale;
     let wrap = ctx.params.b("wrapPixelsAround");
+    let layer = ctx.layer_param("displacementMapLayer", false);
+    if crate::util::displacement_map_is_absent(ctx, &layer) {
+        return b;
+    }
     if ctx.params.b("expandOutput") && !wrap && !ctx.adjustment {
         b.pad(mh.abs().max(mv.abs()).ceil() as u32);
     }
     // The map: the chosen layer (Center / Stretch / Tile), else the layer itself.
-    let layer = ctx.layer_param("displacementMapLayer", false);
     let behavior = ctx.params.e("displacementMapBehavior");
     let map_size = layer.as_ref().map(|o| o.size);
     let map = match layer {
@@ -1079,6 +1082,30 @@ mod tests {
         fn audio(&self, _: u64, _: f64, _: usize, _: u32) -> Option<Vec<f32>> {
             None
         }
+    }
+
+    /// A host whose layers have no picture (ended, or not begun).
+    struct EmptyHost;
+    impl crate::EffectHost for EmptyHost {
+        fn layer(&self, _: u64, _: bool) -> Option<crate::LayerPixels> {
+            None
+        }
+        fn audio(&self, _: u64, _: f64, _: usize, _: u32) -> Option<Vec<f32>> {
+            None
+        }
+    }
+
+    #[test]
+    fn displacement_map_without_a_map_frame_moves_nothing() {
+        let img = test_img(32, 24);
+        let s = crate::find("ec.distort.displacementmap").unwrap();
+        let mut params = Params { values: s.params.iter().map(|p| (p.id.to_string(), p.default.clone())).collect() };
+        params.values.insert("displacementMapLayer".into(), Value::Layer(Some(7)));
+        params.values.insert("maxHorizontal".into(), num(9.0));
+        let env = crate::EffectEnv { host: Some(&EmptyHost), ..Default::default() };
+        let ctx = EffectCtx { params: &params, time: 0.0, layer_size: [32.0, 24.0], seed: 1, adjustment: false, env };
+        let o = crate::apply(s, &ctx, Buf { img: img.clone(), offset: [0.0, 0.0], scale: 1.0 });
+        assert_eq!(o.img, img);
     }
 
     #[test]

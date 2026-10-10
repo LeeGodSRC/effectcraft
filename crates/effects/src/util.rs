@@ -727,6 +727,12 @@ pub fn poly_point_at(pts: &[[f64; 2]], closed: bool, s: f64) -> ([f64; 2], [f64;
     (pts[n - 1], [1.0, 0.0])
 }
 
+/// A map layer is chosen but has no picture at this time (it has ended or not begun): nothing
+/// is displaced. Only without a chosen layer does the layer displace itself.
+pub fn displacement_map_is_absent(ctx: &crate::EffectCtx, layer: &Option<crate::LayerPixels>) -> bool {
+    layer.is_none() && ctx.params.get("displacementMapLayer").and_then(effectcraft_keyframe::Value::as_layer).is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -211,10 +211,13 @@ fn displacement_map(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
     let mh = ctx.params.f("maxHorizontal") * b.scale;
     let mv = ctx.params.f("maxVertical") * b.scale;
     let wrap = ctx.params.b("wrapPixelsAround");
+    let layer = ctx.layer_param("displacementMapLayer", false);
+    if util::displacement_map_is_absent(ctx, &layer) {
+        return Some(b);
+    }
     if ctx.params.b("expandOutput") && !wrap && !ctx.adjustment {
         b.pad(e, mh.abs().max(mv.abs()).ceil() as u32)?;
     }
-    let layer = ctx.layer_param("displacementMapLayer", false);
     let behavior = ctx.params.e("displacementMapBehavior");
     let (w, h) = (b.img.width as usize, b.img.height as usize);
     let inv = 1.0 / b.scale.max(1e-9);
