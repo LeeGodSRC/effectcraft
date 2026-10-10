@@ -173,6 +173,11 @@ impl LayerCache {
         }
     }
 
+    /// Whether the cache holds `key` in memory (not counted as a hit or a miss).
+    pub fn holds(&self, key: u64) -> bool {
+        self.inner.lock().is_ok_and(|g| g.map.contains_key(&key))
+    }
+
     pub fn insert(&self, key: u64, buf: Arc<Buf>) {
         self.insert_as(key, buf, false);
     }
@@ -200,7 +205,10 @@ impl LayerCache {
     fn insert_mem(&self, key: u64, buf: Arc<Buf>, stable: bool) {
         let bytes = buf.img.data.len() * std::mem::size_of::<effectcraft_raster::Px>();
         let Ok(mut g) = self.inner.lock() else { return };
-        if bytes > g.budget / 4 {
+        // One buffer may not crowd out the rest. A buffer every frame uses (an oversized precomp
+        // nothing moves in) is worth more of the budget than one a single frame does: dropped,
+        // it would be rendered again for every frame.
+        if bytes > g.budget / if stable { 2 } else { 4 } {
             return;
         }
         g.clock += 1;

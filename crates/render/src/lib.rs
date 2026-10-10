@@ -28,7 +28,7 @@ use std::sync::Arc;
 pub use auto::{AutoKey, AutoPick};
 pub use cache::{CacheStats, LayerCache, LayerStore, PrefetchStore};
 use effectcraft_color::BlendMode;
-use effectcraft_effects::{Buf, EffectCtx, EffectEnv, EffectHost, LayerPixels, Params};
+use effectcraft_effects::{Buf, EffectCtx, EffectEnv, EffectHost, LayerPixels, LayerView, Params};
 use effectcraft_geom::{Mat3, Mat4, vec2};
 use effectcraft_project::{Comp, Footage, FootageKind, FrameBlend, GroupKind, ItemId, ItemKind, Layer, LayerSource, MatteKind, Project, Quality, Sampling};
 pub use effectcraft_raster::Image;
@@ -117,6 +117,12 @@ impl FxHost<'_, '_, '_> {
         }
         LayerPixels { buf, size }
     }
+
+    /// [`Self::pixels`] of a layer's content (layer space), sharing the buffer.
+    fn view(&self, other: &Layer, buf: Arc<Buf>) -> LayerView {
+        let (size, origin) = self.ctx.effect_bounds(other);
+        LayerView { offset: [buf.offset[0] + origin[0] * buf.scale, buf.offset[1] + origin[1] * buf.scale], size, buf }
+    }
 }
 
 /// The comp's camera and first light relative to `layer`, in its layer pixels (see
@@ -163,6 +169,33 @@ impl EffectHost for FxHost<'_, '_, '_> {
         // The cached layer buffer is shared; effects get their own copy.
         let buf = if masks_and_effects { (*sub.content_buf(self.ctx, other)?).clone() } else { sub.source(self.ctx, other)? };
         Some(self.pixels(other, buf, true))
+    }
+
+    fn layer_view(&self, id: u64, masks_and_effects: bool) -> Option<LayerView> {
+        if !masks_and_effects {
+            return self.layer(id, false).map(LayerView::from);
+        }
+        let other = self.ctx.layer(effectcraft_project::LayerId(id))?;
+        if other.id == self.layer.id || self.r.depth > MAX_FX_DEPTH {
+            return None;
+        }
+        Some(self.view(other, self.r.nested().content_buf(self.ctx, other)?))
+    }
+
+    fn layer_view_at(&self, id: u64, comp_time: f64, masks_and_effects: bool) -> Option<LayerView> {
+        let other = self.ctx.layer(effectcraft_project::LayerId(id))?;
+        if other.id == self.layer.id || self.r.depth > MAX_FX_DEPTH {
+            return None;
+        }
+        let ctx = self.ctx.at(Tick::from_seconds_f64(comp_time));
+        let sub = self.r.nested();
+        Some(if masks_and_effects {
+            self.view(other, sub.content_buf(&ctx, other)?)
+        } else {
+            // (A layer's input is in effect space already.)
+            let buf = sub.layer_input(&ctx, other, 0)?;
+            LayerView { offset: buf.offset, size: self.ctx.effect_bounds(other).0, buf }
+        })
     }
 
     fn layer_masks(&self, id: u64) -> Option<LayerPixels> {
@@ -893,6 +926,8 @@ impl<'a> Renderer<'a> {
     fn draw_comp(&self, ctx: &EvalCtx<'a>, canvas: &mut Image, mut blank: bool) {
         // Bottom-to-top, with runs of consecutive 3D layers depth-sorted (farthest first).
         let visible = self.visible_layers(ctx);
+        // A comp several of the layers show at the same time renders once, ahead of them.
+        self.prewarm_precomps(ctx, &visible);
         let mut i = 0;
         // The layers at the bottom that nothing moves in make the same picture every frame: it is
         // kept across frames (the layer cache), and the frame starts from it.
@@ -1210,29 +1245,32 @@ impl<'a> Renderer<'a> {
     /// top-level frame that show the same one (see [`memo`]). `keep`: more layers are known to
     /// want it; otherwise a frame is kept from the second time it is rendered.
     fn nested_frame(&self, item: ItemId, t: Tick, keep: bool) -> Arc<Buf> {
+        // The frame, and whether the layer cache holds it.
         let render = || {
             // A frame that does not change with time is kept across frames (the layer cache).
             let still = self.cache.zip(self.still_frame_key(item, t));
             if let Some((cache, k)) = still
                 && let Some(buf) = cache.get(k)
             {
-                return buf;
+                return (buf, true);
             }
             let img = Renderer { within_still: self.within_still || still.is_some(), ..*self }.comp_frame(item, t);
             let buf = Arc::new(Buf { img, offset: [0.0; 2], scale: self.opts.scale });
-            if let Some((cache, k)) = still {
+            let kept = still.is_some_and(|(cache, k)| {
                 cache.insert_stable(k, buf.clone());
-            }
-            buf
+                cache.holds(k)
+            });
+            (buf, kept)
         };
-        let Some(shared) = self.memo else { return render() };
+        let Some(shared) = self.memo else { return render().0 };
         let key = memo::Key::new(item, t, self.opts.scale, self.depth, self.inherited);
         if let Some(buf) = shared.get(&key) {
             return buf;
         }
         let keep = shared.repeated(key) || keep;
-        let buf = render();
-        if keep {
+        let (buf, cached) = render();
+        // (A frame the layer cache holds is a lookup away: it leaves the memo's budget alone.)
+        if keep && !cached {
             shared.insert(key, buf.clone());
         }
         buf
@@ -1281,6 +1319,10 @@ impl<'a> Renderer<'a> {
         let mut wanted: Vec<(Renderer<'a>, memo::Key, ItemId, Tick, usize)> = Vec::new();
         for layer in layers {
             let LayerSource::Comp { item } = &layer.source else { continue };
+            // Faded out: not drawn (see `draw_layer`).
+            if !layer.is_3d() && !layer.switches.adjustment && ctx.opacity(layer) as f32 * self.opacity_mul <= 0.0 {
+                continue;
+            }
             // As `source` decides: these draw nothing, a proxy, or an instance of their own.
             if self.project.comp_contains(*item, ctx.comp_id) || self.proxy_for(*item).is_some() || !essential_overrides(ctx, layer).is_empty() {
                 continue;

@@ -297,6 +297,30 @@ pub struct LayerPixels {
     pub size: [f64; 2],
 }
 
+/// [`LayerPixels`] sharing the layer's rendered buffer instead of owning a copy of it, for
+/// effects that only read it (a particle system showing a layer at each particle's birth frame
+/// reads hundreds of them per frame). `offset` is where layer coordinate (0, 0) falls in the
+/// buffer, in place of the buffer's own.
+#[derive(Clone, Debug)]
+pub struct LayerView {
+    pub buf: std::sync::Arc<Buf>,
+    pub offset: [f64; 2],
+    pub size: [f64; 2],
+}
+
+impl LayerView {
+    /// [`Buf::to_px`] through this view's offset.
+    pub fn to_px(&self, p: [f64; 2]) -> (f64, f64) {
+        (p[0] * self.buf.scale + self.offset[0], p[1] * self.buf.scale + self.offset[1])
+    }
+}
+
+impl From<LayerPixels> for LayerView {
+    fn from(p: LayerPixels) -> LayerView {
+        LayerView { offset: p.buf.offset, size: p.size, buf: std::sync::Arc::new(p.buf) }
+    }
+}
+
 /// Services the renderer offers effects that look beyond their own pixels.
 pub trait EffectHost: Sync {
     /// Layer `id` of the same composition at the current comp time. `masks_and_effects`
@@ -321,6 +345,14 @@ pub trait EffectHost: Sync {
     /// [`EffectHost::layer`] but at another time.
     fn layer_at(&self, _id: u64, _comp_time: f64, _masks_and_effects: bool) -> Option<LayerPixels> {
         None
+    }
+    /// [`EffectHost::layer`] to read only: the renderer shares its buffer instead of copying it.
+    fn layer_view(&self, id: u64, masks_and_effects: bool) -> Option<LayerView> {
+        self.layer(id, masks_and_effects).map(LayerView::from)
+    }
+    /// [`EffectHost::layer_at`] to read only (see [`EffectHost::layer_view`]).
+    fn layer_view_at(&self, id: u64, comp_time: f64, masks_and_effects: bool) -> Option<LayerView> {
+        self.layer_at(id, comp_time, masks_and_effects).map(LayerView::from)
     }
     /// Auxiliary 3D channels (depth, object / material IDs, normals, Cryptomatte, any named
     /// EXR channel) of the effect's own layer source at the current time, in layer space (see

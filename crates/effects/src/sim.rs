@@ -1459,7 +1459,7 @@ struct Stamp {
 /// Draw `stamps` into `fx` in order. Rows are independent, so bands of rows are drawn in
 /// parallel, each walking the stamps in the same (far to near) order: every pixel sees the same
 /// sequence of blends as a serial pass.
-fn draw_stamps(fx: &mut Image, frames: &std::collections::HashMap<i64, crate::LayerPixels>, stamps: &[Stamp], kind: u32, mode: u32, crop: f64) {
+fn draw_stamps(fx: &mut Image, frames: &std::collections::HashMap<i64, crate::LayerView>, stamps: &[Stamp], kind: u32, mode: u32, crop: f64) {
     const BAND: usize = 8;
     let w = fx.width as usize;
     if w == 0 || stamps.is_empty() {
@@ -1481,7 +1481,7 @@ fn draw_stamps(fx: &mut Image, frames: &std::collections::HashMap<i64, crate::La
                     if u.abs() > 1.0 || v.abs() > 1.0 || matches!(kind, 11 | 12) && u * u + v * v > 1.0 || kind == 10 && v < 2.0 * u.abs() - 1.0 {
                         continue;
                     }
-                    let (tx, ty) = texture.buf.to_px([
+                    let (tx, ty) = texture.to_px([
                         (st.crop_origin[0] + (u + 1.0) * 0.5 * crop) * texture.size[0],
                         (st.crop_origin[1] + (v + 1.0) * 0.5 * crop) * texture.size[1],
                     ]);
@@ -1514,7 +1514,7 @@ fn texture_particles(ctx: &EffectCtx, mut b: Buf, plan: &WorldPlan) -> Buf {
     let kind = ctx.params.e("particle/particleType");
     let time_mode = ctx.params.e("texture/time");
     let source = ctx.params.get("texture/layerSource").map(Value::as_enum).unwrap_or(2) != 0;
-    let mut frames = std::collections::HashMap::<i64, crate::LayerPixels>::new();
+    let mut frames = std::collections::HashMap::<i64, crate::LayerView>::new();
     let fps = ctx.fps().clamp(1.0, 240.0);
     // Scatter selects a random crop of the texture, not a different animation frame.
     let scatter = (ctx.params.f("texture/scatter") * 0.01).clamp(0.0, 1.0);
@@ -1533,11 +1533,11 @@ fn texture_particles(ctx: &EffectCtx, mut b: Buf, plan: &WorldPlan) -> Buf {
         // A missing temporal sample is transparent. Falling back to the current
         // frame gives pre-roll particles a texture that did not exist at birth,
         // or revives an animation after its source composition has ended.
-        let pixels = || host.layer_at(id, frame as f64 / fps, source).or_else(|| (time_mode == 1).then(|| host.layer(id, source)).flatten());
+        let pixels = || host.layer_view_at(id, frame as f64 / fps, source).or_else(|| (time_mode == 1).then(|| host.layer_view(id, source)).flatten());
         if !frames.contains_key(&frame)
             && let Some(pixels) = pixels()
         {
-            let full = |frames: &std::collections::HashMap<i64, crate::LayerPixels>| {
+            let full = |frames: &std::collections::HashMap<i64, crate::LayerView>| {
                 !frames.is_empty()
                     && (frames.len() >= 64
                         || frames.values().map(|p| p.buf.img.data.len()).sum::<usize>().saturating_add(pixels.buf.img.data.len()) > 16_777_216)
