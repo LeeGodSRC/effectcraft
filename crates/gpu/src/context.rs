@@ -1194,6 +1194,18 @@ impl<'g> Enc<'g> {
         img
     }
 
+    /// A new image with every pixel `px` (a solid layer's source, made here rather than
+    /// uploaded).
+    pub fn solid(&mut self, w: u32, h: u32, px: [f32; 4]) -> GpuImage {
+        self.reclaim();
+        let (img, _) = self.g.pooled(w, h);
+        let mut p = Params::default();
+        p.f[0] = px;
+        let dummy = GpuImage::new(self.g.dummy.clone(), 1, 1);
+        self.pixels("fill", &p, &dummy, None, &img, None);
+        img
+    }
+
     /// Set every pixel of `img` to `v`.
     fn fill(&mut self, img: &GpuImage, v: f32) {
         let mut p = Params::default();

@@ -341,6 +341,21 @@ impl Accelerator for Gpu {
         Some(&self.auto)
     }
 
+    fn diagnostics(&self) -> Option<String> {
+        let (t, p) = (self.ctx.transfer_stats(), self.ctx.pool_usage());
+        let mb = |b: u64| b as f64 / 1048576.0;
+        Some(format!(
+            "{} uploads ({:.0} MB), {} readbacks ({:.0} MB), working textures peak {:.0} MB ({} reused, {} allocated)",
+            t.uploads,
+            mb(t.upload_bytes),
+            t.readbacks,
+            mb(t.readback_bytes),
+            mb(p.peak_bytes as u64),
+            p.hits,
+            p.misses
+        ))
+    }
+
     fn frame_begin(&self) {
         if let Some(d) = self.ctx.deferred() {
             d.frame_begin();

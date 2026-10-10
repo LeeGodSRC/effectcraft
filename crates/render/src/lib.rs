@@ -369,6 +369,11 @@ pub trait Accelerator: Send + Sync {
     fn particles(&self) -> Option<&dyn effectcraft_effects::psim::ParticleSim> {
         None
     }
+    /// A one-line account of the work so far for logs and the command line (transfers between
+    /// main and video memory, working memory). `None` = nothing to report.
+    fn diagnostics(&self) -> Option<String> {
+        None
+    }
     /// Timing history [`Backend::Auto`] uses to send each comp's top-level frames to the
     /// faster compositor. `None` = Auto always tries the accelerator first.
     fn auto_pick(&self) -> Option<&AutoPick> {
@@ -2457,11 +2462,11 @@ impl<'a> Renderer<'a> {
 
     /// A 2D layer whose effects an accelerator can run on its own device and keep there, instead
     /// of each frame's result being read back for the layer cache and uploaded again to be
-    /// composited: the layer's input (source → masks, in effect space) and where effect space
-    /// starts in layer coordinates. Only for a stack that changes from frame to frame (a still
+    /// composited: where effect space starts in layer coordinates (the stack runs on the
+    /// layer's input, [`Self::layer_input`] or [`Self::plain_solid`], in effect space). Only for a stack that changes from frame to frame (a still
     /// one is rendered once and kept by the layer cache) and whose every effect the accelerator
     /// supports; no layer styles, no motion-blurred content.
-    pub fn resident_effects(&self, ctx: &EvalCtx, layer: &Layer) -> Option<(Arc<Buf>, [f64; 2])> {
+    pub fn resident_effects(&self, ctx: &EvalCtx, layer: &Layer) -> Option<[f64; 2]> {
         let a = self.active_accel()?;
         if layer.switches.adjustment || layer.is_3d() || !layer.switches.effects || styles::active(ctx, layer) || self.content_times(ctx, layer).is_some() {
             return None;
@@ -2476,7 +2481,25 @@ impl<'a> Renderer<'a> {
         if !stack.all(runs_there) || !(cache::animated(fx) || cache::time_dependent(layer)) {
             return None;
         }
-        Some((self.layer_input(ctx, layer, 0)?, ctx.effect_bounds(layer).1))
+        Some(ctx.effect_bounds(layer).1)
+    }
+
+    /// An unmasked solid layer's pixel and buffer size at this render's scale: an accelerator
+    /// fills its own image with it instead of taking a filled buffer from here. `None` for any
+    /// other layer (use [`Self::layer_input`]).
+    pub fn plain_solid(&self, ctx: &EvalCtx, layer: &Layer) -> Option<([f32; 4], u32, u32)> {
+        let LayerSource::Solid { item } = &layer.source else { return None };
+        if layer.switches.adjustment || self.content_times(ctx, layer).is_some() || layer.masks().is_some_and(|m| !m.children.is_empty()) {
+            return None;
+        }
+        let ItemKind::Solid(sol) = &self.project.item(*item)?.kind else { return None };
+        let mut c = sol.color;
+        if let Some(conv) = self.pipe.authored_in() {
+            c = conv.apply(c);
+        }
+        let s = self.opts.scale;
+        let (w, h) = (((sol.width as f64 * s).ceil() as u32).max(1), ((sol.height as f64 * s).ceil() as u32).max(1));
+        Some((self.pipe.quantize_px([c[0], c[1], c[2], 1.0]), w, h))
     }
 
     /// [`Self::run_effects_on`] for a layer's own pixels in effect space

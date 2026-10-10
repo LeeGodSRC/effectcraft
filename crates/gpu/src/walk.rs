@@ -326,9 +326,17 @@ fn resident_layer(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer) -> Op
     if e.g.deferred.is_some() || r.pipe().to_blend().is_some() {
         return None;
     }
-    let (input, origin) = r.resident_effects(ctx, layer)?;
-    let src = e.g.upload_buf(&input)?;
-    let mut fx = crate::effects::GpuFx::new(e, src, input.offset, input.scale, r.pipe().levels);
+    let origin = r.resident_effects(ctx, layer)?;
+    // The input in effect space: a solid is filled here, anything else comes from the CPU
+    // renderer (uploaded once while the layer cache keeps it).
+    let (src, offset, scale) = match r.plain_solid(ctx, layer).filter(|(_, w, h)| e.g.fits(*w, *h)) {
+        Some((px, w, h)) => (e.solid(w, h, px), [origin[0] * r.opts.scale, origin[1] * r.opts.scale], r.opts.scale),
+        None => {
+            let input = r.layer_input(ctx, layer, 0)?;
+            (e.g.upload_buf(&input)?, input.offset, input.scale)
+        }
+    };
+    let mut fx = crate::effects::GpuFx::new(e, src, offset, scale, r.pipe().levels);
     r.run_layer_effects_on(ctx, layer, &mut fx);
     let (img, offset, scale) = fx.finish()?;
     // Back from effect space to layer space (`Buf::rebase`).
@@ -398,14 +406,15 @@ fn composite_iso_with(
             }
             None => {
                 let mut mimg = e.zeros(canvas.width, canvas.height);
-                if m.is_active_at(ctx.time)
-                    && let Some(mb) = {
-                        e.park();
-                        r.layer_buf(ctx, m)
-                    }
-                {
+                if m.is_active_at(ctx.time) {
+                    e.park();
                     let mo = ctx.opacity(m) as f32;
-                    mimg = place(e, r, ctx, m, &mb, &mimg, BlendMode::Normal, mo, None)?;
+                    // (A matte whose effects run here stays here too.)
+                    if let Some((img, head)) = resident_layer(e, r, ctx, m) {
+                        mimg = place_src(e, r, ctx, m, &head, &img, &mimg, BlendMode::Normal, mo, None)?;
+                    } else if let Some(mb) = r.layer_buf(ctx, m) {
+                        mimg = place(e, r, ctx, m, &mb, &mimg, BlendMode::Normal, mo, None)?;
+                    }
                 }
                 mimg
             }

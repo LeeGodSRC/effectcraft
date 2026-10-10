@@ -738,6 +738,9 @@ fn render(args: &Args, json_out: bool) -> Result<(), Failure> {
             other => failed.push(format!("{name}: {}", other.label())),
         }
     }
+    if let Some(d) = s.accel.as_ref().and_then(|a| a.diagnostics()) {
+        note!("gpu: {d}");
+    }
     if !failed.is_empty() {
         return Err(Failure::Error(failed.join("; ")));
     }
