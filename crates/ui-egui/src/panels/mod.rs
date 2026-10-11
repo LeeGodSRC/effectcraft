@@ -78,6 +78,32 @@ pub enum DragPayload {
     Files(Vec<String>),
 }
 
+/// Layers carried by a Project item drag. Dragging a selected item uses the
+/// complete selection, while dragging an unselected item uses only that item.
+/// Folders and data files are not composition layers.
+pub(crate) fn project_drop_items(app: &EffectcraftApp, dragged: u64) -> Vec<u64> {
+    use effectcraft_engine::project::{FootageKind, ItemId, ItemKind};
+
+    let selected = &app.session.state.project_selection;
+    let candidates: Vec<u64> = if selected.iter().any(|id| id.0 == dragged) {
+        selected.iter().map(|id| id.0).collect()
+    } else {
+        // One unselected item goes through as is, so a folder or data file still gets the
+        // engine's error instead of a silent no-op.
+        return vec![dragged];
+    };
+    candidates
+        .into_iter()
+        .filter(|id| {
+            app.session.project.item(ItemId(*id)).is_some_and(|item| match &item.kind {
+                ItemKind::Comp(_) | ItemKind::Solid(_) => true,
+                ItemKind::Footage(f) => f.kind != FootageKind::Data,
+                ItemKind::Folder => false,
+            })
+        })
+        .collect()
+}
+
 /// The current time formatted per project settings (timecode with `;` for drop-frame, frames
 /// or Feet + Frames).
 pub fn timecode(session: &Session, comp: &Comp, t: Tick) -> String {
@@ -152,13 +178,13 @@ pub fn panel_menu_popup(app: &mut EffectcraftApp, ui: &mut egui::Ui) {
         egui::Frame::popup(ui.style()).show(ui, |ui| {
             ui.set_min_width(200.0);
             if ui.button(tr("Close Panel")).clicked() {
-                app.close_panel(panel);
+                let _ = app.dock_command(ui.ctx(), craft_ui::docking::Action::Close { panel });
                 close = true;
             }
             let floating = app.ui.floating.iter().any(|f| f.panels.contains(&panel));
             if !floating && ui.button(tr("Undock Panel")).clicked() {
                 let r = crate::dock_ui::default_float_rect(ui.ctx().content_rect());
-                app.edit_layout(|l| l.float(panel, r));
+                let _ = app.dock_command(ui.ctx(), craft_ui::docking::Action::Float { panel, rect: r });
                 close = true;
             }
             if !floating && ui.button(if app.ui.maximized == Some(panel) { tr("Restore Panel Size") } else { tr("Maximize Panel") }).clicked() {

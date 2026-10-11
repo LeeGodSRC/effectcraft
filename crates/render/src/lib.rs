@@ -53,8 +53,16 @@ pub(crate) fn preserve_pixel(mode: BlendMode, dst: [f32; 4], src: [f32; 4], nois
 pub trait FootageSource: Send + Sync {
     /// The frame of `item` at source time `t`, straight from the file (any size).
     fn frame(&self, item: ItemId, footage: &Footage, t: Tick) -> Option<Arc<Image>>;
+    /// [`FootageSource::frame`] for a render that shows it at `width` × `height`, at most half its
+    /// size: either that frame or, when the source can make it more cheaply than the whole frame
+    /// (movies, see `effectcraft-media`), the frame already resampled to that size as
+    /// [`effectcraft_raster::resample`] would.
+    fn frame_at_size(&self, item: ItemId, footage: &Footage, t: Tick, _width: u32, _height: u32) -> Option<Arc<Image>> {
+        self.frame(item, footage, t)
+    }
     /// `frames` interleaved stereo sample frames of `item`'s audio from source time `t` at
-    /// `rate` Hz (`None` when unavailable).
+    /// `rate` Hz (`None` when unavailable). The first sample is `t.to_units_floor(rate)`;
+    /// a sample boundary uses the earliest representable tick that selects that sample.
     fn audio(&self, _item: ItemId, _footage: &Footage, _t: Tick, _frames: usize, _rate: u32) -> Option<Vec<f32>> {
         None
     }
@@ -74,6 +82,10 @@ pub trait FootageSource: Send + Sync {
     /// Drop the decoded frames it keeps (Edit ▸ Purge ▸ All Memory / Image Cache Memory): the
     /// next reads decode again. Sources without a cache ignore it.
     fn purge(&self) {}
+    /// The file at `path` changed on disk (Reload Footage): drop what it keeps of it (decoded
+    /// frames, open decoders, parsed models), so the next reads see the new contents. Sources
+    /// without a cache ignore it.
+    fn forget(&self, _path: &str) {}
     /// Settings ▸ Disk ▸ Conformed Audio Folder: where decoded audio is kept between reads
     /// (`None` = off); sources that don't decode audio ignore it.
     fn set_conform_folder(&self, _folder: Option<std::path::PathBuf>) {}
@@ -105,6 +117,7 @@ struct FxHost<'r, 'a, 'c> {
     origin: [f64; 2],
     /// Index of the effect being rendered (bounds `self_at` to effects before it).
     index: std::sync::atomic::AtomicUsize,
+    original: Option<&'c Buf>,
 }
 
 impl FxHost<'_, '_, '_> {
@@ -157,12 +170,16 @@ pub(crate) fn comp_scene(ctx: &EvalCtx, layer: &Layer) -> Option<effectcraft_eff
 const MAX_FX_DEPTH: usize = 8;
 
 impl EffectHost for FxHost<'_, '_, '_> {
+    fn original(&self) -> Option<&Buf> {
+        self.original
+    }
+
     fn particles(&self) -> Option<&dyn effectcraft_effects::psim::ParticleSim> {
         self.r.active_accel().and_then(|a| a.particles())
     }
     fn layer(&self, id: u64, masks_and_effects: bool) -> Option<LayerPixels> {
         let other = self.ctx.layer(effectcraft_project::LayerId(id))?;
-        if other.id == self.layer.id || self.r.depth > MAX_FX_DEPTH {
+        if (other.id == self.layer.id && masks_and_effects) || self.r.depth > MAX_FX_DEPTH {
             return None;
         }
         let sub = self.r.nested();
@@ -200,7 +217,7 @@ impl EffectHost for FxHost<'_, '_, '_> {
 
     fn layer_masks(&self, id: u64) -> Option<LayerPixels> {
         let other = self.ctx.layer(effectcraft_project::LayerId(id))?;
-        if other.id == self.layer.id || self.r.depth > MAX_FX_DEPTH {
+        if self.r.depth > MAX_FX_DEPTH {
             return None;
         }
         let sub = self.r.nested();
@@ -270,14 +287,17 @@ impl EffectHost for FxHost<'_, '_, '_> {
 
     fn layer_at(&self, id: u64, comp_time: f64, masks_and_effects: bool) -> Option<LayerPixels> {
         let other = self.ctx.layer(effectcraft_project::LayerId(id))?;
-        if other.id == self.layer.id || self.r.depth > MAX_FX_DEPTH {
+        if (other.id == self.layer.id && masks_and_effects) || !comp_time.is_finite() || self.r.depth > MAX_FX_DEPTH {
             return None;
         }
         let ctx = self.ctx.at(Tick::from_seconds_f64(comp_time));
         let sub = self.r.nested();
         Some(if masks_and_effects {
             self.pixels(other, (*sub.content_buf(&ctx, other)?).clone(), true)
+        } else if other.id == self.layer.id {
+            self.pixels(other, sub.source(&ctx, other)?, true)
         } else {
+            // Preserve other-layer reads: time effects historically see source + masks.
             self.pixels(other, (*sub.layer_input(&ctx, other, 0)?).clone(), false)
         })
     }
@@ -670,6 +690,30 @@ impl<'a> Renderer<'a> {
             through_lost: false,
             ..*self
         }
+    }
+
+    /// A precomp layer's nested comp for an accelerator to render resident (no CPU render and
+    /// upload of the nested frame): the renderer one level down, the comp, its time and the
+    /// buffer scale, exactly as [`Self::layer_source`]'s comp branch would render it. `None`
+    /// when that branch does more (composition proxy, Essential Properties overrides, frame
+    /// blending, recursion) or draws nothing (outside the nested comp's span): use the CPU path.
+    pub fn precomp_source(&self, ctx: &EvalCtx, layer: &Layer) -> Option<(Renderer<'a>, ItemId, Tick, f64)> {
+        let LayerSource::Comp { item } = layer.source else { return None };
+        if layer.switches.adjustment || self.project.comp_contains(item, ctx.comp_id) {
+            return None;
+        }
+        let nc = self.project.comp(item)?;
+        let lt = ctx.nested_time(layer);
+        if self.content_times(ctx, layer).is_some() {
+            return None;
+        }
+        if !nc.covers(lt) || self.proxy_for(item).is_some() || !essential_overrides(ctx, layer).is_empty() || frame_blend_mode(ctx, layer) != FrameBlend::Off {
+            return None;
+        }
+        let s = self.opts.scale;
+        let bs = if s < 1.0 && nc.preserve_resolution { 1.0 } else { s };
+        let base = self.nested_through(layer);
+        Some((Renderer { opts: RenderOpts { scale: bs, ..base.opts }, ..base }, item, lt, bs))
     }
 
     /// The nested comp of a precomp layer whose transformations collapse into this comp: the
@@ -1072,7 +1116,18 @@ impl<'a> Renderer<'a> {
                 *q = [q[0] - origin[0], q[1] - origin[1]];
             }
         }
-        let host = FxHost { r: self, ctx, layer, origin, index: Default::default() };
+        // Capture once, before preceding effects can expand or replace the input. An
+        // adjustment stack's original is the comp below, not its solid source.
+        let needs_original =
+            fx.groups().take(limit).any(|g| g.enabled && matches!(&g.kind, GroupKind::Effect { effect } if effect == "ec.channel.cccomposite"));
+        let mut original = None;
+        if needs_original {
+            target.cpu(&mut |buf| {
+                original = Some(buf.clone());
+                buf
+            });
+        }
+        let host = FxHost { r: self, ctx, layer, origin, index: Default::default(), original: original.as_ref() };
         let env = EffectEnv {
             masks: &mask_shapes,
             host: Some(&host),
@@ -1224,8 +1279,10 @@ impl<'a> Renderer<'a> {
                 }
                 let lt = ctx.source_time(layer);
                 // The proxy is decoded instead, at its own size, and fills the footage's frame.
-                let pf = self.proxy_for(*item).unwrap_or(f);
-                let img = self.footage_frame(ctx, layer, *item, pf, lt)?;
+                let proxy = self.proxy_for(*item);
+                let pf = proxy.unwrap_or(f);
+                let size = self.reduced_size(f.width, f.height).filter(|_| proxy.is_none());
+                let img = self.footage_frame(ctx, layer, *item, pf, lt, size)?;
                 Some(self.footage_buf(&img, pf, f.width, f.height))
             }
             LayerSource::Text => Some(self.authored(text::render(ctx, layer, self.raster_scale(ctx, layer)))),
@@ -1466,17 +1523,23 @@ impl<'a> Renderer<'a> {
         let s = self.opts.scale;
         let k = if img.width > 0 { w.max(1) as f64 / img.width as f64 } else { 1.0 };
         // Keep native pixels when downsampling is small; resample otherwise.
-        let mut buf = if s < 0.75 && k <= 1.0 + 1e-9 {
-            let rw = ((w as f64 * s).round() as u32).max(1);
-            let rh = ((h as f64 * s).round() as u32).max(1);
-            Buf { img: effectcraft_raster::resample(img, rw, rh), offset: [0.0; 2], scale: s }
-        } else {
-            Buf { img: img.clone(), offset: [0.0; 2], scale: 1.0 / k }
+        let mut buf = match self.reduced_size(w, h) {
+            // The source resampled it already (`FootageSource::frame_at_size`).
+            Some(size) if (img.width, img.height) == size => Buf { img: img.clone(), offset: [0.0; 2], scale: s },
+            Some((rw, rh)) if k <= 1.0 + 1e-9 => Buf { img: effectcraft_raster::resample(img, rw, rh), offset: [0.0; 2], scale: s },
+            _ => Buf { img: img.clone(), offset: [0.0; 2], scale: 1.0 / k },
         };
         if let Some(c) = self.pipe.media_in(f) {
             color::convert(&mut buf.img, &c);
         }
         buf
+    }
+
+    /// The size of `w` × `h` layer pixels in this render when it is reduced enough that footage
+    /// is resampled to it (below 3/4 scale).
+    fn reduced_size(&self, w: u32, h: u32) -> Option<(u32, u32)> {
+        let s = self.opts.scale;
+        (s < 0.75).then(|| (((w as f64 * s).round() as u32).max(1), ((h as f64 * s).round() as u32).max(1)))
     }
 
     /// Authored colours into the working space (linear working spaces).
@@ -1490,7 +1553,8 @@ impl<'a> Renderer<'a> {
     /// A footage frame at source time `t`, frame-blended between the two nearest source frames
     /// when the layer's Frame Blending switch (and the comp's Enable Frame Blending) is on and
     /// `t` falls between frames (footage rate ≠ comp rate, time stretch, time remapping).
-    fn footage_frame(&self, ctx: &EvalCtx, layer: &Layer, item: ItemId, f: &Footage, t: Tick) -> Option<Arc<Image>> {
+    /// `size`: a plain frame may come resampled to it ([`FootageSource::frame_at_size`]).
+    fn footage_frame(&self, ctx: &EvalCtx, layer: &Layer, item: ItemId, f: &Footage, t: Tick, size: Option<(u32, u32)>) -> Option<Arc<Image>> {
         // Interpret Footage ▸ Separate Fields: each field is a frame at twice the rate.
         if f.fields != effectcraft_project::FieldOrder::Off && matches!(f.kind, FootageKind::Video | FootageKind::Sequence) {
             let field_rate = FrameRate::new(f.frame_rate.num * 2, f.frame_rate.den);
@@ -1499,13 +1563,15 @@ impl<'a> Renderer<'a> {
             let dominant_upper = f.fields == effectcraft_project::FieldOrder::UpperFirst;
             // Upper field = even lines (0, 2, …).
             let parity = if (i % 2 == 0) == dominant_upper { 0 } else { 1 };
-            return Some(Arc::new(interpret_pixels(&field_frame(&img, parity), f)));
+            return Some(Arc::new(interpret_pixels(&field_frame(&img, parity), f, self.pipe.linear_footage_space(f))));
         }
-        let img = self.footage_frame_raw(ctx, layer, item, f, t)?;
-        if f.invert_alpha || f.linear_light_applies() { Some(Arc::new(interpret_pixels(&img, f))) } else { Some(img) }
+        // Interpretation is per pixel but not linear: it runs on the frame before resampling.
+        let size = size.filter(|_| !(f.invert_alpha || f.linear_light_applies()));
+        let img = self.footage_frame_raw(ctx, layer, item, f, t, size)?;
+        if f.invert_alpha || f.linear_light_applies() { Some(Arc::new(interpret_pixels(&img, f, self.pipe.linear_footage_space(f)))) } else { Some(img) }
     }
 
-    fn footage_frame_raw(&self, ctx: &EvalCtx, layer: &Layer, item: ItemId, f: &Footage, t: Tick) -> Option<Arc<Image>> {
+    fn footage_frame_raw(&self, ctx: &EvalCtx, layer: &Layer, item: ItemId, f: &Footage, t: Tick, size: Option<(u32, u32)>) -> Option<Arc<Image>> {
         let mode = frame_blend_mode(ctx, layer);
         if mode != FrameBlend::Off && matches!(f.kind, FootageKind::Video | FootageKind::Sequence) {
             let (i, w) = frame_position(t, f.frame_rate);
@@ -1533,7 +1599,10 @@ impl<'a> Renderer<'a> {
                 }
             }
         }
-        self.footage.frame(item, f, t)
+        match size {
+            Some((w, h)) => self.footage.frame_at_size(item, f, t, w, h),
+            None => self.footage.frame(item, f, t),
+        }
     }
 
     /// An unmasked solid whose first effect takes its input as one colour instead of reading it
@@ -2554,8 +2623,11 @@ impl<'a> Renderer<'a> {
             GroupKind::Effect { effect } => effectcraft_effects::find(effect).is_some_and(|s| s.gpu && a.supports_effect(s.id)),
             _ => false,
         };
-        // (A nested comp that moves changes the input every frame, whatever the effects do.)
-        if !stack.all(runs_there) || !(cache::animated(fx) || cache::time_dependent(layer) || self.masked_precomp(ctx, layer).is_some()) {
+        // A nested comp that moves changes the input every frame, whatever the effects do: it
+        // stays with the accelerator even when an effect of the stack runs on the CPU (read
+        // back for that effect alone, instead of the whole nested comp being composited here).
+        let precomp = self.masked_precomp(ctx, layer).is_some();
+        if !(precomp || stack.all(runs_there) && (cache::animated(fx) || cache::time_dependent(layer))) {
             return None;
         }
         Some(ctx.effect_bounds(layer).1)
@@ -2579,12 +2651,6 @@ impl<'a> Renderer<'a> {
         Some((self.pipe.quantize_px([c[0], c[1], c[2], 1.0]), w, h))
     }
 
-    /// [`Self::run_effects_on`] for a layer's own pixels in effect space
-    /// ([`Self::resident_effects`]).
-    pub fn run_layer_effects_on(&self, ctx: &EvalCtx, layer: &Layer, target: &mut dyn FxTarget) {
-        self.run_effect_stack(ctx, layer, false, usize::MAX, None, ctx.effect_bounds(layer).1, target);
-    }
-
     /// Run the layer's effect stack on `target` (an accelerator's resident image): GPU-capable
     /// runs through [`FxTarget::gpu`], the others through [`FxTarget::cpu`], with the CPU's
     /// parameters and environment. `adjustment`: the stack runs on the comp below (adjustment
@@ -2592,6 +2658,15 @@ impl<'a> Renderer<'a> {
     pub fn run_effects_on(&self, ctx: &EvalCtx, layer: &Layer, adjustment: bool, target: &mut dyn FxTarget) {
         // `target` is used as it is: the comp below for adjustment layers (the callers).
         self.run_effect_stack(ctx, layer, adjustment, usize::MAX, None, [0.0; 2], target);
+    }
+
+    /// [`Renderer::run_effects_on`] for a (non-adjustment) layer's own pixels: `target` holds
+    /// them in effect space (as [`Renderer::layer_input`] hands them out) and the result stays
+    /// there. Returns the effect-space origin in layer coordinates (rebase by its negation).
+    pub fn run_layer_effects_on(&self, ctx: &EvalCtx, layer: &Layer, target: &mut dyn FxTarget) -> [f64; 2] {
+        let origin = ctx.effect_bounds(layer).1;
+        self.run_effect_stack(ctx, layer, false, usize::MAX, None, origin, target);
+        origin
     }
 
     /// An adjustment layer's footprint (its source with masks applied, layer space): where
@@ -2729,13 +2804,12 @@ pub fn field_frame(img: &Image, parity: usize) -> Image {
 }
 
 /// Interpret Footage ▸ Invert Alpha and Interpret As Linear Light on decoded (premultiplied)
-/// pixels.
-pub fn interpret_pixels(img: &Image, f: &Footage) -> Image {
+/// pixels; linear light is encoded in `space` ([`color::Pipe::linear_footage_space`]).
+pub fn interpret_pixels(img: &Image, f: &Footage, space: effectcraft_color::ColorSpace) -> Image {
     let linear = f.linear_light_applies();
     if !f.invert_alpha && !linear {
         return img.clone();
     }
-    let space = f.color_profile.unwrap_or(effectcraft_color::ColorSpace::Srgb);
     let mut out = img.clone();
     for p in out.data.iter_mut() {
         let a = p[3];
@@ -2851,6 +2925,8 @@ mod tests_aux;
 mod tests_collapse;
 #[cfg(test)]
 mod tests_color;
+#[cfg(test)]
+mod tests_footage_size;
 #[cfg(test)]
 mod tests_frame_blend;
 #[cfg(test)]

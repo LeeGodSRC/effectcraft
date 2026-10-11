@@ -26,6 +26,7 @@ mod distort2;
 mod distort3;
 pub mod distort4;
 pub mod face_track;
+pub mod fidelity;
 mod generate;
 mod generate2;
 mod generate3;
@@ -77,7 +78,7 @@ pub use color2::{Curve, auto_correct_settings, color_link_mode, color_link_sampl
 pub use color3::OffsetCurve;
 pub use distort::transform_shutter;
 pub use distort2::{MAGNIFY_MODES, bezier_grid, parse_mesh};
-pub use distort3::{RESHAPE_POINTS, ReshapeSetup, SmearSetup, reshape_setup, smear_setup, warp_inverse_map};
+pub use distort3::{RESHAPE_POINTS, ReshapeSetup, SmearSetup, cc_smear_pad, reshape_setup, smear_setup, warp_inverse_map};
 pub use distort4::liquify_mesh;
 use effectcraft_keyframe::Value;
 use effectcraft_project::build::Ids;
@@ -323,8 +324,14 @@ impl From<LayerPixels> for LayerView {
 
 /// Services the renderer offers effects that look beyond their own pixels.
 pub trait EffectHost: Sync {
+    /// Pixels entering the effect stack, in effect space, before any effects. For an
+    /// adjustment layer this is the composition below it, in the effect working space.
+    fn original(&self) -> Option<&Buf> {
+        None
+    }
+
     /// Layer `id` of the same composition at the current comp time. `masks_and_effects`
-    /// selects "Effects & Masks" over "Source". `None` for missing/self/recursive references.
+    /// selects "Effects & Masks" over "Source". `None` for missing/recursive references; own Source reads are supported.
     fn layer(&self, id: u64, masks_and_effects: bool) -> Option<LayerPixels>;
     /// `frames` stereo sample frames (interleaved L R …) of layer `id`'s audio starting at comp
     /// time `start` seconds, at `rate` Hz. `None` when the layer has no audio.
@@ -476,6 +483,10 @@ pub(crate) fn p(id: &'static str, name: &'static str, default: Value, ui: ParamU
 }
 pub(crate) fn slider(min: f64, max: f64, smin: f64, smax: f64, decimals: u8) -> ParamUi {
     ParamUi::Slider { min, max, slider_min: smin, slider_max: smax, decimals }
+}
+/// A file parameter offering files with these extensions (Effect Controls' Choose…).
+pub(crate) fn file_ui(exts: &[&str]) -> ParamUi {
+    ParamUi::File { filters: exts.iter().map(|s| s.to_string()).collect() }
 }
 pub(crate) fn popup(opts: &[&str]) -> ParamUi {
     ParamUi::Popup { options: opts.iter().map(|s| s.to_string()).collect() }

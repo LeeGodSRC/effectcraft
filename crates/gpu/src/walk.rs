@@ -151,7 +151,7 @@ fn draw_3d<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, run: &[&'a Laye
         if matches!(l.source, effectcraft_project::LayerSource::Text) || r.layer_opacity(ctx, l) <= 0.0 || r.collapsed(ctx, l).is_some() {
             continue;
         }
-        if let Some((img, head)) = resident_layer(e, r, ctx, l) {
+        if let Some((img, head)) = resident_layer(e, r, ctx, l, false) {
             held.insert(l.id, head);
             textures.insert(l.id.0 as u32, img);
         }
@@ -241,7 +241,7 @@ fn draw_layer(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &
         return done;
     }
     e.park();
-    if let Some((img, head)) = resident_layer(e, r, ctx, layer) {
+    if let Some((img, head)) = resident_layer(e, r, ctx, layer, true) {
         return composite_layer(e, r, ctx, layer, &head, Some(img), canvas, opacity);
     }
     let Some(st) = r.styled_layer(ctx, layer) else { return Some(()) };
@@ -313,8 +313,7 @@ fn draw_adjustment(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canv
 /// the layer's pixels from the CPU renderer).
 fn draw_precomp(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &mut GpuImage, opacity: f32) -> Option<Option<()>> {
     // (Deferred readbacks render in passes keyed per step: left to the CPU path.)
-    // (Nor a linear blending space: layer buffers are converted to it on the CPU.)
-    if e.g.deferred.is_some() || r.pipe().to_blend().is_some() || styles::active(ctx, layer) {
+    if e.g.deferred.is_some() || styles::active(ctx, layer) {
         return None;
     }
     if layer.switches.effects && layer.effects().is_some_and(|fx| fx.groups().any(|g| g.enabled)) {
@@ -322,7 +321,11 @@ fn draw_precomp(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas:
     }
     let (sub, item, t, key) = r.masked_precomp(ctx, layer)?;
     let img = nested_frame(e, &sub, item, t, key)?;
-    let img = masked(e, r, ctx, layer, img, sub.opts.scale)?;
+    let mut img = masked(e, r, ctx, layer, img, sub.opts.scale)?;
+    // Layers blend in the blending space (linear with Blend Colors Using 1.0 Gamma).
+    if let Some(c) = r.pipe().to_blend() {
+        img = ops::convert(e, &img, &c);
+    }
     // The frame as a layer buffer: its size and scale are all the placement reads.
     let head = Arc::new(Buf { img: Image { width: img.width, height: img.height, data: Vec::new() }, offset: [0.0; 2], scale: sub.opts.scale });
     Some(composite_layer(e, r, ctx, layer, &head, Some(img), canvas, opacity))
@@ -357,10 +360,12 @@ fn nested_frame(e: &mut Enc, sub: &Renderer, item: ItemId, t: Tick, key: u64) ->
 /// the effects run on the device, and the result stays there to be composited: no readback and
 /// no second upload. Returns the texture and the buffer it stands for (size, offset, scale).
 /// `None`: not such a layer, or a kernel declined (the caller takes the CPU renderer's pixels).
-fn resident_layer(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer) -> Option<(GpuImage, Arc<Buf>)> {
+fn resident_layer(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, blend: bool) -> Option<(GpuImage, Arc<Buf>)> {
     // (Deferred readbacks render in passes keyed per step: left to the CPU path.)
-    // (Nor a linear blending space: layer buffers are converted to it on the CPU.)
-    if e.g.deferred.is_some() || r.pipe().to_blend().is_some() {
+    // `blend`: the result is composited as the layer and goes to the blending space here; a
+    // matte or a 3D plane stays in the working space, which is left to the CPU path while the
+    // two differ.
+    if e.g.deferred.is_some() || !blend && r.pipe().to_blend().is_some() {
         return None;
     }
     let origin = r.resident_effects(ctx, layer)?;
@@ -379,7 +384,10 @@ fn resident_layer(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer) -> Op
     };
     let mut fx = crate::effects::GpuFx::new(e, src, offset, scale, r.pipe().levels);
     r.run_layer_effects_on(ctx, layer, &mut fx);
-    let (img, offset, scale) = fx.finish()?;
+    let (mut img, offset, scale) = fx.finish()?;
+    if let Some(c) = r.pipe().to_blend() {
+        img = ops::convert(e, &img, &c);
+    }
     // Back from effect space to layer space (`Buf::rebase`).
     let offset = [offset[0] - origin[0] * scale, offset[1] - origin[1] * scale];
     let head = Arc::new(Buf { img: Image { width: img.width, height: img.height, data: Vec::new() }, offset, scale });
@@ -442,7 +450,7 @@ fn composite_iso_with(
                 let blank = e.zeros(out.0, out.1);
                 // Its effects run here when they can, and the result stays here.
                 let mut drawn = None;
-                if let Some((img, head)) = resident_layer(e, r, ctx, m)
+                if let Some((img, head)) = resident_layer(e, r, ctx, m, false)
                     && let Some(prep) = r.prepare_matte_3d_resident(ctx, m, out, head)
                 {
                     drawn = crate::classic3d::draw_run_with(e, &prep, &blank, &std::collections::HashMap::from([(m.id.0 as u32, img)]));
@@ -461,7 +469,7 @@ fn composite_iso_with(
                     e.park();
                     let mo = ctx.opacity(m) as f32;
                     // (A matte whose effects run here stays here too.)
-                    if let Some((img, head)) = resident_layer(e, r, ctx, m) {
+                    if let Some((img, head)) = resident_layer(e, r, ctx, m, false) {
                         mimg = place_src(e, r, ctx, m, &head, &img, &mimg, BlendMode::Normal, mo, None)?;
                     } else if let Some(mb) = r.layer_buf(ctx, m) {
                         mimg = place(e, r, ctx, m, &mb, &mimg, BlendMode::Normal, mo, None)?;

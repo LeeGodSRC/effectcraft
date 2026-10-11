@@ -18,6 +18,7 @@ pub mod commands;
 pub mod config;
 pub mod demo;
 pub mod footage_check;
+pub mod footage_reload;
 pub mod guard;
 pub mod history;
 pub mod jobs;
@@ -125,6 +126,13 @@ pub trait Services: Send + Sync {
     /// Whether a file exists (the background footage check after open).
     fn exists(&self, path: &str) -> bool {
         std::path::Path::new(path).exists()
+    }
+    /// A file's size and modification time (nanoseconds since 1970), to notice that it changed
+    /// on disk (Settings ▸ Import ▸ Reload Footage Changed on Disk); `None` when it can't be read.
+    fn stamp(&self, path: &str) -> Option<(u64, u128)> {
+        let meta = std::fs::metadata(path).ok()?;
+        let modified = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
+        Some((meta.len(), modified.as_nanos()))
     }
     /// Keep a file the app made for itself (footage extracted from a template): like
     /// [`Services::write_file`], creating its folder, but never offered as a download (web: it
@@ -276,6 +284,10 @@ pub struct EditorState {
     /// The last copy was keyframes (Paste pastes keys at the CTI).
     #[serde(skip)]
     pub clip_is_keys: bool,
+    /// Values of selected unanimated properties (match path, value), copied with Edit ▸ Copy;
+    /// Paste sets the same properties of the selected layers.
+    #[serde(skip)]
+    pub value_clipboard: Vec<(String, effectcraft_keyframe::Value)>,
     /// Copied effect instances (Edit ▸ Copy with effects selected); Paste adds them to the
     /// selected layers.
     #[serde(skip)]
@@ -428,6 +440,9 @@ pub struct Session {
     /// Why there is no [`Session::accel`] (`render.backend`'s `why`): the host's reason, e.g. a
     /// headless start without `--gpu` or the compositor's setup error.
     pub accel_note: Option<String>,
+    /// The graphics adapter and backend the window draws with (`NVIDIA GeForce RTX 4070
+    /// (Vulkan)`), as the host reports it: the System Compatibility Report shows it.
+    pub window_adapter: Option<String>,
     /// Expression syntax checker (set by the host that links the expression engine).
     pub expr_check: Option<fn(&str) -> std::result::Result<(), String>>,
     pub importer: Option<Arc<dyn Importer>>,
@@ -531,7 +546,20 @@ pub struct Session {
     pub last_aep_report: Option<crate::aep::AepReport>,
     /// Original AEP sources remain write-protected even after dismissing or replacing a report.
     pub protected_aep_sources: Vec<String>,
+    /// Each footage file's size and modification time when last seen (Settings ▸ Import ▸
+    /// Reload Footage Changed on Disk, [`footage_reload`]).
+    pub footage_stamps: std::collections::HashMap<String, footage_reload::Stamp>,
+    /// The stamps being taken on a worker thread ([`footage_reload::start_scan`]).
+    pub footage_scan: Option<footage_reload::Scan>,
+    /// How many script-issued commands are running ([`Session::execute_for_script`]): while one
+    /// is, settings that guard what scripts may do can't change (see
+    /// [`prefs::Scripting::same_permissions`]).
+    pub script_calls: ScriptCalls,
 }
+
+/// The count behind [`Session::running_for_script`]; only the engine changes it.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ScriptCalls(u32);
 
 /// A thumbnail render ([`Session::thumbnail_job`]): (width, height, RGBA8).
 pub type ThumbnailJob = Box<dyn FnOnce() -> Option<(u32, u32, Vec<u8>)> + Send>;
@@ -570,6 +598,7 @@ impl Default for Session {
             expr: None,
             accel: None,
             accel_note: None,
+            window_adapter: None,
             expr_check: None,
             importer: None,
             exporter: None,
@@ -618,6 +647,9 @@ impl Default for Session {
             check_footage_on_open: false,
             last_aep_report: None,
             protected_aep_sources: Vec::new(),
+            footage_stamps: Default::default(),
+            footage_scan: None,
+            script_calls: ScriptCalls::default(),
         }
     }
 }
@@ -658,6 +690,22 @@ impl Session {
         let spec = commands::find(id).ok_or_else(|| EngineError::UnknownCommand(id.to_string()))?;
         commands::check_params(spec, &params)?;
         self.execute(id, params)
+    }
+
+    /// [`Session::execute`] for a command a script asked for (the JavaScript engine's
+    /// `app.run`, ScriptUI callbacks…). The command and everything it runs count as the script's:
+    /// it may not change the settings that limit scripts (Settings ▸ Scripting & Expressions ▸
+    /// Application Scripting), which only the user can, from the UI, CLI or control channel.
+    pub fn execute_for_script(&mut self, id: &str, params: Value) -> Result<Value> {
+        self.script_calls.0 = self.script_calls.0.saturating_add(1);
+        let r = self.execute(id, params);
+        self.script_calls.0 = self.script_calls.0.saturating_sub(1);
+        r
+    }
+
+    /// Whether the command running was issued by a script ([`Session::execute_for_script`]).
+    pub fn running_for_script(&self) -> bool {
+        self.script_calls.0 > 0
     }
 
     pub fn is_enabled(&self, id: &str) -> bool {
@@ -1096,6 +1144,8 @@ mod tests_fidelity;
 #[cfg(test)]
 mod tests_frame_export;
 #[cfg(test)]
+mod tests_key_metadata_order;
+#[cfg(test)]
 mod tests_keylight;
 #[cfg(test)]
 mod tests_lottie;
@@ -1241,3 +1291,6 @@ mod tests_paint;
 mod tests_panels;
 #[cfg(test)]
 mod tests_roto;
+
+#[cfg(test)]
+mod tests_key_time;

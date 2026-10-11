@@ -588,7 +588,8 @@ fn loop_on_two_dimensional_position() {
     let mut f = fx();
     f.layer_mut(f.a).props.prop_mut(POS).unwrap().keys =
         vec![Keyframe::new(secs(0.0), Value::Vec3([0.0, 0.0, 0.0])), Keyframe::new(secs(1.0), Value::Vec3([100.0, 50.0, 0.0]))];
-    assert_eq!(f.pos("loopOut('offset')", 1.5), [150.0, 75.0, 0.0]);
+    let p = f.pos("loopOut('offset')", 1.5);
+    assert!(p.iter().zip([150.0, 75.0, 0.0]).all(|(a, b)| (a - b).abs() < 1e-9), "{p:?}");
 }
 
 #[test]
@@ -1176,4 +1177,16 @@ fn separated_position_aliases_resolve_in_imported_expressions() {
     assert_close!(f.num("transform.xPosition + transform.yPosition + transform.zPosition", 0.0), 150.0);
     let value = f.ev(f.a, "transform/positionX", "(transform.xPosition + time * 1500) % 4000", 0.5).unwrap();
     assert_close!(value.as_f64(), 775.0);
+}
+
+#[test]
+fn pending_text_style_baseline_setters_are_visible_to_expression_getters() {
+    let x = fx();
+    assert_eq!(x.num("thisComp.layer('Title').text.sourceText.style.setSuperscript(true).isSuperscript ? 1 : 0", 0.0), 1.0);
+    assert_eq!(x.num("thisComp.layer('Title').text.sourceText.style.setSubscript(true).isSubscript ? 1 : 0", 0.0), 1.0);
+    assert_eq!(x.num("thisComp.layer('Title').text.sourceText.style.setSuperscript(true).setSubscript(true).isSuperscript ? 1 : 0", 0.0), 0.0);
+    assert_eq!(x.num("thisComp.layer('Title').text.sourceText.style.setSuperscript(true).setSubscript(true).isSubscript ? 1 : 0", 0.0), 1.0);
+    assert_eq!(x.num("thisComp.layer('Title').text.sourceText.style.setSubscript(true).setSubscript(false).isSubscript ? 1 : 0", 0.0), 0.0);
+    assert_eq!(x.num("thisComp.layer('Title').text.sourceText.style.setBaselineOption('superscript').isSuperscript ? 1 : 0", 0.0), 1.0);
+    assert_eq!(x.text("var s = text.sourceText.style.setSuperscript(true); s.setText(s.isSuperscript ? 'super' : 'normal')", 0.0), "super");
 }
