@@ -112,6 +112,18 @@ fn point(e: &mut Enc, id: &str, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
             }
             p.u[0] = [5, pr.e("inputPhase/mode"), smooth as u32, 0];
             p.f[0] = [pr.f("outputCycle/cycles").max(0.0) as f32, f("inputPhase/phaseShift") / 360.0, 1.0 - f("blend") / 100.0, 0.0];
+            // Any palette but the hue wheel (which the kernel computes), or Modify Alpha: the
+            // stops go to the kernel as data (position, r, g, b, a each).
+            let modify_alpha = pr.b("modify/modifyAlpha");
+            if pr.e("outputCycle/usePresetPalette") != 0 || modify_alpha {
+                let palette = effectcraft_effects::ColoramaPalette::of(pr);
+                if palette.stops.is_empty() || palette.stops.len() > 256 {
+                    return None;
+                }
+                p.u[1] = [palette.stops.len() as u32, modify_alpha as u32, 0, 0];
+                let stops: Vec<f32> = palette.stops.iter().flat_map(|(pos, c)| [*pos, c[0], c[1], c[2], c[3]]).collect();
+                data = Some(e.data(&stops));
+            }
         }
         "ec.color.channelmixer" => {
             let g = |k: &str| f(k) / 100.0;

@@ -6,11 +6,11 @@ use std::io::Write;
 
 use effectcraft_project::Comp;
 use effectcraft_project::render_queue::{AudioFormat, Channels, OutputFormat, ProResProfile};
-use effectcraft_time::{FrameRate, TICKS_PER_SECOND, Tick};
+use effectcraft_time::{FrameRate, Tick};
 use filmcraft_isobmff::{Brand, FourCc, Mp4Writer, PcmConfig, SampleEntry, TrackConfig, WriteSample, WriterOptions};
 use rayon::prelude::*;
 
-use crate::{Cx, ExportError, Report, Result, State, batch_size, wants_audio};
+use crate::{Cx, ExportError, Report, Result, State, wants_audio};
 
 fn enc(e: impl std::fmt::Display) -> ExportError {
     ExportError::Encode(e.to_string())
@@ -26,7 +26,7 @@ pub(crate) struct Packet {
     pub(crate) cto: i32,
 }
 
-pub(crate) trait VideoEncoder {
+pub(crate) trait VideoEncoder: Send {
     fn sample_entry(&self) -> SampleEntry;
     fn encode(&mut self, rgba: &[u8], index: u64) -> Result<Vec<Packet>>;
     fn flush(&mut self) -> Result<Vec<Packet>>;
@@ -263,7 +263,7 @@ pub(crate) async fn movie(job: &Cx<'_>, comp: &Comp, w: u32, h: u32, st: &mut St
         _ => Box::new(ProRes::new(w, h, job.output.prores_profile, if channels == Channels::Alpha { Channels::Rgb } else { channels })),
     };
     let brand = if fmt == OutputFormat::ProRes { Brand::Mov } else { Brand::Mp4 };
-    let batch = batch_size();
+    let batch = job.batch();
     let render = |_: u64, img: effectcraft_raster::Image| -> Vec<u8> { job.pixels(&img, comp, channels, w, h) };
 
     // Encode the first batch before creating tracks: encoders finalise their config on frame 1.
@@ -331,7 +331,8 @@ pub(crate) async fn movie(job: &Cx<'_>, comp: &Comp, w: u32, h: u32, st: &mut St
             return Ok(());
         }
         let n = (end - *cursor) as usize;
-        let start = Tick(((*cursor as i128 * TICKS_PER_SECOND as i128) / sr as i128) as i64);
+        let start = Tick::from_units(*cursor, i64::from(sr));
+        let start = if start.to_units_floor(i64::from(sr)) < *cursor { Tick(start.0.saturating_add(1)) } else { start };
         let buf = mix(job, start, n, sr);
         *cursor = end;
         match a {
@@ -353,16 +354,57 @@ pub(crate) async fn movie(job: &Cx<'_>, comp: &Comp, w: u32, h: u32, st: &mut St
     let frame_end_time = |k: u64| -> Tick { if k >= total { span_end } else { job.settings.frame_time(comp, k) } };
     write_video(&mut mux, pending)?;
     write_audio_until(&mut mux, frame_end_time(first_end), &mut cursor)?;
-    let mut i = first_end;
-    while i < total {
-        let end = (i + batch).min(total);
-        let frames: Vec<Vec<u8>> = job.frames(comp, (i..end).collect(), render).await;
+    // Encoding is serial (each frame leans on the one before): a batch is encoded while the
+    // next one renders, instead of the renderer waiting for it.
+    fn encode(venc: &mut dyn VideoEncoder, frames: &[Vec<u8>], at: u64) -> Result<Vec<Packet>> {
+        let mut ps = Vec::new();
         for (k, px) in frames.iter().enumerate() {
-            let ps = venc.encode(px, i + k as u64)?;
-            write_video(&mut mux, ps)?;
+            ps.extend(venc.encode(px, at + k as u64)?);
         }
-        write_audio_until(&mut mux, frame_end_time(end), &mut cursor)?;
+        Ok(ps)
+    }
+    // With worker threads the frames stream instead: one starts as another finishes, and this
+    // thread encodes them in order as they arrive (audio written per batch as below).
+    let streamed = job.streams();
+    if streamed {
+        job.stream(comp, first_end, total, batch, render, |k, px| {
+            st.advance(1)?;
+            write_video(&mut mux, venc.encode(&px, k)?)?;
+            if (k + 1 - first_end).is_multiple_of(batch) || k + 1 == total {
+                write_audio_until(&mut mux, frame_end_time(k + 1), &mut cursor)?;
+            }
+            Ok(())
+        })?;
+    }
+    // Rendered frames `[a, b)` not encoded yet.
+    let mut waiting: Option<(Vec<Vec<u8>>, u64, u64)> = None;
+    let mut i = if streamed { total } else { first_end };
+    loop {
+        let end = (i + batch).min(total);
+        let ks: Vec<u64> = (i..end).collect();
+        let rendered = match waiting.take() {
+            Some((frames, a, b)) => {
+                let (packets, rendered) = if ks.is_empty() {
+                    (encode(venc.as_mut(), &frames, a), None)
+                } else if job.deferred() {
+                    // (Readbacks arrive on this thread: the frames render in passes here.)
+                    let packets = encode(venc.as_mut(), &frames, a);
+                    (packets, Some(job.frames(comp, ks, render).await))
+                } else {
+                    let (packets, rendered) =
+                        rayon::join(|| encode(venc.as_mut(), &frames, a), || effectcraft_render::passes::block_on(job.frames(comp, ks, render)));
+                    (packets, Some(rendered))
+                };
+                write_video(&mut mux, packets?)?;
+                write_audio_until(&mut mux, frame_end_time(b), &mut cursor)?;
+                rendered
+            }
+            None if ks.is_empty() => None,
+            None => Some(job.frames(comp, ks, render).await),
+        };
+        let Some(frames) = rendered else { break };
         st.advance(end - i)?;
+        waiting = Some((frames, i, end));
         i = end;
     }
     write_video(&mut mux, venc.flush()?)?;

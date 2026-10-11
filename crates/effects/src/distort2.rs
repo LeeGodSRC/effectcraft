@@ -20,7 +20,7 @@ use effectcraft_raster::{Image, Px};
 use rayon::prelude::*;
 
 use crate::generate::value_noise;
-use crate::util::{SRC_NAMES, Src, fit_layer, layer_rect, lerp4, map_xy, pick, premul, remap, smoothstep, src_at, unpremul};
+use crate::util::{SRC_NAMES, Src, fit_layer, layer_cover_pad, layer_rect, lerp4, map_xy, pick, premul, remap, smoothstep, src_at, unpremul};
 use crate::{Buf, EffectCtx, EffectSpec, col, num, p, popup, slider};
 
 fn spec(id: &'static str, name: &'static str, params: Vec<crate::ParamSpec>, render: crate::RenderFn) -> EffectSpec {
@@ -166,11 +166,14 @@ fn displacement_map(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let mh = ctx.params.f("maxHorizontal") * b.scale;
     let mv = ctx.params.f("maxVertical") * b.scale;
     let wrap = ctx.params.b("wrapPixelsAround");
+    let layer = ctx.layer_param("displacementMapLayer", false);
+    if crate::util::displacement_map_is_absent(ctx, &layer) {
+        return b;
+    }
     if ctx.params.b("expandOutput") && !wrap && !ctx.adjustment {
         b.pad(mh.abs().max(mv.abs()).ceil() as u32);
     }
     // The map: the chosen layer (Center / Stretch / Tile), else the layer itself.
-    let layer = ctx.layer_param("displacementMapLayer", false);
     let behavior = ctx.params.e("displacementMapBehavior");
     let map_size = layer.as_ref().map(|o| o.size);
     let map = match layer {
@@ -605,19 +608,27 @@ fn bend_it(ctx: &EffectCtx, mut b: Buf) -> Buf {
 
 fn cc_lens(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let c = b.to_px(ctx.params.v2("center"));
-    let (_, _, lw, lh) = layer_rect(ctx, &b);
-    let r = (ctx.params.f("size") / 100.0 * lw.max(lh) * 0.5).max(0.5);
-    let k = 2f64.powf(ctx.params.f("convergence") / 50.0);
+    let (_, _, _, lh) = layer_rect(ctx, &b);
+    // Cycore's public manual specifies a circular lens and signed distortion,
+    // but no equation or size units. Height-relative diameter and interpolation
+    // between planar and spherical radii are inferred from reference renders.
+    // Do not exponentiate the radius: that makes the centre's magnification
+    // unbounded and turns a large lens into a nearly constant centre sample.
+    let r = (ctx.params.f("size") / 100.0 * lh * 0.5).max(0.0);
+    let convergence = ctx.params.f("convergence");
+    let convergence = if convergence.is_finite() { (convergence / 100.0).clamp(-1.0, 1.0) } else { 0.0 };
     b.img = remap(&b.img, false, |x, y| {
         let (dx, dy) = (x - c.0, y - c.1);
         let d = (dx * dx + dy * dy).sqrt();
-        if d >= r {
+        if !r.is_finite() || d >= r {
             return None;
         }
-        if d < 1e-9 {
+        if d < 1e-9 || convergence == 0.0 {
             return Some((x, y));
         }
-        let g = ((d / r).asin() / FRAC_PI_2).powf(k);
+        let u = (d / r).clamp(0.0, 1.0);
+        let spherical = if convergence >= 0.0 { u.asin() / FRAC_PI_2 } else { (u * FRAC_PI_2).sin() };
+        let g = u + (spherical - u) * convergence.abs();
         let s = r * g / d;
         Some((c.0 + dx * s, c.1 + dy * s))
     });
@@ -678,6 +689,9 @@ fn page_turn(ctx: &EffectCtx, mut b: Buf) -> Buf {
 
 fn cc_tiler(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let s = (ctx.params.f("scale") / 100.0).max(0.001);
+    if !ctx.adjustment {
+        b.pad(layer_cover_pad(ctx, [b.img.width, b.img.height], b.offset, b.scale));
+    }
     let c = b.to_px(ctx.params.v2("center"));
     let blend = (ctx.params.f("blendWithOriginal") / 100.0) as f32;
     let (x0, y0, w, h) = layer_rect(ctx, &b);
@@ -1025,6 +1039,43 @@ mod tests {
         assert!(o.img.get(16, 16)[3] > 0.99);
     }
 
+    #[test]
+    fn cc_lens_zero_convergence_preserves_pixels_inside_height_sized_circle() {
+        let img = test_img(80, 40);
+        let out = run("ec.distort.cclens", &[("size", num(100.0)), ("convergence", num(0.0))], img.clone());
+        for y in 0..40 {
+            for x in 0..80 {
+                let inside = (x as f64 + 0.5 - 40.0).hypot(y as f64 + 0.5 - 20.0) < 20.0;
+                if inside {
+                    assert_eq!(out.img.get(x, y), img.get(x, y));
+                } else {
+                    assert_eq!(out.img.get(x, y), [0.0; 4]);
+                }
+            }
+        }
+        let empty = run("ec.distort.cclens", &[("size", num(0.0))], img);
+        assert!(empty.img.data.iter().all(|p| *p == [0.0; 4]));
+    }
+
+    #[test]
+    fn cc_lens_signed_convergence_keeps_centre_detail_and_covers_large_lens() {
+        // Encode source coordinates in colour, so sampling positions can be measured.
+        let mut img = Image::new(80, 40);
+        for y in 0..40 {
+            for x in 0..80 {
+                img.set(x, y, [(x as f32 + 0.5) / 80.0, (y as f32 + 0.5) / 40.0, 0.0, 1.0]);
+            }
+        }
+        let positive = run("ec.distort.cclens", &[("size", num(230.0)), ("convergence", num(100.0))], img.clone());
+        assert!(positive.img.data.iter().all(|p| p[3] > 0.999));
+        let a = positive.img.get(40, 20)[0];
+        let b = positive.img.get(41, 20)[0];
+        assert!((b - a) * 80.0 > 0.6, "finite magnification must retain the centre's slope");
+        let negative = run("ec.distort.cclens", &[("size", num(230.0)), ("convergence", num(-100.0))], img.clone());
+        assert!(positive.img.get(50, 20)[0] < img.get(50, 20)[0]);
+        assert!(negative.img.get(50, 20)[0] > img.get(50, 20)[0]);
+    }
+
     /// A host whose every layer is a flat 8×8 image of `px`.
     struct FlatHost([f32; 4]);
     impl crate::EffectHost for FlatHost {
@@ -1034,6 +1085,30 @@ mod tests {
         fn audio(&self, _: u64, _: f64, _: usize, _: u32) -> Option<Vec<f32>> {
             None
         }
+    }
+
+    /// A host whose layers have no picture (ended, or not begun).
+    struct EmptyHost;
+    impl crate::EffectHost for EmptyHost {
+        fn layer(&self, _: u64, _: bool) -> Option<crate::LayerPixels> {
+            None
+        }
+        fn audio(&self, _: u64, _: f64, _: usize, _: u32) -> Option<Vec<f32>> {
+            None
+        }
+    }
+
+    #[test]
+    fn displacement_map_without_a_map_frame_moves_nothing() {
+        let img = test_img(32, 24);
+        let s = crate::find("ec.distort.displacementmap").unwrap();
+        let mut params = Params { values: s.params.iter().map(|p| (p.id.to_string(), p.default.clone())).collect() };
+        params.values.insert("displacementMapLayer".into(), Value::Layer(Some(7)));
+        params.values.insert("maxHorizontal".into(), num(9.0));
+        let env = crate::EffectEnv { host: Some(&EmptyHost), ..Default::default() };
+        let ctx = EffectCtx { params: &params, time: 0.0, layer_size: [32.0, 24.0], seed: 1, adjustment: false, env };
+        let o = crate::apply(s, &ctx, Buf { img: img.clone(), offset: [0.0, 0.0], scale: 1.0 });
+        assert_eq!(o.img, img);
     }
 
     #[test]

@@ -14,15 +14,9 @@ fn fxn_pixel(gid: vec3<u32>) -> vec2<i32> {
     return p;
 }
 
-// Refine approximate GPU division with two fma residual corrections before restoring
-// the median's straight colour. Driver float optimisations can still affect rounding;
-// the fixed median levels instead come from a CPU-rounded lookup table.
+// Median threshold comparisons use correctly rounded division on every backend.
 fn fxn_div4(a: vec4<f32>, b: vec4<f32>) -> vec4<f32> {
-    let q = a / b;
-    let r = fma(-q, b, a);
-    let corrected = fma(r, 1.0 / b, q);
-    let residual = fma(-corrected, b, a);
-    return fma(residual, 1.0 / b, corrected);
+    return vec4<f32>(div_rn(a.x,b.x),div_rn(a.y,b.y),div_rn(a.z,b.z),div_rn(a.w,b.w));
 }
 
 // util::unpremul: (straight colour, alpha).
@@ -644,6 +638,9 @@ fn fxn_fractal(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (kind == 7u) {
         raw = best;
     }
+    if (P.u[1].z != 0u) {
+        raw = 1.0 - raw;
+    }
     var val = (raw - 0.5) * P.f[1].x + 0.5 + P.f[1].y;
     let ov = P.u[1].w;
     if (ov == 0u) {
@@ -654,15 +651,12 @@ fn fxn_fractal(@builtin(global_invocation_id) gid: vec3<u32>) {
         let t = val - 2.0 * floor(val / 2.0);
         val = select(t, 2.0 - t, t > 1.0);
     }
-    if (P.u[1].z != 0u) {
-        val = 1.0 - val;
-    }
     let op = P.f[1].z;
     let s = vec4<f32>(vec3<f32>(val * op), op);
     let orig = textureLoad(src, p, 0);
     var r = s;
     if (P.u[2].x != 255u) {
-        r = blend_pixel(P.u[2].x, orig, s, 0.5);
+        r = blend_pixel(P.u[2].x, orig, s * orig.a, 0.5);
     }
     let bo = P.f[1].w;
     textureStore(out, p, orig * bo + r * (1.0 - bo));

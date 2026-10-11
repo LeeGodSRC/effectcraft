@@ -13,7 +13,7 @@ use effectcraft_time::{TICKS_PER_SECOND, Tick};
 use crate::encode::VideoEncoder;
 use crate::encode::mix;
 use crate::webm::{CLUSTER, EBML, INFO, OPUS_RATE, SEGMENT, TRACK_ENTRY, TRACKS, el, el_float, el_str, el_uint, id_bytes, opus_encoder, vint};
-use crate::{Cx, Report, Result, State, batch_size, io, wants_audio};
+use crate::{Cx, Report, Result, State, io, wants_audio};
 
 struct Block {
     ms: i64,
@@ -132,7 +132,7 @@ pub(crate) async fn webm_av1(job: &Cx<'_>, comp: &Comp, w: u32, h: u32, st: &mut
         }
     };
 
-    let batch = batch_size();
+    let batch = job.batch();
     let mut i = 0;
     let flush_blocks = |blocks: &mut Vec<Block>, file: &mut crate::out::Out, seg_len: &mut u64| -> Result<()> {
         if !blocks.is_empty() {

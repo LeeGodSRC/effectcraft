@@ -87,7 +87,10 @@ fn basic_3d(ctx: &EffectCtx, mut b: Buf) -> Buf {
 // ---------------------------------------------------------------- Gaussian Blur (Legacy)
 
 fn gaussian_legacy(ctx: &EffectCtx, mut b: Buf) -> Buf {
-    let s = ctx.params.f("blurriness").max(0.0) * 0.5 * b.scale;
+    // Legacy Gaussian / Fast Blur use the same kernel. The 0.375 conversion is
+    // fitted to legacy-blur edge profiles, not a published Adobe formula. Modern
+    // Gaussian Blur has a different response and keeps its own conversion.
+    let s = ctx.params.f("blurriness").max(0.0) * 0.375 * b.scale;
     if s <= 0.0 {
         return b;
     }
@@ -96,10 +99,11 @@ fn gaussian_legacy(ctx: &EffectCtx, mut b: Buf) -> Buf {
         2 => (0.0, 1.0),
         _ => (1.0, 1.0),
     };
-    if !ctx.adjustment {
+    let repeat = ctx.params.b("repeatEdge") || ctx.adjustment;
+    if !repeat {
         b.pad((s * 3.0).ceil() as u32);
     }
-    b.img = gaussian_blur(&b.img, s * kx, s * ky, ctx.adjustment);
+    b.img = gaussian_blur(&b.img, s * kx, s * ky, repeat);
     b
 }
 
@@ -116,6 +120,16 @@ pub fn specs() -> Vec<EffectSpec> {
                 p("preview/drawPreviewWireframe", "Draw Preview Wireframe", Value::Bool(false), ParamUi::Checkbox),
             ],
             basic_3d,
+        ),
+        spec(
+            "ec.obsolete.fastblur",
+            "Fast Blur (Legacy)",
+            vec![
+                p("blurriness", "Blurriness", num(0.0), slider(0.0, 1000.0, 0.0, 50.0, 1)),
+                p("blurDimensions", "Blur Dimensions", Value::Enum(0), popup(&["Horizontal and Vertical", "Horizontal", "Vertical"])),
+                p("repeatEdge", "Repeat Edge Pixels", Value::Bool(false), effectcraft_project::ParamUi::Checkbox),
+            ],
+            gaussian_legacy,
         ),
         spec(
             "ec.obsolete.gaussianlegacy",
@@ -173,6 +187,35 @@ mod tests {
         assert!((total - 1.0).abs() < 1e-3, "{total}");
         let c = out.img.width / 2;
         assert!(out.img.get(c as i64, c as i64)[3] < 0.5);
+    }
+
+    #[test]
+    fn legacy_blurs_share_kernel_and_fast_blur_repeats_edges() {
+        let mut impulse = Image::new(121, 3);
+        impulse.set(60, 1, [1.0; 4]);
+        let params = [("blurriness", num(16.0)), ("blurDimensions", Value::Enum(1))];
+        let gaussian = run_fx("ec.obsolete.gaussianlegacy", &params, impulse.clone(), 0.0, EffectEnv::default());
+        let fast = run_fx("ec.obsolete.fastblur", &params, impulse, 0.0, EffectEnv::default());
+        assert_eq!(gaussian.img, fast.img);
+        let center = (gaussian.img.width / 2) as f64;
+        let mut mass = 0.0;
+        let mut moment = 0.0;
+        for y in 0..gaussian.img.height {
+            for x in 0..gaussian.img.width {
+                let alpha = gaussian.img.get(x as i64, y as i64)[3] as f64;
+                mass += alpha;
+                moment += alpha * (x as f64 - center).powi(2);
+            }
+        }
+        assert!((mass - 1.0).abs() < 1e-5);
+        assert!(((moment / mass).sqrt() - 6.0).abs() < 0.25, "legacy sigma at 16: {}", (moment / mass).sqrt());
+        let white = Image::filled(16, 16, [1.0; 4]);
+        let repeated = run_fx("ec.obsolete.fastblur", &[("blurriness", num(16.0)), ("repeatEdge", Value::Bool(true))], white, 0.0, EffectEnv::default());
+        assert_eq!((repeated.img.width, repeated.img.height), (16, 16));
+        assert!(repeated.img.data.iter().all(|p| (p[3] - 1.0).abs() < 1e-5));
+        let edged = run_fx("ec.obsolete.fastblur", &[("blurriness", num(16.0))], Image::filled(16, 16, [1.0; 4]), 0.0, EffectEnv::default());
+        assert!(edged.img.width > 16);
+        assert!(edged.img.get(18, 18)[3] < 0.5, "transparent outside source bounds");
     }
 
     #[test]

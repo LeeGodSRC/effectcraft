@@ -39,11 +39,53 @@ fn demo(s: &mut Session, _: &Value) -> Result<Value> {
 
 pub(crate) fn open(s: &mut Session, p: &Value) -> Result<Value> {
     let path = str_p(p, "path").ok_or_else(|| bad("file.open", "missing `path`"))?;
-    let bytes = s.services.read_file(path).map_err(|e| EngineError::Other(format!("cannot read {path}: {e}")))?;
+    let bytes = s.services.read_project_file(path).map_err(|e| EngineError::Other(format!("cannot read {path}: {e}")))?;
+    let p_lower = path.to_ascii_lowercase();
+    let is_aep_path = p_lower.ends_with(".aep") || p_lower.ends_with(".aepx");
+    if is_aep_path || crate::aep::is_aep(&bytes) || crate::aep::is_aepx(&bytes) {
+        let (proj, mut report) = crate::aep::from_aep_or_aepx_with_report(&bytes, Some(std::path::Path::new(path))).map_err(EngineError::Other)?;
+        let missing_fonts: Vec<String> =
+            report.fonts.iter().filter(|f| *f != "AdobeInvisFont" && effectcraft_text::fonts::resolve(f, "Regular").missing).cloned().collect();
+        report.missing_fonts = missing_fonts.clone();
+        report.project_path = Some(path.to_string());
+        s.replace_project(proj, None);
+        s.mark_unsaved();
+        s.last_aep_report = Some(report.clone());
+        protect_aep_source(s, path);
+        s.note_project_path(path);
+        let comps_count = s.project.comps().count();
+        s.toast(format!("Opened After Effects project ({comps_count} compositions)"));
+        if s.check_footage_on_open {
+            crate::footage_check::start(s, None, false)?;
+        }
+        if report.missing_footage_count > 0 {
+            s.toast(format!("After Effects Warning: {} file(s) are missing since this project was saved", report.missing_footage_count));
+        }
+        if !missing_fonts.is_empty() {
+            let names = missing_fonts.join(", ");
+            s.toast(format!("After Effects Warning: Missing font(s): {names}"));
+        }
+        if !report.custom_plugins.is_empty() {
+            let names = report.custom_plugins.join(", ");
+            s.toast(format!("After Effects Notice: Unmapped effects detected ({names}). These effects were not imported."));
+        }
+        return Ok(json!({
+            "path": path,
+            "type": "aep",
+            "comps": comps_count,
+            "missingFiles": report.missing_footage_count,
+            "missingFonts": missing_fonts.len(),
+            "plugins": report.plugins,
+            "customPlugins": report.custom_plugins,
+            "importedEffects": report.imported_effect_count,
+            "warnings": report.warnings,
+        }));
+    }
     let text = String::from_utf8(bytes).map_err(|_| EngineError::Other("not a text project file".into()))?;
     // XML copies (File ▸ Save a Copy As XML…) open like the JSON project.
     let text = if crate::xml_project::is_xml(&text) { crate::xml_project::from_xml(&text).map_err(EngineError::Other)? } else { text };
-    let proj = Project::from_json(&text).map_err(|e| EngineError::Other(format!("{path} is not a project EffectCraft can open: {e}")))?;
+    let mut proj = Project::from_json(&text).map_err(|e| EngineError::Other(format!("{path} is not a project EffectCraft can open: {e}")))?;
+    resolve_relative_footage(&mut proj, path, s.services.as_ref());
     s.replace_project(proj, Some(path.to_string()));
     s.note_project_path(path);
     // Written by a newer EffectCraft: what this version doesn't know would be lost on saving.
@@ -62,12 +104,54 @@ pub(crate) fn open(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({"path": path, "savedBy": saved_by}))
 }
 
+/// Footage saved with a relative path (imported by the CLI or an agent as `clip.mp4`, or written
+/// by hand) is found next to the project file, as After Effects looks for footage relative to
+/// the project. It used to be looked up from the working directory: the CLI started in the
+/// project's folder found it, the desktop app (started from the Finder, Explorer or a launcher,
+/// in another folder) showed and rendered nothing (#652). A path that exists from the working
+/// directory is kept.
+fn resolve_relative_footage(p: &mut Project, project_path: &str, services: &dyn crate::Services) {
+    use std::path::Path;
+    let Some(dir) = Path::new(project_path).parent().filter(|d| !d.as_os_str().is_empty()) else { return };
+    let beside = |f: &str| dir.join(f).to_string_lossy().to_string();
+    for item in p.items.values_mut() {
+        let ItemKind::Footage(f) = &mut item.kind else { continue };
+        if f.path.is_empty() || !Path::new(&f.path).is_relative() || services.exists(&f.path) || !services.exists(&beside(&f.path)) {
+            continue;
+        }
+        f.path = beside(&f.path);
+        for frame in f.sequence.iter_mut().filter(|q| Path::new(q.as_str()).is_relative()) {
+            *frame = beside(frame);
+        }
+    }
+}
+
 /// The project file's text for `path`: `.ecproj` JSON, or XML for `.ecprojx` / `.xml` (a
 /// project opened from an XML copy saves as XML again). Fails, writing nothing, when the project
 /// wouldn't read back.
 pub(crate) fn file_text(s: &Session, path: &str) -> Result<String> {
+    ensure_native_save_path(s, path)?;
+
     let json = s.project.to_file_json()?;
     if crate::xml_project::is_xml_path(path) { crate::xml_project::to_xml(&json).map_err(EngineError::Other) } else { Ok(json) }
+}
+
+fn protect_aep_source(s: &mut Session, path: &str) {
+    let source = std::fs::canonicalize(path).ok().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|| path.to_string());
+    if !s.protected_aep_sources.contains(&source) {
+        s.protected_aep_sources.push(source);
+    }
+}
+
+/// Every save variant protects the original binary, including extensionless files opened by
+/// signature and alternate relative/symlink spellings of the same source.
+pub(crate) fn ensure_native_save_path(s: &Session, path: &str) -> Result<()> {
+    let target = std::fs::canonicalize(path).ok();
+    let original = s.protected_aep_sources.iter().any(|source| source == path || target.as_ref().is_some_and(|target| std::path::Path::new(source) == target));
+    if crate::aep::is_aep_path(path) || original {
+        return Err(bad("file.save", "AEP export is unsupported; save as an .ecproj file to keep the original project"));
+    }
+    Ok(())
 }
 
 fn save_to(s: &mut Session, path: &str) -> Result<Value> {
@@ -342,6 +426,46 @@ fn prepare_import(s: &mut Session, p: &Value) -> Result<PendingImport> {
     let mut comps = vec![];
     let mut items = vec![];
     let mut errors = vec![];
+    // Decode AEP before editing; merge all generated IDs consistently in one undo step.
+    s.last_aep_report = None;
+    let mut non_aep = vec![];
+    for path in paths {
+        if !crate::aep::is_aep_path(&path) {
+            non_aep.push(path);
+            continue;
+        }
+        let imported = (|| -> Result<_> {
+            let bytes = s.services.read_file_limited(&path, crate::aep::MAX_FILE_BYTES).map_err(|e| EngineError::Other(e.to_string()))?;
+            let (mut imported, mut report) = crate::aep::from_aep_or_aepx_with_report(&bytes, Some(std::path::Path::new(&path))).map_err(EngineError::Other)?;
+            report.missing_fonts =
+                report.fonts.iter().filter(|f| *f != "AdobeInvisFont" && effectcraft_text::fonts::resolve(f, "Regular").missing).cloned().collect();
+            let result = s.edit("Import After Effects Project", None, |proj, st| {
+                // The decoder only allocates monotonically below next_id. Check the full range
+                // before calling the template merger, which shifts every reference by offset.
+                let next =
+                    proj.next_id.checked_add(imported.next_id).filter(|n| *n < u64::MAX).ok_or_else(|| bad("file.import", "project ID space exhausted"))?;
+                effectcraft_project::essential::offset_ids(&mut imported, proj.next_id);
+                let new_items: Vec<_> = imported.items.keys().map(|id| id.0).collect();
+                let new_comps: Vec<_> = imported.comps().map(|(id, _)| id.0).collect();
+                st.project_selection = new_comps.iter().map(|id| ItemId(*id)).collect();
+                proj.items.extend(imported.items);
+                proj.next_id = next;
+                Ok((new_items, new_comps))
+            })?;
+            s.last_aep_report = Some(report);
+            protect_aep_source(s, &path);
+            Ok(result)
+        })();
+        match imported {
+            Ok((new_items, new_comps)) => {
+                items.extend(new_items);
+                comps.extend(new_comps);
+            }
+            Err(e) => errors.push(format!("{path}: {e}")),
+        }
+    }
+    paths = non_aep;
+
     if let Some(retain) = retain {
         let mut rest = vec![];
         for path in paths {
@@ -376,7 +500,7 @@ fn prepare_import(s: &mut Session, p: &Value) -> Result<PendingImport> {
     }
     // Numbered stills as image sequences (the Import dialog's "<format> Sequence" and Force
     // Alphabetical Order), at `frameRate` or Settings ▸ Import ▸ Sequence Footage.
-    let opts = SequenceOptions::from_params(p);
+    let opts = SequenceOptions::for_import(p);
     let fps = match p.get("frameRate") {
         None | Some(Value::Null) => s.prefs.import.sequence_fps,
         Some(v) => v.as_f64().filter(|x| *x > 0.0 && *x <= 999.0).ok_or_else(|| bad("file.import", "frameRate: frames per second, up to 999"))?,
@@ -577,6 +701,14 @@ fn project_settings(s: &mut Session, p: &Value) -> Result<Value> {
                 ),
             };
         }
+        if let Some(g) = p.get("workingGamma") {
+            // After Effects takes 2.2 or 2.4 only (`app.project.workingGamma`).
+            proj.settings.working_gamma = match g.as_f64() {
+                Some(g) if (g - 2.2).abs() < 1e-6 => 2.2,
+                Some(g) if (g - 2.4).abs() < 1e-6 => 2.4,
+                _ => return Err(bad(cmd, format!("workingGamma: 2.2|2.4, not `{g}`"))),
+            };
+        }
         if proj.settings.color_engine == ColorEngine::Ocio && !proj.settings.working_space.is_some_and(|w| w.is_linear()) {
             return Err(bad(cmd, "the OCIO built-in config's working spaces are acescg and aces2065"));
         }
@@ -680,7 +812,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "File...",
             ["File", "Import"],
             Some("Cmd+I"),
-            "{paths: [string] (files or folders), sequence?: bool (default true: numbered stills of one run import as one image sequence; one picked file brings its whole run, several picked files that range), alphabetical?: bool (Force Alphabetical Order: every image of that type in the folder, by name), frameRate?: fps (image sequences; default Settings ▸ Import ▸ Sequence Footage), importAs?: footage|composition|compositionLayerSizes (Photoshop, PDF, Illustrator and EPS files), layer?: name|index (footage of one Photoshop layer), page?: number from 1 (PDF / Illustrator page), drag?: bool (dropped files: Settings ▸ Import ▸ Default Drag Import As), addToComp?: bool (also add them to the active comp, at time?, index?, position? as in layer.addItem), background?: bool (probe the files in a background job, jobs.list / jobs.wait; returns {job})}",
+            "{paths: [string] (files or folders), sequence?: bool (the Sequence checkbox: true imports numbered stills of one run as one image sequence, one picked file bringing its whole run and several picked files that range; default: a numbered still brings its run, except dropped files (drag), which import as stills as in After Effects; folders' runs import as sequences; false imports stills and a folder's files individually), alphabetical?: bool (Force Alphabetical Order: every image of that type in the folder, by name), frameRate?: fps (image sequences; default Settings ▸ Import ▸ Sequence Footage), importAs?: footage|composition|compositionLayerSizes (Photoshop, PDF, Illustrator and EPS files), layer?: name|index (footage of one Photoshop layer), page?: number from 1 (PDF / Illustrator page), drag?: bool (dropped files: Settings ▸ Import ▸ Default Drag Import As; files import as stills unless sequence), addToComp?: bool (also add them to the active comp, at time?, index?, position? as in layer.addItem), background?: bool (probe the files in a background job, jobs.list / jobs.wait; returns {job})}",
             always,
             import_cmd
         ),
@@ -689,7 +821,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Project Settings...",
             ["File"],
             Some("Cmd+Alt+Shift+K"),
-            "{bitDepth?: 8|16|32, colorEngine?: adobe|ocio, workingSpace?: none|srgb|rec709|rec2020|p3|acescg|aces2065, linearize?, blendLinear?, hdr?: clip|compand|toneMap, outputSpace?: srgb|rec709|rec2020|p3|rec2100pq|rec2100hlg, renderer?: gpu|software, timeDisplay?: timecode|frames|feet35|feet16}",
+            "{bitDepth?: 8|16|32, colorEngine?: adobe|ocio, workingSpace?: none|srgb|rec709|rec2020|p3|acescg|aces2065, workingGamma?: 2.2|2.4 (with no working space), linearize?, blendLinear?, hdr?: clip|compand|toneMap, outputSpace?: srgb|rec709|rec2020|p3|rec2100pq|rec2100hlg, renderer?: gpu|software, timeDisplay?: timecode|frames|feet35|feet16}",
             always,
             project_settings
         ),

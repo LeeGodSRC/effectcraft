@@ -16,6 +16,7 @@ pub mod disk_cache;
 use color::Region;
 pub mod eval;
 pub mod masks;
+mod memo;
 pub mod passes;
 pub mod shapes;
 pub mod styles;
@@ -27,7 +28,7 @@ use std::sync::Arc;
 pub use auto::{AutoKey, AutoPick};
 pub use cache::{CacheStats, LayerCache, LayerStore, PrefetchStore};
 use effectcraft_color::BlendMode;
-use effectcraft_effects::{Buf, EffectCtx, EffectEnv, EffectHost, LayerPixels, Params};
+use effectcraft_effects::{Buf, EffectCtx, EffectEnv, EffectHost, LayerPixels, LayerView, Params};
 use effectcraft_geom::{Mat3, Mat4, vec2};
 use effectcraft_project::{Comp, Footage, FootageKind, FrameBlend, GroupKind, ItemId, ItemKind, Layer, LayerSource, MatteKind, Project, Quality, Sampling};
 pub use effectcraft_raster::Image;
@@ -36,12 +37,32 @@ use effectcraft_time::{FrameRate, TICKS_PER_SECOND, Tick};
 pub use eval::{EvalCtx, ExprHost, effect_bounds, source_size};
 use rayon::prelude::*;
 
+/// Blend within the existing coverage, as a clipping layer. Multiplying the source by
+/// destination alpha before ordinary Over would increase that alpha a second time.
+pub(crate) fn preserve_pixel(mode: BlendMode, dst: [f32; 4], src: [f32; 4], noise: f32) -> [f32; 4] {
+    let a = dst[3];
+    if a <= 0.0 {
+        return [0.0; 4];
+    }
+    let opaque = [dst[0] / a, dst[1] / a, dst[2] / a, 1.0];
+    let blended = effectcraft_color::blend_pixel(mode, opaque, src, noise);
+    [blended[0] * a, blended[1] * a, blended[2] * a, a]
+}
+
 /// Supplies decoded footage frames (implemented by the media layer).
 pub trait FootageSource: Send + Sync {
     /// The frame of `item` at source time `t`, straight from the file (any size).
     fn frame(&self, item: ItemId, footage: &Footage, t: Tick) -> Option<Arc<Image>>;
+    /// [`FootageSource::frame`] for a render that shows it at `width` × `height`, at most half its
+    /// size: either that frame or, when the source can make it more cheaply than the whole frame
+    /// (movies, see `effectcraft-media`), the frame already resampled to that size as
+    /// [`effectcraft_raster::resample`] would.
+    fn frame_at_size(&self, item: ItemId, footage: &Footage, t: Tick, _width: u32, _height: u32) -> Option<Arc<Image>> {
+        self.frame(item, footage, t)
+    }
     /// `frames` interleaved stereo sample frames of `item`'s audio from source time `t` at
-    /// `rate` Hz (`None` when unavailable).
+    /// `rate` Hz (`None` when unavailable). The first sample is `t.to_units_floor(rate)`;
+    /// a sample boundary uses the earliest representable tick that selects that sample.
     fn audio(&self, _item: ItemId, _footage: &Footage, _t: Tick, _frames: usize, _rate: u32) -> Option<Vec<f32>> {
         None
     }
@@ -61,6 +82,10 @@ pub trait FootageSource: Send + Sync {
     /// Drop the decoded frames it keeps (Edit ▸ Purge ▸ All Memory / Image Cache Memory): the
     /// next reads decode again. Sources without a cache ignore it.
     fn purge(&self) {}
+    /// The file at `path` changed on disk (Reload Footage): drop what it keeps of it (decoded
+    /// frames, open decoders, parsed models), so the next reads see the new contents. Sources
+    /// without a cache ignore it.
+    fn forget(&self, _path: &str) {}
     /// Settings ▸ Disk ▸ Conformed Audio Folder: where decoded audio is kept between reads
     /// (`None` = off); sources that don't decode audio ignore it.
     fn set_conform_folder(&self, _folder: Option<std::path::PathBuf>) {}
@@ -92,6 +117,7 @@ struct FxHost<'r, 'a, 'c> {
     origin: [f64; 2],
     /// Index of the effect being rendered (bounds `self_at` to effects before it).
     index: std::sync::atomic::AtomicUsize,
+    original: Option<&'c Buf>,
 }
 
 impl FxHost<'_, '_, '_> {
@@ -103,6 +129,12 @@ impl FxHost<'_, '_, '_> {
             buf.rebase(origin);
         }
         LayerPixels { buf, size }
+    }
+
+    /// [`Self::pixels`] of a layer's content (layer space), sharing the buffer.
+    fn view(&self, other: &Layer, buf: Arc<Buf>) -> LayerView {
+        let (size, origin) = self.ctx.effect_bounds(other);
+        LayerView { offset: [buf.offset[0] + origin[0] * buf.scale, buf.offset[1] + origin[1] * buf.scale], size, buf }
     }
 }
 
@@ -138,12 +170,16 @@ pub(crate) fn comp_scene(ctx: &EvalCtx, layer: &Layer) -> Option<effectcraft_eff
 const MAX_FX_DEPTH: usize = 8;
 
 impl EffectHost for FxHost<'_, '_, '_> {
+    fn original(&self) -> Option<&Buf> {
+        self.original
+    }
+
     fn particles(&self) -> Option<&dyn effectcraft_effects::psim::ParticleSim> {
         self.r.active_accel().and_then(|a| a.particles())
     }
     fn layer(&self, id: u64, masks_and_effects: bool) -> Option<LayerPixels> {
         let other = self.ctx.layer(effectcraft_project::LayerId(id))?;
-        if other.id == self.layer.id || self.r.depth > MAX_FX_DEPTH {
+        if (other.id == self.layer.id && masks_and_effects) || self.r.depth > MAX_FX_DEPTH {
             return None;
         }
         let sub = self.r.nested();
@@ -152,9 +188,36 @@ impl EffectHost for FxHost<'_, '_, '_> {
         Some(self.pixels(other, buf, true))
     }
 
-    fn layer_masks(&self, id: u64) -> Option<LayerPixels> {
+    fn layer_view(&self, id: u64, masks_and_effects: bool) -> Option<LayerView> {
+        if !masks_and_effects {
+            return self.layer(id, false).map(LayerView::from);
+        }
         let other = self.ctx.layer(effectcraft_project::LayerId(id))?;
         if other.id == self.layer.id || self.r.depth > MAX_FX_DEPTH {
+            return None;
+        }
+        Some(self.view(other, self.r.nested().content_buf(self.ctx, other)?))
+    }
+
+    fn layer_view_at(&self, id: u64, comp_time: f64, masks_and_effects: bool) -> Option<LayerView> {
+        let other = self.ctx.layer(effectcraft_project::LayerId(id))?;
+        if other.id == self.layer.id || self.r.depth > MAX_FX_DEPTH {
+            return None;
+        }
+        let ctx = self.ctx.at(Tick::from_seconds_f64(comp_time));
+        let sub = self.r.nested();
+        Some(if masks_and_effects {
+            self.view(other, sub.content_buf(&ctx, other)?)
+        } else {
+            // (A layer's input is in effect space already.)
+            let buf = sub.layer_input(&ctx, other, 0)?;
+            LayerView { offset: buf.offset, size: self.ctx.effect_bounds(other).0, buf }
+        })
+    }
+
+    fn layer_masks(&self, id: u64) -> Option<LayerPixels> {
+        let other = self.ctx.layer(effectcraft_project::LayerId(id))?;
+        if self.r.depth > MAX_FX_DEPTH {
             return None;
         }
         let sub = self.r.nested();
@@ -206,6 +269,11 @@ impl EffectHost for FxHost<'_, '_, '_> {
         }
     }
 
+    fn params_revision(&self) -> u64 {
+        let i = self.index.load(std::sync::atomic::Ordering::Relaxed);
+        self.layer.effects().and_then(|g| g.groups().nth(i)).map(cache::effect_revision).unwrap_or(0)
+    }
+
     fn params_at(&self, layer_time: f64) -> Option<Params> {
         let i = self.index.load(std::sync::atomic::Ordering::Relaxed);
         let g = self.layer.effects()?.groups().nth(i)?;
@@ -219,14 +287,17 @@ impl EffectHost for FxHost<'_, '_, '_> {
 
     fn layer_at(&self, id: u64, comp_time: f64, masks_and_effects: bool) -> Option<LayerPixels> {
         let other = self.ctx.layer(effectcraft_project::LayerId(id))?;
-        if other.id == self.layer.id || self.r.depth > MAX_FX_DEPTH {
+        if (other.id == self.layer.id && masks_and_effects) || !comp_time.is_finite() || self.r.depth > MAX_FX_DEPTH {
             return None;
         }
         let ctx = self.ctx.at(Tick::from_seconds_f64(comp_time));
         let sub = self.r.nested();
         Some(if masks_and_effects {
             self.pixels(other, (*sub.content_buf(&ctx, other)?).clone(), true)
+        } else if other.id == self.layer.id {
+            self.pixels(other, sub.source(&ctx, other)?, true)
         } else {
+            // Preserve other-layer reads: time effects historically see source + masks.
             self.pixels(other, (*sub.layer_input(&ctx, other, 0)?).clone(), false)
         })
     }
@@ -316,6 +387,11 @@ pub trait Accelerator: Send + Sync {
     /// A particle simulation backend (GPU particles) for the stepped particle effects, with
     /// the CPU simulation's semantics. `None` = they simulate on the CPU.
     fn particles(&self) -> Option<&dyn effectcraft_effects::psim::ParticleSim> {
+        None
+    }
+    /// A one-line account of the work so far for logs and the command line (transfers between
+    /// main and video memory, working memory). `None` = nothing to report.
+    fn diagnostics(&self) -> Option<String> {
         None
     }
     /// Timing history [`Backend::Auto`] uses to send each comp's top-level frames to the
@@ -470,6 +546,16 @@ pub struct Renderer<'a> {
     through: [Option<Through<'a>>; MAX_THROUGH],
     /// More collapsed levels than [`MAX_THROUGH`]: their motion is not blurred.
     through_lost: bool,
+    /// Nested comp frames already rendered for this top-level frame (see [`memo`]).
+    memo: Option<&'a memo::FrameMemo>,
+    /// The picture being drawn is itself kept across frames (a comp nothing moves in, the still
+    /// layers at the bottom of a comp): the layer buffers that go into it are the first to leave
+    /// the layer cache.
+    within_still: bool,
+    /// Layers of a 3D run whose pixels an accelerator rendered and holds itself
+    /// ([`Renderer::prepare_3d_run_holding`]): the buffer describing each (size, offset, scale)
+    /// stands in for the layer's processed buffer when its plane is prepared.
+    pub(crate) held: Option<&'a std::collections::HashMap<effectcraft_project::LayerId, Arc<Buf>>>,
 }
 
 /// One collapsed precomp layer a nested comp is drawn through.
@@ -556,6 +642,9 @@ impl<'a> Renderer<'a> {
             top: true,
             through: [None; MAX_THROUGH],
             through_lost: false,
+            memo: None,
+            within_still: false,
+            held: None,
         }
     }
 
@@ -601,6 +690,30 @@ impl<'a> Renderer<'a> {
             through_lost: false,
             ..*self
         }
+    }
+
+    /// A precomp layer's nested comp for an accelerator to render resident (no CPU render and
+    /// upload of the nested frame): the renderer one level down, the comp, its time and the
+    /// buffer scale, exactly as [`Self::layer_source`]'s comp branch would render it. `None`
+    /// when that branch does more (composition proxy, Essential Properties overrides, frame
+    /// blending, recursion) or draws nothing (outside the nested comp's span): use the CPU path.
+    pub fn precomp_source(&self, ctx: &EvalCtx, layer: &Layer) -> Option<(Renderer<'a>, ItemId, Tick, f64)> {
+        let LayerSource::Comp { item } = layer.source else { return None };
+        if layer.switches.adjustment || self.project.comp_contains(item, ctx.comp_id) {
+            return None;
+        }
+        let nc = self.project.comp(item)?;
+        let lt = ctx.nested_time(layer);
+        if self.content_times(ctx, layer).is_some() {
+            return None;
+        }
+        if !nc.covers(lt) || self.proxy_for(item).is_some() || !essential_overrides(ctx, layer).is_empty() || frame_blend_mode(ctx, layer) != FrameBlend::Off {
+            return None;
+        }
+        let s = self.opts.scale;
+        let bs = if s < 1.0 && nc.preserve_resolution { 1.0 } else { s };
+        let base = self.nested_through(layer);
+        Some((Renderer { opts: RenderOpts { scale: bs, ..base.opts }, ..base }, item, lt, bs))
     }
 
     /// The nested comp of a precomp layer whose transformations collapse into this comp: the
@@ -826,6 +939,11 @@ impl<'a> Renderer<'a> {
             }
             return out;
         }
+        // One top-level frame shares its nested comp frames (see [`memo`]).
+        if self.depth == 0 && self.memo.is_none() {
+            let shared = memo::FrameMemo::default();
+            return Renderer { memo: Some(&shared), ..*self }.comp_frame_cpu(comp_id, t);
+        }
         let (w, h) = match self.roi_offset() {
             Some((_, _, rw, rh)) => (rw, rh),
             None => (w, h),
@@ -862,8 +980,29 @@ impl<'a> Renderer<'a> {
     fn draw_comp(&self, ctx: &EvalCtx<'a>, canvas: &mut Image, mut blank: bool) {
         // Bottom-to-top, with runs of consecutive 3D layers depth-sorted (farthest first).
         let visible = self.visible_layers(ctx);
+        // A comp several of the layers show at the same time renders once, ahead of them.
+        self.prewarm_precomps(ctx, &visible);
         let mut i = 0;
+        // The layers at the bottom that nothing moves in make the same picture every frame: it is
+        // kept across frames (the layer cache), and the frame starts from it.
+        let mut still = self.still_prefix(ctx, &visible, canvas, blank);
+        if let Some((n, key)) = still
+            && let Some(kept) = self.cache.and_then(|c| c.get(key))
+            && kept.img.width == canvas.width
+            && kept.img.height == canvas.height
+        {
+            canvas.data.copy_from_slice(&kept.img.data);
+            (i, blank, still) = (n, false, None);
+        }
         while i < visible.len() {
+            if let Some((n, key)) = still
+                && i == n
+            {
+                if let Some(c) = self.cache {
+                    c.insert_stable(key, Arc::new(Buf { img: canvas.clone(), offset: [0.0; 2], scale: self.opts.scale }));
+                }
+                still = None;
+            }
             if visible[i].is_3d() {
                 let mut j = i;
                 while j < visible.len() && visible[j].is_3d() {
@@ -876,6 +1015,7 @@ impl<'a> Renderer<'a> {
             } else {
                 let changed = match self.collapsed(ctx, visible[i]) {
                     Some(item) => self.draw_collapsed(ctx, visible[i], item, canvas, blank),
+                    None if still.is_some() => Renderer { within_still: true, ..*self }.draw_layer(ctx, visible[i], canvas, blank),
                     None => self.draw_layer(ctx, visible[i], canvas, blank),
                 };
                 i += 1;
@@ -885,6 +1025,29 @@ impl<'a> Renderer<'a> {
                 blank = false;
             }
         }
+    }
+
+    /// The bottom layers of `visible` (drawing order) whose picture on the empty `canvas` is the
+    /// same at every time ([`cache::prefix_key`]): how many, and its layer-cache key. Only for a
+    /// comp drawn on its own canvas (not collapsed into its parent) with a layer cache, and only
+    /// when layers that do change follow (a comp nothing moves in is kept whole, see
+    /// [`Self::nested_frame`]; the top-level frame is the viewer's to keep).
+    fn still_prefix(&self, ctx: &EvalCtx, visible: &[&Layer], canvas: &Image, blank: bool) -> Option<(usize, u64)> {
+        self.cache?;
+        if !blank || self.outer.is_some() || self.collapse3d.is_some() || self.opacity_mul != 1.0 {
+            return None;
+        }
+        // 2D layers drawn through `draw_layer` (a collapsed precomp's layers join this comp).
+        let eligible = |l: &Layer| !l.is_3d() && !(l.switches.collapse && matches!(l.source, LayerSource::Comp { .. }));
+        let (n, content) = cache::prefix_key(ctx, visible, eligible)?;
+        if n >= visible.len() {
+            return None;
+        }
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        use std::hash::{Hash, Hasher};
+        (0x57e1_1b07_u64, content, self.depth, self.top, self.active_accel().is_some(), canvas.width, canvas.height).hash(&mut h);
+        format!("{:?} {:?}", self.opts, self.inherited).hash(&mut h);
+        Some((n, h.finish()))
     }
 
     /// Evaluate an effect instance's parameters.
@@ -953,17 +1116,32 @@ impl<'a> Renderer<'a> {
                 *q = [q[0] - origin[0], q[1] - origin[1]];
             }
         }
-        let host = FxHost { r: self, ctx, layer, origin, index: Default::default() };
+        // Capture once, before preceding effects can expand or replace the input. An
+        // adjustment stack's original is the comp below, not its solid source.
+        let needs_original =
+            fx.groups().take(limit).any(|g| g.enabled && matches!(&g.kind, GroupKind::Effect { effect } if effect == "ec.channel.cccomposite"));
+        let mut original = None;
+        if needs_original {
+            target.cpu(&mut |buf| {
+                original = Some(buf.clone());
+                buf
+            });
+        }
+        let host = FxHost { r: self, ctx, layer, origin, index: Default::default(), original: original.as_ref() };
         let env = EffectEnv {
             masks: &mask_shapes,
             host: Some(&host),
             comp_time: ctx.time.seconds(),
+            layer_in_point: layer.in_point.seconds(),
             frame_rate: ctx.comp.frame_rate.as_f64(),
             effect_index: 0,
             working_space: self.pipe.space,
             working_linear: self.pipe.linear,
             shutter: self.mb_on(ctx, layer).then_some((ctx.comp.shutter_angle, ctx.comp.shutter_phase, ctx.comp.motion_blur_samples)),
+            levels: None,
+            solid_input: None,
         };
+        let solid = self.solid_first_effect(ctx, layer).filter(|_| !adjustment);
         // Video effects in stack order (index, group, spec); disabled and audio effects skipped.
         let stack: Vec<(usize, &effectcraft_project::PropGroup, &'static effectcraft_effects::EffectSpec)> = fx
             .groups()
@@ -1008,13 +1186,17 @@ impl<'a> Renderer<'a> {
             k += 1;
             let params = self.effect_params(ctx, layer, g);
             host.index.store(i, std::sync::atomic::Ordering::Relaxed);
-            let env = EffectEnv { effect_index: i, ..env };
+            // 8/16 bpc effects write integer pixels: rounded by the effect itself where it can
+            // (as it writes them), else in a pass over its output.
+            let rounds = effectcraft_effects::QUANTIZES.contains(&spec.id);
+            let env = EffectEnv { effect_index: i, levels: self.pipe.levels.filter(|_| rounds), solid_input: solid.filter(|s| s.0 == i).map(|s| s.1), ..env };
             let ectx = EffectCtx { params: &params, time: lt.seconds(), layer_size, seed: g.uid as u32, adjustment, env };
             let t0 = web_time::Instant::now();
             target.cpu(&mut |buf| {
                 let mut buf = effectcraft_effects::apply(spec, &ectx, buf);
-                // 8/16 bpc effects write integer pixels.
-                self.pipe.quantize(&mut buf.img);
+                if !rounds {
+                    self.pipe.quantize(&mut buf.img);
+                }
                 buf
             });
             if let Some(v) = timing.as_deref_mut() {
@@ -1061,29 +1243,22 @@ impl<'a> Renderer<'a> {
                 // values.
                 let ov = essential_overrides(ctx, layer);
                 let tmp = if ov.is_empty() { None } else { effectcraft_project::essential::with_overrides(self.project, *item, &ov) };
-                // Preserve resolution when nested: drawn at full size even when this comp renders
-                // smaller (the buffer's scale places it).
-                let full = s < 1.0 && self.project.comp(*item).is_some_and(|nc| nc.preserve_resolution);
-                let bs = if full { 1.0 } else { s };
-                let base = self.nested_through(layer);
-                let base = Renderer { opts: RenderOpts { scale: bs, ..base.opts }, ..base };
+                let (base, frames) = self.nested_frames(ctx, layer, *item, lt);
+                let bs = base.opts.scale;
                 let sub = match &tmp {
-                    Some(p) => Renderer { project: p, ..base },
+                    // This instance's own comp: not the frame other layers of the comp share.
+                    Some(p) => Renderer { project: p, memo: None, ..base },
                     None => base,
                 };
-                // Frame blending between the nested comp's frames (time-stretched/remapped).
-                let mode = frame_blend_mode(ctx, layer);
-                if mode != FrameBlend::Off
-                    && let Some(nc) = self.project.comp(*item)
-                {
-                    let (i, w) = frame_position(lt, nc.frame_rate);
-                    if w > 1e-6 {
-                        let a = sub.comp_frame(*item, nc.frame_rate.tick_of(i));
-                        let b = sub.comp_frame(*item, nc.frame_rate.tick_of(i + 1));
-                        return Some(Buf { img: blend_frames(mode, &a, &b, w as f32), offset: [0.0; 2], scale: bs });
+                let img = match frames {
+                    NestedFrames::One(t) => unshare(sub.nested_frame(*item, t, false)).img,
+                    NestedFrames::Blend(mode, a, b, w) => {
+                        let a = sub.nested_frame(*item, a, false);
+                        let b = sub.nested_frame(*item, b, false);
+                        blend_frames(mode, &a.img, &b.img, w)
                     }
-                }
-                Some(Buf { img: sub.comp_frame(*item, lt), offset: [0.0; 2], scale: bs })
+                };
+                Some(Buf { img, offset: [0.0; 2], scale: bs })
             }
             LayerSource::Footage { item } => {
                 let it = self.project.item(*item)?;
@@ -1104,14 +1279,235 @@ impl<'a> Renderer<'a> {
                 }
                 let lt = ctx.source_time(layer);
                 // The proxy is decoded instead, at its own size, and fills the footage's frame.
-                let pf = self.proxy_for(*item).unwrap_or(f);
-                let img = self.footage_frame(ctx, layer, *item, pf, lt)?;
+                let proxy = self.proxy_for(*item);
+                let pf = proxy.unwrap_or(f);
+                let size = self.reduced_size(f.width, f.height).filter(|_| proxy.is_none());
+                let img = self.footage_frame(ctx, layer, *item, pf, lt, size)?;
                 Some(self.footage_buf(&img, pf, f.width, f.height))
             }
             LayerSource::Text => Some(self.authored(text::render(ctx, layer, self.raster_scale(ctx, layer)))),
             LayerSource::Shape => layer.props.sub("contents").map(|c| self.authored(shapes::render(ctx, layer, c, self.raster_scale(ctx, layer)))),
             _ => None,
         }
+    }
+
+    /// How precomp layer `layer` draws its nested comp `item` at nested time `lt`: the renderer
+    /// (one level deeper, the layer's switches passed down, at the nested scale) and the comp
+    /// frames it needs.
+    fn nested_frames(&self, ctx: &EvalCtx, layer: &Layer, item: ItemId, lt: Tick) -> (Renderer<'a>, NestedFrames) {
+        let s = self.opts.scale;
+        // Preserve resolution when nested: drawn at full size even when this comp renders
+        // smaller (the buffer's scale places it).
+        let full = s < 1.0 && self.project.comp(item).is_some_and(|nc| nc.preserve_resolution);
+        let bs = if full { 1.0 } else { s };
+        let base = self.nested_through(layer);
+        let base = Renderer { opts: RenderOpts { scale: bs, ..base.opts }, ..base };
+        // Frame blending between the nested comp's frames (time-stretched/remapped).
+        let mode = frame_blend_mode(ctx, layer);
+        if mode != FrameBlend::Off
+            && let Some(nc) = self.project.comp(item)
+        {
+            let (i, w) = frame_position(lt, nc.frame_rate);
+            if w > 1e-6 {
+                return (base, NestedFrames::Blend(mode, nc.frame_rate.tick_of(i), nc.frame_rate.tick_of(i + 1), w as f32));
+            }
+        }
+        (base, NestedFrames::One(lt))
+    }
+
+    /// This (nested) renderer's frame of comp `item` at `t`, shared with the other layers of the
+    /// top-level frame that show the same one (see [`memo`]). `keep`: more layers are known to
+    /// want it; otherwise a frame is kept from the second time it is rendered.
+    fn nested_frame(&self, item: ItemId, t: Tick, keep: bool) -> Arc<Buf> {
+        // The frame, and whether the layer cache holds it.
+        let render = || {
+            // A frame that does not change with time is kept across frames (the layer cache).
+            let still = self.cache.zip(self.still_frame_key(item, t));
+            if let Some((cache, k)) = still
+                && let Some(buf) = cache.get(k)
+            {
+                return (buf, true);
+            }
+            let img = Renderer { within_still: self.within_still || still.is_some(), ..*self }.comp_frame(item, t);
+            let buf = Arc::new(Buf { img, offset: [0.0; 2], scale: self.opts.scale });
+            let kept = still.is_some_and(|(cache, k)| {
+                cache.insert_stable(k, buf.clone());
+                cache.holds(k)
+            });
+            (buf, kept)
+        };
+        let Some(shared) = self.memo else { return render().0 };
+        let key = memo::Key::new(item, t, self.opts.scale, self.depth, self.inherited);
+        if let Some(buf) = shared.get(&key) {
+            return buf;
+        }
+        let keep = shared.repeated(key) || keep;
+        let (buf, cached) = render();
+        // (A frame the layer cache holds is a lookup away: it leaves the memo's budget alone.)
+        if keep && !cached {
+            shared.insert(key, buf.clone());
+        }
+        buf
+    }
+
+    /// Layer-cache key of this (nested) renderer's frame of comp `item` at `t`, when the frame
+    /// is the same at every time around `t` ([`cache::comp_key`]): the comp's content and
+    /// everything of this render that shapes its pixels.
+    fn still_frame_key(&self, item: ItemId, t: Tick) -> Option<u64> {
+        let comp = self.project.comp(item)?;
+        let content = cache::comp_key(&self.ctx(item, comp, t), 0)?;
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        use std::hash::{Hash, Hasher};
+        (0x0c09_f4a3_u64, content, self.depth, self.active_accel().is_some()).hash(&mut h);
+        // Every render option but the region of interest (a nested frame is drawn whole).
+        format!("{:?} {:?}", RenderOpts { roi: None, ..self.opts }, self.inherited).hash(&mut h);
+        Some(h.finish())
+    }
+
+    /// The processed buffer of a precomp layer that shows its nested comp's frame as it is (no
+    /// masks, effects, proxy, instance overrides or frame blending): the shared frame itself, so
+    /// the layers showing it hold one buffer between them. `None` for every other layer.
+    fn shared_precomp(&self, ctx: &EvalCtx, layer: &Layer) -> Option<Arc<Buf>> {
+        let LayerSource::Comp { item } = &layer.source else { return None };
+        if layer.masks().is_some_and(|m| !m.children.is_empty()) || (layer.switches.effects && layer.effects().is_some_and(|fx| fx.groups().any(|g| g.enabled)))
+        {
+            return None;
+        }
+        if self.project.comp_contains(*item, ctx.comp_id) || self.proxy_for(*item).is_some() || !essential_overrides(ctx, layer).is_empty() {
+            return None;
+        }
+        let lt = ctx.nested_time(layer);
+        if !self.project.comp(*item).is_some_and(|nc| nc.covers(lt)) {
+            return None;
+        }
+        let (sub, NestedFrames::One(t)) = self.nested_frames(ctx, layer, *item, lt) else { return None };
+        Some(sub.nested_frame(*item, t, false))
+    }
+
+    /// A precomp layer that shows its nested comp's frame as it is ([`Self::shared_precomp`]), for
+    /// a compositor that renders the nested comp itself (the GPU, which then keeps the frame on
+    /// the device instead of taking it from the CPU): the nested renderer, the comp, its time,
+    /// and a key that is equal for the layers of one top-level frame showing the same picture.
+    /// `None` for every other layer, and for a nested frame that does not change with time (the
+    /// layer cache keeps that one across frames, see [`Self::nested_frame`]).
+    pub fn plain_precomp(&self, ctx: &EvalCtx, layer: &Layer) -> Option<(Renderer<'a>, ItemId, Tick, u64)> {
+        if layer.switches.effects && layer.effects().is_some_and(|fx| fx.groups().any(|g| g.enabled)) {
+            return None;
+        }
+        self.precomp_input(ctx, layer)
+    }
+
+    /// [`Self::plain_precomp`] for a precomp layer that may have effects: its nested comp's frame
+    /// is then the input of its effect stack ([`Self::resident_effects`]), not the layer's
+    /// pixels.
+    pub fn precomp_input(&self, ctx: &EvalCtx, layer: &Layer) -> Option<(Renderer<'a>, ItemId, Tick, u64)> {
+        if layer.masks().is_some_and(|m| !m.children.is_empty()) {
+            return None;
+        }
+        self.precomp_frame(ctx, layer)
+    }
+
+    /// [`Self::precomp_input`] for a precomp layer that may have masks as well: the compositor
+    /// multiplies the nested frame by [`Self::precomp_coverage`]. `None` also when the masks
+    /// are motion blurred (the CPU renderer averages the sub-samples).
+    pub fn masked_precomp(&self, ctx: &EvalCtx, layer: &Layer) -> Option<(Renderer<'a>, ItemId, Tick, u64)> {
+        if self.content_times(ctx, layer).is_some() {
+            return None;
+        }
+        self.precomp_frame(ctx, layer)
+    }
+
+    /// What a precomp layer's masks leave of its nested frame (`width` × `height` at `scale`):
+    /// white through the masks, for a compositor that holds the frame itself
+    /// ([`Self::masked_precomp`]) to multiply it by. `None` when no mask applies. Cached like an
+    /// adjustment layer's footprint, so masks nothing animates are drawn and uploaded once.
+    pub fn precomp_coverage(&self, ctx: &EvalCtx, layer: &Layer, width: u32, height: u32, scale: f64) -> Option<Arc<Buf>> {
+        if !layer.masks().is_some_and(|m| !m.children.is_empty()) {
+            return None;
+        }
+        let key = self
+            .cache
+            .and_then(|_| cache::footprint_key(ctx, layer, scale, self.opts.draft, self.mb_on(ctx, layer)))
+            .map(|k| cache::derive(cache::derive(k, 0x6d61_736b), (width as u64) << 32 | height as u64));
+        if let (Some(c), Some(k)) = (self.cache, key)
+            && let Some(b) = c.get(k)
+        {
+            return (!b.img.is_empty()).then_some(b);
+        }
+        let mut cov = Buf { img: Image::filled(width, height, [1.0; 4]), offset: [0.0; 2], scale };
+        // (No mask applies: remembered as an empty buffer.)
+        if !masks::apply(ctx, layer, &mut cov, self.mask_blur(ctx, layer)) {
+            cov.img = Image::new(0, 0);
+        }
+        let cov = Arc::new(cov);
+        if let (Some(c), Some(k)) = (self.cache, key) {
+            if !self.within_still && !layer.masks().is_some_and(cache::animated) {
+                c.insert_stable(k, cov.clone());
+            } else {
+                c.insert(k, cov.clone());
+            }
+        }
+        (!cov.img.is_empty()).then_some(cov)
+    }
+
+    /// The nested frame a precomp layer shows ([`Self::precomp_input`], whatever its masks).
+    fn precomp_frame(&self, ctx: &EvalCtx, layer: &Layer) -> Option<(Renderer<'a>, ItemId, Tick, u64)> {
+        let LayerSource::Comp { item } = &layer.source else { return None };
+        if self.project.comp_contains(*item, ctx.comp_id) || self.proxy_for(*item).is_some() || !essential_overrides(ctx, layer).is_empty() {
+            return None;
+        }
+        let lt = ctx.nested_time(layer);
+        if !self.project.comp(*item).is_some_and(|nc| nc.covers(lt)) {
+            return None;
+        }
+        let (sub, NestedFrames::One(t)) = self.nested_frames(ctx, layer, *item, lt) else { return None };
+        if sub.cache.is_some() && sub.still_frame_key(*item, t).is_some() {
+            return None;
+        }
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        memo::Key::new(*item, t, sub.opts.scale, sub.depth, sub.inherited).hash(&mut h);
+        Some((sub, *item, t, h.finish()))
+    }
+
+    /// Render the nested comp frames that several of `layers` (precomp layers of this comp, about
+    /// to be drawn in parallel) share, each once, so that every one of them finds it in the
+    /// [`memo`] instead of all rendering it at the same time.
+    pub(crate) fn prewarm_precomps(&self, ctx: &EvalCtx<'a>, layers: &[&'a Layer]) {
+        let Some(shared) = self.memo else { return };
+        // (renderer, comp, time, layers that want it)
+        let mut wanted: Vec<(Renderer<'a>, memo::Key, ItemId, Tick, usize)> = Vec::new();
+        for layer in layers {
+            let LayerSource::Comp { item } = &layer.source else { continue };
+            // Faded out: not drawn (see `draw_layer`).
+            if !layer.is_3d() && !layer.switches.adjustment && ctx.opacity(layer) as f32 * self.opacity_mul <= 0.0 {
+                continue;
+            }
+            // As `source` decides: these draw nothing, a proxy, or an instance of their own.
+            if self.project.comp_contains(*item, ctx.comp_id) || self.proxy_for(*item).is_some() || !essential_overrides(ctx, layer).is_empty() {
+                continue;
+            }
+            let lt = ctx.nested_time(layer);
+            if !self.project.comp(*item).is_some_and(|nc| nc.covers(lt)) {
+                continue;
+            }
+            let (sub, frames) = self.nested_frames(ctx, layer, *item, lt);
+            let times = match frames {
+                NestedFrames::One(t) => [Some(t), None],
+                NestedFrames::Blend(_, a, b, _) => [Some(a), Some(b)],
+            };
+            for t in times.into_iter().flatten() {
+                let key = memo::Key::new(*item, t, sub.opts.scale, sub.depth, sub.inherited);
+                match wanted.iter_mut().find(|w| w.1 == key) {
+                    Some(w) => w.4 += 1,
+                    None => wanted.push((Renderer { ..sub }, key, *item, t, 1)),
+                }
+            }
+        }
+        wanted.retain(|w| w.4 > 1 && shared.get(&w.1).is_none());
+        wanted.par_iter().for_each(|(sub, _, item, t, _)| {
+            sub.nested_frame(*item, *t, true);
+        });
     }
 
     /// The proxy footage used for `item` under this render's Proxy Use, if any.
@@ -1127,17 +1523,23 @@ impl<'a> Renderer<'a> {
         let s = self.opts.scale;
         let k = if img.width > 0 { w.max(1) as f64 / img.width as f64 } else { 1.0 };
         // Keep native pixels when downsampling is small; resample otherwise.
-        let mut buf = if s < 0.75 && k <= 1.0 + 1e-9 {
-            let rw = ((w as f64 * s).round() as u32).max(1);
-            let rh = ((h as f64 * s).round() as u32).max(1);
-            Buf { img: effectcraft_raster::resample(img, rw, rh), offset: [0.0; 2], scale: s }
-        } else {
-            Buf { img: img.clone(), offset: [0.0; 2], scale: 1.0 / k }
+        let mut buf = match self.reduced_size(w, h) {
+            // The source resampled it already (`FootageSource::frame_at_size`).
+            Some(size) if (img.width, img.height) == size => Buf { img: img.clone(), offset: [0.0; 2], scale: s },
+            Some((rw, rh)) if k <= 1.0 + 1e-9 => Buf { img: effectcraft_raster::resample(img, rw, rh), offset: [0.0; 2], scale: s },
+            _ => Buf { img: img.clone(), offset: [0.0; 2], scale: 1.0 / k },
         };
         if let Some(c) = self.pipe.media_in(f) {
             color::convert(&mut buf.img, &c);
         }
         buf
+    }
+
+    /// The size of `w` × `h` layer pixels in this render when it is reduced enough that footage
+    /// is resampled to it (below 3/4 scale).
+    fn reduced_size(&self, w: u32, h: u32) -> Option<(u32, u32)> {
+        let s = self.opts.scale;
+        (s < 0.75).then(|| (((w as f64 * s).round() as u32).max(1), ((h as f64 * s).round() as u32).max(1)))
     }
 
     /// Authored colours into the working space (linear working spaces).
@@ -1151,7 +1553,8 @@ impl<'a> Renderer<'a> {
     /// A footage frame at source time `t`, frame-blended between the two nearest source frames
     /// when the layer's Frame Blending switch (and the comp's Enable Frame Blending) is on and
     /// `t` falls between frames (footage rate ≠ comp rate, time stretch, time remapping).
-    fn footage_frame(&self, ctx: &EvalCtx, layer: &Layer, item: ItemId, f: &Footage, t: Tick) -> Option<Arc<Image>> {
+    /// `size`: a plain frame may come resampled to it ([`FootageSource::frame_at_size`]).
+    fn footage_frame(&self, ctx: &EvalCtx, layer: &Layer, item: ItemId, f: &Footage, t: Tick, size: Option<(u32, u32)>) -> Option<Arc<Image>> {
         // Interpret Footage ▸ Separate Fields: each field is a frame at twice the rate.
         if f.fields != effectcraft_project::FieldOrder::Off && matches!(f.kind, FootageKind::Video | FootageKind::Sequence) {
             let field_rate = FrameRate::new(f.frame_rate.num * 2, f.frame_rate.den);
@@ -1160,13 +1563,15 @@ impl<'a> Renderer<'a> {
             let dominant_upper = f.fields == effectcraft_project::FieldOrder::UpperFirst;
             // Upper field = even lines (0, 2, …).
             let parity = if (i % 2 == 0) == dominant_upper { 0 } else { 1 };
-            return Some(Arc::new(interpret_pixels(&field_frame(&img, parity), f)));
+            return Some(Arc::new(interpret_pixels(&field_frame(&img, parity), f, self.pipe.linear_footage_space(f))));
         }
-        let img = self.footage_frame_raw(ctx, layer, item, f, t)?;
-        if f.invert_alpha || f.linear_light_applies() { Some(Arc::new(interpret_pixels(&img, f))) } else { Some(img) }
+        // Interpretation is per pixel but not linear: it runs on the frame before resampling.
+        let size = size.filter(|_| !(f.invert_alpha || f.linear_light_applies()));
+        let img = self.footage_frame_raw(ctx, layer, item, f, t, size)?;
+        if f.invert_alpha || f.linear_light_applies() { Some(Arc::new(interpret_pixels(&img, f, self.pipe.linear_footage_space(f)))) } else { Some(img) }
     }
 
-    fn footage_frame_raw(&self, ctx: &EvalCtx, layer: &Layer, item: ItemId, f: &Footage, t: Tick) -> Option<Arc<Image>> {
+    fn footage_frame_raw(&self, ctx: &EvalCtx, layer: &Layer, item: ItemId, f: &Footage, t: Tick, size: Option<(u32, u32)>) -> Option<Arc<Image>> {
         let mode = frame_blend_mode(ctx, layer);
         if mode != FrameBlend::Off && matches!(f.kind, FootageKind::Video | FootageKind::Sequence) {
             let (i, w) = frame_position(t, f.frame_rate);
@@ -1194,18 +1599,64 @@ impl<'a> Renderer<'a> {
                 }
             }
         }
-        self.footage.frame(item, f, t)
+        match size {
+            Some((w, h)) => self.footage.frame_at_size(item, f, t, w, h),
+            None => self.footage.frame(item, f, t),
+        }
+    }
+
+    /// An unmasked solid whose first effect takes its input as one colour instead of reading it
+    /// ([`effectcraft_effects::TAKES_SOLID_INPUT`], on the CPU): that effect's index in the stack,
+    /// the solid's pixel and its buffer size. Filling a full-frame solid that Fractal Noise
+    /// overwrites at once is a pass over 33 MB per noise layer.
+    fn solid_first_effect(&self, ctx: &EvalCtx, layer: &Layer) -> Option<(usize, [f32; 4], u32, u32)> {
+        let LayerSource::Solid { item } = &layer.source else { return None };
+        if layer.switches.adjustment || !layer.switches.effects || self.active_accel().is_some() || self.content_times(ctx, layer).is_some() {
+            return None;
+        }
+        if layer.masks().is_some_and(|m| !m.children.is_empty()) {
+            return None;
+        }
+        let ItemKind::Solid(sol) = &self.project.item(*item)?.kind else { return None };
+        let (i, first) = layer.effects()?.groups().enumerate().find(|(_, g)| g.enabled)?;
+        let GroupKind::Effect { effect } = &first.kind else { return None };
+        if !effectcraft_effects::TAKES_SOLID_INPUT.contains(&effect.as_str()) {
+            return None;
+        }
+        let mut c = sol.color;
+        if let Some(conv) = self.pipe.authored_in() {
+            c = conv.apply(c);
+        }
+        let s = self.opts.scale;
+        let (w, h) = (((sol.width as f64 * s).ceil() as u32).max(1), ((sol.height as f64 * s).ceil() as u32).max(1));
+        Some((i, self.pipe.quantize_px([c[0], c[1], c[2], 1.0]), w, h))
     }
 
     /// Source → masks, clamped/quantised to the project depth.
     fn masked_source(&self, ctx: &EvalCtx, layer: &Layer) -> Option<Buf> {
+        self.masked_source_for(ctx, layer, false)
+    }
+
+    /// [`Self::masked_source`]; `all_effects`: the layer's whole effect stack runs on the result
+    /// next (so a solid its first effect overwrites need not be filled).
+    fn masked_source_for(&self, ctx: &EvalCtx, layer: &Layer, all_effects: bool) -> Option<Buf> {
         let mut buf = match self.content_times(ctx, layer) {
             Some(times) => self.blurred_source(ctx, layer, &times)?,
-            None => self.source(ctx, layer)?,
+            None => match all_effects.then(|| self.solid_first_effect(ctx, layer)).flatten() {
+                // (Its first effect writes every pixel without reading any.)
+                Some((_, _, w, h)) => return Some(Buf { img: Image::scratch(w, h), offset: [0.0; 2], scale: self.opts.scale }),
+                None => self.source(ctx, layer)?,
+            },
         };
-        // A solid is filled with a quantised colour: only masks can take it off the grid.
-        let solid = matches!(layer.source, LayerSource::Solid { .. });
-        if masks::apply(ctx, layer, &mut buf, self.mask_blur(ctx, layer)) || !solid {
+        // A solid is filled with a quantised colour and a nested comp's frame is quantised after
+        // every layer: only masks can take them off the grid.
+        let exact = match &layer.source {
+            LayerSource::Solid { .. } => true,
+            // (A proxy's pixels and a blend of two frames are not on the grid.)
+            LayerSource::Comp { item } => self.proxy_for(*item).is_none() && frame_blend_mode(ctx, layer) == FrameBlend::Off,
+            _ => false,
+        };
+        if masks::apply(ctx, layer, &mut buf, self.mask_blur(ctx, layer)) || !exact {
             self.pipe.quantize(&mut buf.img);
         }
         Some(buf)
@@ -1282,10 +1733,19 @@ impl<'a> Renderer<'a> {
             }
             return Some((b, key));
         }
-        let buf = self.masked_source(ctx, layer)?;
+        // A precomp shown as it is: the nested comp's (shared) frame, without a copy.
+        if let Some(buf) = self.shared_precomp(ctx, layer) {
+            return Some((buf, key));
+        }
+        let buf = self.masked_source_for(ctx, layer, true)?;
         let buf = Arc::new(self.apply_effects_timed(ctx, layer, buf, false, usize::MAX, timing.map(|t| &mut t.effects)));
         if let (Some(c), Some(k)) = (self.cache, key) {
-            c.insert(k, buf.clone());
+            // (Content that animates within the shutter is keyed by its times.)
+            if !self.within_still && cache::stable_layer(layer) && self.content_times(ctx, layer).is_none() {
+                c.insert_stable(k, buf.clone());
+            } else {
+                c.insert(k, buf.clone());
+            }
         }
         Some((buf, key))
     }
@@ -1631,11 +2091,24 @@ impl<'a> Renderer<'a> {
 
     /// Draw a processed layer into `target` (transform, motion blur) with `mode`/`opacity`.
     fn place(&self, ctx: &EvalCtx, layer: &Layer, buf: &Buf, target: &mut Image, mode: BlendMode, opacity: f32) {
+        self.place_quantized(ctx, layer, buf, target, mode, opacity, None);
+    }
+
+    /// [`Self::place`] into an integer comp's canvas, rounding the pixels it writes to `levels`
+    /// steps as it blends them. `false` when it could not (a perspective transform, a stencil
+    /// mode): the caller then quantises the layer's footprint.
+    #[allow(clippy::too_many_arguments)]
+    fn place_quantized(&self, ctx: &EvalCtx, layer: &Layer, buf: &Buf, target: &mut Image, mode: BlendMode, opacity: f32, levels: Option<f32>) -> bool {
         let pl = self.placement(ctx, layer, buf);
         let opts = WarpOpts { sampling: pl.sampling, opacity, mode, seed: pl.seed, clip: None };
         if let [m] = pl.matrices.as_slice() {
-            composite_warp(target, &buf.img, m, &opts);
-            return;
+            return match levels {
+                Some(l) => effectcraft_raster::composite_warp_quantized(target, &buf.img, m, &opts, l),
+                None => {
+                    composite_warp(target, &buf.img, m, &opts);
+                    true
+                }
+            };
         }
         // Sub-samples sum straight into one buffer (each warp is row-parallel).
         let mut acc = Image::new(target.width, target.height);
@@ -1643,7 +2116,90 @@ impl<'a> Renderer<'a> {
         for m in &pl.matrices {
             effectcraft_raster::accumulate_warp(&mut acc, &buf.img, m, opts.sampling, k);
         }
-        target.blend_from(&acc, mode, opacity, pl.seed);
+        target.blend_from_quantized(&acc, mode, opacity, pl.seed, levels);
+        // (Stencil modes change pixels the blend does not visit.)
+        !mode.is_stencil()
+    }
+
+    /// Where `buf` lands in the output when placing it is a whole-pixel shift: every output
+    /// pixel is then one of the buffer's own, and the buffer can be read in place instead of
+    /// being drawn into a canvas-sized copy first.
+    fn aligned(&self, ctx: &EvalCtx, layer: &Layer, buf: &Buf) -> Option<(i64, i64)> {
+        // (Bicubic clamps negative samples even at pixel centres.)
+        if self.sampling(layer) == effectcraft_raster::Sampling::Bicubic {
+            return None;
+        }
+        let pl = self.placement(ctx, layer, buf);
+        let [m] = pl.matrices.as_slice() else { return None };
+        let k = &m.0;
+        let whole = |v: f64| v == v.round() && v.abs() < 1e9;
+        (m.is_affine() && k[0][0] == 1.0 && k[1][1] == 1.0 && k[0][1] == 0.0 && k[1][0] == 0.0 && whole(k[0][2]) && whole(k[1][2]))
+            .then(|| (k[0][2] as i64, k[1][2] as i64))
+    }
+
+    /// Composite a layer through its 2D track matte in one pass over the canvas: source pixel ×
+    /// matte factor, blended and (integer comps) quantised. Buffers that land on whole pixels
+    /// are read in place; the others are drawn into a canvas-sized image first.
+    fn composite_matted(&self, ctx: &EvalCtx, layer: &Layer, buf: &Buf, canvas: &mut Image, opacity: f32, matte: (&Layer, MatteKind)) {
+        let (m, kind) = matte;
+        let (w, h) = (canvas.width, canvas.height);
+        let drawn;
+        let src = match self.aligned(ctx, layer, buf) {
+            Some((dx, dy)) => Rows::Aligned { img: &buf.img, dx, dy, k: 1.0 },
+            None => {
+                let mut iso = Image::new(w, h);
+                self.place(ctx, layer, buf, &mut iso, BlendMode::Normal, 1.0);
+                drawn = iso;
+                Rows::Placed(&drawn)
+            }
+        };
+        let matte_buf = if m.is_active_at(ctx.time) { self.layer_buf(ctx, m) } else { None };
+        let matte_drawn;
+        let matte_rows = match &matte_buf {
+            None => Rows::Empty,
+            Some(mb) => {
+                let mo = ctx.opacity(m) as f32;
+                match self.aligned(ctx, m, mb) {
+                    Some((dx, dy)) if mo > 0.0 => Rows::Aligned { img: &mb.img, dx, dy, k: mo },
+                    _ => {
+                        let mut mimg = Image::new(w, h);
+                        self.place(ctx, m, mb, &mut mimg, BlendMode::Normal, mo);
+                        matte_drawn = mimg;
+                        Rows::Placed(&matte_drawn)
+                    }
+                }
+            }
+        };
+        let (mode, seed) = (layer.blend_mode, layer.id.0 as u32);
+        let levels = self.pipe.levels;
+        let inv = levels.map_or(1.0, |l| 1.0 / l);
+        let (stencil, dissolve) = (mode.is_stencil(), matches!(mode, BlendMode::Dissolve | BlendMode::DancingDissolve));
+        let wu = w.max(1) as usize;
+        canvas.data.par_chunks_mut(wu).enumerate().for_each_init(
+            || (Vec::new(), Vec::new()),
+            |(a, b), (y, row)| {
+                let (s, q) = (src.row(y, row.len(), a), matte_rows.row(y, row.len(), b));
+                for (x, (d, (s, q))) in row.iter_mut().zip(s.iter().zip(q)).enumerate() {
+                    let k = match kind {
+                        MatteKind::Alpha => q[3],
+                        MatteKind::AlphaInverted => 1.0 - q[3],
+                        MatteKind::Luma => effectcraft_color::luminance(q[0], q[1], q[2]),
+                        MatteKind::LumaInverted => 1.0 - effectcraft_color::luminance(q[0], q[1], q[2]),
+                    }
+                    .clamp(0.0, 1.0);
+                    let sp = s.map(|c| c * k);
+                    if sp[3] <= 0.0 && !stencil {
+                        continue;
+                    }
+                    let n = if dissolve { effectcraft_raster::hash_noise(x as u32, y as u32, seed) } else { 0.5 };
+                    let px = effectcraft_color::blend_pixel(mode, *d, sp.map(|c| c * opacity), n);
+                    *d = match levels {
+                        Some(l) => effectcraft_raster::quantize_px(px, l, inv),
+                        None => px,
+                    };
+                }
+            },
+        );
     }
 
     /// Draw a 2D layer into `canvas`; returns the region it may have changed.
@@ -1657,8 +2213,7 @@ impl<'a> Renderer<'a> {
             return Region::Empty;
         }
         if layer.switches.adjustment {
-            self.draw_adjustment(ctx, layer, canvas, opacity);
-            return Region::Full;
+            return self.draw_adjustment(ctx, layer, canvas, opacity);
         }
         let mut timing = self.profile.map(|_| LayerTiming { depth: self.depth, layer: layer.name.clone(), ..Default::default() });
         let t0 = web_time::Instant::now();
@@ -1666,8 +2221,8 @@ impl<'a> Renderer<'a> {
         let st = self.styled_to_blend(st);
         let t1 = web_time::Instant::now();
         let changed = if st.plain {
-            self.composite_layer(ctx, layer, &st.body, canvas, opacity);
-            self.footprint(ctx, layer, &st.body, opacity, blank)
+            // (Quantised while blending: nothing left to round.)
+            if self.composite_layer(ctx, layer, &st.body, canvas, opacity) { Region::Empty } else { self.footprint(ctx, layer, &st.body, opacity, blank) }
         } else {
             self.composite_styled(ctx, layer, &st, canvas, opacity);
             Region::Full
@@ -1721,16 +2276,26 @@ impl<'a> Renderer<'a> {
         });
     }
 
-    fn composite_layer(&self, ctx: &EvalCtx, layer: &Layer, buf: &Buf, canvas: &mut Image, opacity: f32) {
-        let matte = layer.track_matte.is_some_and(|tm| tm.layer != layer.id && ctx.comp.layer(tm.layer).is_some());
-        if !matte && !layer.preserve_transparency {
-            self.place(ctx, layer, buf, canvas, layer.blend_mode, opacity);
-            return;
+    /// Composite a plain (unstyled) layer. `true` when the pixels it wrote are already rounded to
+    /// the comp's bit depth; otherwise the caller quantises the layer's footprint.
+    fn composite_layer(&self, ctx: &EvalCtx, layer: &Layer, buf: &Buf, canvas: &mut Image, opacity: f32) -> bool {
+        let matte = layer.track_matte.and_then(|tm| ctx.comp.layer(tm.layer).filter(|m| m.id != layer.id).map(|m| (m, tm.kind)));
+        if matte.is_none() && !layer.preserve_transparency {
+            return self.place_quantized(ctx, layer, buf, canvas, layer.blend_mode, opacity, self.pipe.levels);
+        }
+        // A 2D matte: one pass. (A 3D matte is seen through the camera, see `composite_iso_with`.)
+        if let Some(matte) = matte
+            && !layer.preserve_transparency
+            && !matte.0.is_3d()
+        {
+            self.composite_matted(ctx, layer, buf, canvas, opacity, matte);
+            return !layer.blend_mode.is_stencil();
         }
         // Render in isolation, then matte / preserve transparency, then blend.
         let mut iso = Image::new(canvas.width, canvas.height);
         self.place(ctx, layer, buf, &mut iso, BlendMode::Normal, 1.0);
         self.composite_iso(ctx, layer, iso, canvas, opacity);
+        false
     }
 
     /// Apply the track matte / preserve transparency to an isolated layer render, then blend.
@@ -1739,13 +2304,26 @@ impl<'a> Renderer<'a> {
     }
 
     /// [`Self::composite_iso`] with the track matte's pixels already drawn (`matte`, e.g. a 3D
-    /// matte seen through the camera); otherwise the matte layer is placed in 2D.
+    /// matte seen through the camera); otherwise a 3D matte layer is drawn through
+    /// the camera here and a 2D one is placed in 2D.
     pub(crate) fn composite_iso_with(&self, ctx: &EvalCtx, layer: &Layer, mut iso: Image, canvas: &mut Image, opacity: f32, matte_img: Option<Image>) {
         let matte = layer.track_matte.and_then(|tm| ctx.comp.layer(tm.layer).filter(|m| m.id != layer.id).map(|m| (m, tm.kind)));
         let preserve = layer.preserve_transparency;
         if let Some((m, kind)) = matte {
             let mimg = match matte_img {
                 Some(i) if i.width == canvas.width && i.height == canvas.height => i,
+                // A 3D matte layer is seen through the camera, whatever the matted layer is (a
+                // 2D layer too takes the matte where the 3D layer appears on screen).
+                _ if m.is_3d() => {
+                    let out = (canvas.width, canvas.height);
+                    if three_d::adv::active(self, ctx) {
+                        three_d::adv::matte_image(self, ctx, layer, out).unwrap_or_else(|| Image::new(out.0, out.1))
+                    } else if m.is_active_at(ctx.time) {
+                        three_d::compose::matte_image(self, ctx, m, out)
+                    } else {
+                        Image::new(out.0, out.1)
+                    }
+                }
                 _ => {
                     let mut mimg = Image::new(canvas.width, canvas.height);
                     if m.is_active_at(ctx.time)
@@ -1771,21 +2349,35 @@ impl<'a> Renderer<'a> {
             });
         }
         if preserve {
-            iso.data.par_iter_mut().zip(canvas.data.par_iter()).for_each(|(p, q)| {
-                for c in p.iter_mut() {
-                    *c *= q[3];
-                }
+            canvas.data.par_iter_mut().zip(iso.data.par_iter()).enumerate().for_each(|(i, (d, s))| {
+                let w = iso.width.max(1) as usize;
+                let noise = effectcraft_raster::hash_noise((i % w) as u32, (i / w) as u32, layer.id.0 as u32);
+                *d = preserve_pixel(layer.blend_mode, *d, s.map(|v| v * opacity), noise);
             });
+        } else {
+            canvas.blend_from(&iso, layer.blend_mode, opacity, layer.id.0 as u32);
         }
-        canvas.blend_from(&iso, layer.blend_mode, opacity, layer.id.0 as u32);
     }
 
     /// Adjustment layer: effects applied to the comp below, limited to the layer's footprint.
-    fn draw_adjustment(&self, ctx: &EvalCtx, layer: &Layer, canvas: &mut Image, opacity: f32) {
-        let Some(mut foot) = self.source(ctx, layer) else { return };
-        let _ = masks::apply(ctx, layer, &mut foot, self.mask_blur(ctx, layer));
-        let mut matte = Image::new(canvas.width, canvas.height);
-        self.place(ctx, layer, &foot, &mut matte, BlendMode::Normal, 1.0);
+    /// Returns the region left to quantise.
+    fn draw_adjustment(&self, ctx: &EvalCtx, layer: &Layer, canvas: &mut Image, opacity: f32) -> Region {
+        let Some(mut foot) = self.source(ctx, layer) else { return Region::Empty };
+        let masked = masks::apply(ctx, layer, &mut foot, self.mask_blur(ctx, layer));
+        // An unmasked solid at 100% that lands on whole pixels and spans the frame (the usual
+        // adjustment layer) weighs every pixel 1: the adjusted picture is the result, with no
+        // footprint to draw and no blend with the picture below.
+        let whole = opacity == 1.0
+            && !masked
+            && matches!(layer.source, LayerSource::Solid { .. })
+            && self.aligned(ctx, layer, &foot).is_some_and(|(dx, dy)| {
+                dx <= 0 && dy <= 0 && dx + foot.img.width as i64 >= canvas.width as i64 && dy + foot.img.height as i64 >= canvas.height as i64
+            });
+        let mut matte = Image::new(if whole { 0 } else { canvas.width }, if whole { 0 } else { canvas.height });
+        if !whole {
+            self.place(ctx, layer, &foot, &mut matte, BlendMode::Normal, 1.0);
+        }
+        drop(foot);
         let o = self.roi_offset().map(|(x, y, _, _)| [-x, -y]).unwrap_or([0.0; 2]);
         let mut below = Buf { img: canvas.clone(), offset: o, scale: self.opts.scale };
         // Effects run in the working space, not the linear blending space.
@@ -1797,7 +2389,13 @@ impl<'a> Renderer<'a> {
             color::convert(&mut adjusted.img, &c);
         }
         if adjusted.img.width != canvas.width || adjusted.img.height != canvas.height {
-            return;
+            return Region::Empty;
+        }
+        if whole {
+            *canvas = adjusted.img;
+            // (Every effect leaves integer pixels; only the way back to a linear blending space
+            // takes them off the grid.)
+            return if self.pipe.to_blend().is_none() { Region::Empty } else { Region::Full };
         }
         canvas.data.par_iter_mut().zip(adjusted.img.data.par_iter()).zip(matte.data.par_iter()).for_each(|((c, a), m)| {
             let k = m[3] * opacity;
@@ -1805,7 +2403,66 @@ impl<'a> Renderer<'a> {
                 c[i] += (a[i] - c[i]) * k;
             }
         });
+        Region::Full
     }
+}
+
+/// Canvas rows of a layer drawn alone (see [`Renderer::composite_matted`]).
+enum Rows<'i> {
+    /// Nothing: every pixel transparent.
+    Empty,
+    /// A canvas-sized image.
+    Placed(&'i Image),
+    /// A buffer `dx`, `dy` whole pixels into the canvas, its pixels scaled by `k` (opacity).
+    Aligned { img: &'i Image, dx: i64, dy: i64, k: f32 },
+}
+
+impl Rows<'_> {
+    /// The `w` pixels of canvas row `y`: the image's own row where it spans it, else put
+    /// together in `scratch`.
+    fn row<'s>(&'s self, y: usize, w: usize, scratch: &'s mut Vec<effectcraft_raster::Px>) -> &'s [effectcraft_raster::Px] {
+        let (img, dx, dy, k) = match *self {
+            Rows::Empty => (None, 0, 0, 1.0),
+            Rows::Placed(img) => (Some(img), 0, 0, 1.0),
+            Rows::Aligned { img, dx, dy, k } => (Some(img), dx, dy, k),
+        };
+        let src = img.and_then(|img| {
+            let sy = usize::try_from(y as i64 - dy).ok()?;
+            let iw = img.width as usize;
+            img.data.get(sy.checked_mul(iw)?..sy.checked_mul(iw)?.checked_add(iw)?)
+        });
+        // Canvas x of the row's first pixel is `dx`.
+        if let Some(src) = src
+            && k == 1.0
+            && dx <= 0
+            && let Some(part) = src.get(dx.unsigned_abs() as usize..).and_then(|r| r.get(..w))
+        {
+            return part;
+        }
+        scratch.clear();
+        scratch.resize(w, [0.0; 4]);
+        if let Some(src) = src {
+            let (x0, s0) = if dx >= 0 { (dx as usize, 0) } else { (0, dx.unsigned_abs() as usize) };
+            if let (Some(dst), Some(src)) = (scratch.get_mut(x0.min(w)..), src.get(s0.min(src.len())..)) {
+                for (d, s) in dst.iter_mut().zip(src) {
+                    *d = s.map(|c| c * k);
+                }
+            }
+        }
+        scratch
+    }
+}
+
+/// The frames of a nested comp a precomp layer shows (see [`Renderer::nested_frames`]).
+enum NestedFrames {
+    One(Tick),
+    /// Frame blending: mode, the two frames and the weight of the second.
+    Blend(FrameBlend, Tick, Tick, f32),
+}
+
+/// The buffer itself: without a copy when nothing else holds it.
+fn unshare(buf: Arc<Buf>) -> Buf {
+    Arc::try_unwrap(buf).unwrap_or_else(|shared| (*shared).clone())
 }
 
 /// A layer ready to composite (see [`Renderer::styled_layer`]).
@@ -1882,6 +2539,20 @@ impl<'a> Renderer<'a> {
         three_d::compose::gpu_run(self, ctx, run, out)
     }
 
+    /// [`Self::prepare_3d_run`] when the accelerator rendered some of the run's layers itself
+    /// ([`Self::resident_effects`]) and holds their pixels: `held` gives, per such layer, the
+    /// buffer describing them (size, offset, scale), which stands in for the layer's processed
+    /// buffer. The plane of a held layer carries that description; its texture is the caller's.
+    pub fn prepare_3d_run_holding(
+        &self,
+        ctx: &EvalCtx,
+        run: &[&Layer],
+        out: (u32, u32),
+        held: &std::collections::HashMap<effectcraft_project::LayerId, Arc<Buf>>,
+    ) -> Option<three_d::Run3d> {
+        three_d::compose::gpu_run(&Renderer { held: Some(held), ..*self }, ctx, run, out)
+    }
+
     /// A run of consecutive 3D layers of an Advanced 3D comp prepared for an accelerator's
     /// compositor ([`three_d::adv::Prepared`]): rendered as one scene and composited (Normal,
     /// premultiplied over) onto the canvas. `None` = not an Advanced 3D comp, or a layer needs the
@@ -1934,6 +2605,52 @@ impl<'a> Renderer<'a> {
         out
     }
 
+    /// A layer whose effects an accelerator can run on its own device and keep there, instead
+    /// of each frame's result being read back for the layer cache and uploaded again to be
+    /// composited: where effect space starts in layer coordinates (the stack runs on the
+    /// layer's input, [`Self::layer_input`] or [`Self::plain_solid`], in effect space). Only for a stack that changes from frame to frame (a still
+    /// one is rendered once and kept by the layer cache) and whose every effect the accelerator
+    /// supports; no layer styles, no motion-blurred content.
+    pub fn resident_effects(&self, ctx: &EvalCtx, layer: &Layer) -> Option<[f64; 2]> {
+        let a = self.active_accel()?;
+        if layer.switches.adjustment || !layer.switches.effects || styles::active(ctx, layer) || self.content_times(ctx, layer).is_some() {
+            return None;
+        }
+        let fx = layer.effects()?;
+        let mut stack = fx.groups().filter(|g| g.enabled).peekable();
+        stack.peek()?;
+        let runs_there = |g: &effectcraft_project::PropGroup| match &g.kind {
+            GroupKind::Effect { effect } => effectcraft_effects::find(effect).is_some_and(|s| s.gpu && a.supports_effect(s.id)),
+            _ => false,
+        };
+        // A nested comp that moves changes the input every frame, whatever the effects do: it
+        // stays with the accelerator even when an effect of the stack runs on the CPU (read
+        // back for that effect alone, instead of the whole nested comp being composited here).
+        let precomp = self.masked_precomp(ctx, layer).is_some();
+        if !(precomp || stack.all(runs_there) && (cache::animated(fx) || cache::time_dependent(layer))) {
+            return None;
+        }
+        Some(ctx.effect_bounds(layer).1)
+    }
+
+    /// An unmasked solid layer's pixel and buffer size at this render's scale: an accelerator
+    /// fills its own image with it instead of taking a filled buffer from here. `None` for any
+    /// other layer (use [`Self::layer_input`]).
+    pub fn plain_solid(&self, ctx: &EvalCtx, layer: &Layer) -> Option<([f32; 4], u32, u32)> {
+        let LayerSource::Solid { item } = &layer.source else { return None };
+        if layer.switches.adjustment || self.content_times(ctx, layer).is_some() || layer.masks().is_some_and(|m| !m.children.is_empty()) {
+            return None;
+        }
+        let ItemKind::Solid(sol) = &self.project.item(*item)?.kind else { return None };
+        let mut c = sol.color;
+        if let Some(conv) = self.pipe.authored_in() {
+            c = conv.apply(c);
+        }
+        let s = self.opts.scale;
+        let (w, h) = (((sol.width as f64 * s).ceil() as u32).max(1), ((sol.height as f64 * s).ceil() as u32).max(1));
+        Some((self.pipe.quantize_px([c[0], c[1], c[2], 1.0]), w, h))
+    }
+
     /// Run the layer's effect stack on `target` (an accelerator's resident image): GPU-capable
     /// runs through [`FxTarget::gpu`], the others through [`FxTarget::cpu`], with the CPU's
     /// parameters and environment. `adjustment`: the stack runs on the comp below (adjustment
@@ -1941,6 +2658,15 @@ impl<'a> Renderer<'a> {
     pub fn run_effects_on(&self, ctx: &EvalCtx, layer: &Layer, adjustment: bool, target: &mut dyn FxTarget) {
         // `target` is used as it is: the comp below for adjustment layers (the callers).
         self.run_effect_stack(ctx, layer, adjustment, usize::MAX, None, [0.0; 2], target);
+    }
+
+    /// [`Renderer::run_effects_on`] for a (non-adjustment) layer's own pixels: `target` holds
+    /// them in effect space (as [`Renderer::layer_input`] hands them out) and the result stays
+    /// there. Returns the effect-space origin in layer coordinates (rebase by its negation).
+    pub fn run_layer_effects_on(&self, ctx: &EvalCtx, layer: &Layer, target: &mut dyn FxTarget) -> [f64; 2] {
+        let origin = ctx.effect_bounds(layer).1;
+        self.run_effect_stack(ctx, layer, false, usize::MAX, None, origin, target);
+        origin
     }
 
     /// An adjustment layer's footprint (its source with masks applied, layer space): where
@@ -1957,7 +2683,13 @@ impl<'a> Renderer<'a> {
         let _ = masks::apply(ctx, layer, &mut foot, self.mask_blur(ctx, layer));
         let foot = Arc::new(foot);
         if let (Some(c), Some(k)) = (self.cache, key) {
-            c.insert(k, foot.clone());
+            // A footprint nothing animates serves every frame: kept like a still layer's buffer
+            // (else the buffers of one frame push it out and it is built and uploaded again).
+            if !self.within_still && !layer.masks().is_some_and(cache::animated) && self.content_times(ctx, layer).is_none() {
+                c.insert_stable(k, foot.clone());
+            } else {
+                c.insert(k, foot.clone());
+            }
         }
         Some(foot)
     }
@@ -1984,6 +2716,49 @@ impl<'a> Renderer<'a> {
             }
         }
         st
+    }
+
+    /// What the 3D track matte layer `m` of `layer` shows through the camera, at `out` size: a 3D
+    /// matte is seen where the layer appears on screen, whatever the matted layer is (see
+    /// `composite_iso_with`). For an accelerator compositing a 2D layer with such a matte.
+    pub fn matte_3d(&self, ctx: &EvalCtx, layer: &Layer, m: &Layer, out: (u32, u32)) -> Image {
+        if three_d::adv::active(self, ctx) {
+            three_d::adv::matte_image(self, ctx, layer, out).unwrap_or_else(|| Image::new(out.0, out.1))
+        } else if m.is_active_at(ctx.time) {
+            three_d::compose::matte_image(self, ctx, m, out)
+        } else {
+            Image::new(out.0, out.1)
+        }
+    }
+
+    /// [`Self::matte_3d`] for an accelerator's Classic 3D compositor: the matte layer alone (its
+    /// own matte, blend mode and Preserve Transparency ignored) as a prepared run, to draw on an
+    /// empty canvas. `None` (Advanced 3D, an inactive matte, a run the accelerator cannot take):
+    /// use [`Self::matte_3d`].
+    pub fn prepare_matte_3d(&self, ctx: &EvalCtx, m: &Layer, out: (u32, u32)) -> Option<three_d::Run3d> {
+        if !m.is_active_at(ctx.time) {
+            return None;
+        }
+        let mut solo = m.clone();
+        solo.track_matte = None;
+        solo.preserve_transparency = false;
+        solo.blend_mode = BlendMode::Normal;
+        solo.switches.video = true;
+        three_d::compose::gpu_run(self, ctx, &[&solo], out)
+    }
+
+    /// [`Self::prepare_matte_3d`] for a matte whose pixels the accelerator rendered and holds
+    /// ([`Self::resident_effects`]): `buf` describes them (size, offset, scale).
+    pub fn prepare_matte_3d_resident(&self, ctx: &EvalCtx, m: &Layer, out: (u32, u32), buf: Arc<Buf>) -> Option<three_d::Run3d> {
+        if !m.is_active_at(ctx.time) {
+            return None;
+        }
+        let mut solo = m.clone();
+        solo.track_matte = None;
+        solo.preserve_transparency = false;
+        solo.blend_mode = BlendMode::Normal;
+        solo.switches.video = true;
+        three_d::compose::gpu_run_of(self, ctx, &solo, out, buf)
     }
 
     /// Opacity the layer composites with (its Opacity × collapsed precomps' opacity).
@@ -2029,13 +2804,12 @@ pub fn field_frame(img: &Image, parity: usize) -> Image {
 }
 
 /// Interpret Footage ▸ Invert Alpha and Interpret As Linear Light on decoded (premultiplied)
-/// pixels.
-pub fn interpret_pixels(img: &Image, f: &Footage) -> Image {
+/// pixels; linear light is encoded in `space` ([`color::Pipe::linear_footage_space`]).
+pub fn interpret_pixels(img: &Image, f: &Footage, space: effectcraft_color::ColorSpace) -> Image {
     let linear = f.linear_light_applies();
     if !f.invert_alpha && !linear {
         return img.clone();
     }
-    let space = f.color_profile.unwrap_or(effectcraft_color::ColorSpace::Srgb);
     let mut out = img.clone();
     for p in out.data.iter_mut() {
         let a = p[3];
@@ -2152,6 +2926,8 @@ mod tests_collapse;
 #[cfg(test)]
 mod tests_color;
 #[cfg(test)]
+mod tests_footage_size;
+#[cfg(test)]
 mod tests_frame_blend;
 #[cfg(test)]
 mod tests_mask_blur;
@@ -2159,5 +2935,7 @@ mod tests_mask_blur;
 mod tests_nested;
 #[cfg(test)]
 mod tests_paint;
+#[cfg(test)]
+mod tests_still;
 #[cfg(test)]
 mod tests_time;

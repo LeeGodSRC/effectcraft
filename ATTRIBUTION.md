@@ -60,6 +60,8 @@ Screenshots of EffectCraft itself, rendered headlessly, showing only procedurall
 
 - UI icons drawn in code: `crates/ui-egui/src/icons.rs`.
 - Procedural demo content (solids, shapes, gradients, text animations): `crates/engine/src/demo.rs`.
+- Synthetic triangle-glyph font for fallback tests: `crates/text/tests/fallback_order.rs`
+  (sidecar `.attribution`; generated in memory, no third-party font outlines).
 - Built-in project templates (Lower Third, Title Card, Logo Reveal, Kinetic Type, Social Square, Vertical Story,
   Slideshow, 3D Text Orbit) built from engine commands, and their thumbnails rendered by our own renderer:
   `crates/engine/src/templates.rs`.
@@ -118,3 +120,5 @@ under [`docs/brand/LICENSE-brand.txt`](docs/brand/LICENSE-brand.txt). Forks and 
 | `docs/brand/artcraft-mark-black.svg` | ArtCraft Team | Original work: first-party ArtCraft brand mark (ArtCraft symbol ("A" mark), black) | ArtCraft brand terms, not open source (`docs/brand/LICENSE-brand.txt`) |
 | `docs/brand/artcraft-mark.png` | ArtCraft Team | Original work: first-party ArtCraft brand mark (ArtCraft symbol ("A" mark), blue) | ArtCraft brand terms, not open source (`docs/brand/LICENSE-brand.txt`) |
 | `docs/brand/artcraft-mark.svg` | ArtCraft Team | Original work: first-party ArtCraft brand mark (ArtCraft symbol ("A" mark), blue) | ArtCraft brand terms, not open source (`docs/brand/LICENSE-brand.txt`) |
+
+- Appearance theme previews, drawn procedurally from original shapes: `crates/ui-egui/src/panels/settings.rs` (original work, MIT OR Apache-2.0).

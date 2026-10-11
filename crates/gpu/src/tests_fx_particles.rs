@@ -31,6 +31,27 @@ fn particle_world_types_and_modes() {
     case("ec.sim.ccparticleworld", &[("birthRate", n(0.0))], 0.0, 0.0);
 }
 
+#[test]
+fn particle_world_screen_and_black_matte_overlap() {
+    for mode in [1, 3] {
+        case(
+            "ec.sim.ccparticleworld",
+            &[
+                ("particle/particleType", e(1)),
+                ("particle/transferMode", e(mode)),
+                ("birthRate", n(2.0)),
+                ("particle/birthSize", n(0.5)),
+                ("physics/velocity", n(0.0)),
+                ("physics/gravity", n(0.0)),
+                ("particle/maxOpacity", n(35.0)),
+                ("extras/compositeWithOriginal", off()),
+            ],
+            0.5,
+            0.0,
+        );
+    }
+}
+
 /// #397: CC Particle World seen through a camera layer (the plan is shared, so the GPU follows
 /// the camera with the CPU).
 #[test]

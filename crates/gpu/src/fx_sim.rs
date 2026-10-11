@@ -216,7 +216,12 @@ pub(crate) fn sprite_layer(e: &mut Enc, src: &GpuImage, plan: &SpritePlan) -> Op
     let (w, h) = (src.width, src.height);
     // Without tints the record stops after the (zero) tint kind.
     let stride = if plan.tints.is_empty() { 16 } else { 24 };
-    let mut ch = crate::fx_particles::Chunked::new(0, (plan.acc == Acc::Add) as u32, stride, w, h);
+    let accumulation = match plan.acc {
+        Acc::Over => 0,
+        Acc::Add => 1,
+        Acc::Screen => 3,
+    };
+    let mut ch = crate::fx_particles::Chunked::new(0, accumulation, stride, w, h);
     for (i, s) in plan.sprites.iter().enumerate() {
         let (kind, dx, dy) = match s.shape {
             Shape::Soft => (0.0, 0.0, 0.0),

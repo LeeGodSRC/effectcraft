@@ -401,6 +401,37 @@ fn cancel_stops_early() {
 }
 
 /// 16-bit stereo WAV with a 440 Hz sine at amplitude 0.5 (left) and silence (right).
+/// A movie's frames stream to the encoder while later ones render: cancelling in the middle
+/// stops the frames in flight and the export ends (it used to be a batch boundary).
+#[test]
+fn cancel_stops_a_movie_between_frames() {
+    let (p, cid) = project(None);
+    let d = out_dir("cancel_movie");
+    let om = OutputModule::for_format(OutputFormat::H264);
+    let s = settings();
+    let path = d.join("c.mp4").to_string_lossy().to_string();
+    let job = Job {
+        project: &p,
+        footage: &NoFootage,
+        expr: None,
+        accel: None,
+        comp: cid,
+        settings: &s,
+        output: &om,
+        path: &path,
+        sink: None,
+        options: Default::default(),
+        nested_switches: true,
+    };
+    let mut seen = 0;
+    let r = export(&job, &mut |pr| {
+        seen = pr.done;
+        pr.done < FRAMES - 3
+    });
+    assert!(matches!(r, Err(effectcraft_export::ExportError::Cancelled)));
+    assert_eq!(seen, FRAMES - 3, "stopped at the frame that said so");
+}
+
 fn write_tone(path: &Path, secs: f64) {
     let sr = 48_000u32;
     let n = (secs * sr as f64) as usize;

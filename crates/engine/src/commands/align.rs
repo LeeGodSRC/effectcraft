@@ -51,16 +51,7 @@ fn placed(s: &Session, cid: ItemId, ids: &[LayerId]) -> Result<Vec<Placed>> {
 
 /// Comp space → the space of `l`'s Position (its parent's).
 fn to_parent(ctx: &EvalCtx, l: &Layer) -> Mat4 {
-    // Parent chain: world(layer) = local(pn) ⋯ local(p1) · local(layer).
-    let mut par = Mat4::IDENTITY;
-    let mut cur = l.parent;
-    let mut guard = 0;
-    while let Some(pid) = cur {
-        guard += 1;
-        let Some(p) = ctx.comp.layer(pid).filter(|_| guard < 64) else { break };
-        par = ctx.local_matrix(p) * par;
-        cur = p.parent;
-    }
+    let par = ctx.parent_matrix(l);
     par.inverse().unwrap_or(Mat4::IDENTITY)
 }
 
@@ -263,6 +254,27 @@ mod tests {
         assert!(((ca[1] + ca[3]) / 2.0 - (cb[1] + cb[3]) / 2.0).abs() < 1e-6);
         assert!(s.execute("layer.align", json!({"edge": "left", "to": "selection", "layers": [a]})).is_err());
         assert!(s.execute("layer.align", json!({"edge": "diagonal", "layers": [a]})).is_err());
+    }
+
+    /// #352: shape layers align and snap by their visual edges (half the stroke, no
+    /// anti-aliasing padding), so two rectangles lined up edge to edge touch with no gap.
+    #[test]
+    fn shape_layers_align_by_their_visual_edges() {
+        let mut s = session();
+        let shape = |s: &mut Session, extra: Value| {
+            let mut p = json!({"kind": "rect", "size": [100, 100], "fill": "#ff0000"});
+            p.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            s.execute("layer.newShape", p).unwrap()["layer"].as_u64().unwrap()
+        };
+        let a = shape(&mut s, json!({}));
+        let b = shape(&mut s, json!({"stroke": "#ffffff", "strokeWidth": 10}));
+        let width = |s: &Session, id| {
+            let r = bounds(s, id);
+            r[2] - r[0]
+        };
+        assert!((width(&s, a) - 100.0).abs() < 1e-6 && (width(&s, b) - 110.0).abs() < 1e-6, "{} {}", width(&s, a), width(&s, b));
+        s.execute("layer.align", json!({"edge": "left", "layers": [a, b]})).unwrap();
+        assert!(bounds(&s, a)[0].abs() < 1e-6 && bounds(&s, b)[0].abs() < 1e-6);
     }
 
     #[test]

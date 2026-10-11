@@ -35,14 +35,9 @@ fn fxs_smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
     return t * t * (3.0 - 2.0 * t);
 }
 
-// x / a rounded like the CPU's IEEE division (GPU division may be off by an ulp, which flips
-// thresholds on 8 / 16 bpc colours that sit exactly on them): one residual correction.
+// Threshold decisions must use the CPU's rounded quotient, independent of GPU fast math.
 fn fxs_qdiv(x: vec3<f32>, a: f32) -> vec3<f32> {
-    let q = x / a;
-    let r = fma(-q, vec3<f32>(a), x);
-    // `q + r / a`, written as an fma so drivers (NVIDIA Vulkan) can't contract it another way
-    // and round differently from the CPU.
-    return fma(r / a, vec3<f32>(1.0), q);
+    return vec3<f32>(div_rn(x.x,a),div_rn(x.y,a),div_rn(x.z,a));
 }
 
 fn fxs_rem2(i: i32) -> i32 {
@@ -171,7 +166,7 @@ fn fxs_point(@builtin(global_invocation_id) gid: vec3<u32>) {
 // u[0].x = mode (all sample bilinear, transparent outside, unless noted):
 //  1 Mirror (distort::mirror): f[0] = (cx, cy, nx, ny)
 //  2 Spherize (distort::spherize): f[0] = (cx, cy, radius)
-//  3 Polar Coordinates (distort::polar, edges repeated): u[0].y = to polar;
+//  3 Polar Coordinates (distort::polar, transparent outside): u[0].y = to polar;
 //    f[0] = (w, h, cx, cy); f[1] = (rmax, interpolation)
 //  4 CC Slant (distort3::cc_slant): f[0] = (floor x, floor y, 1 / height, slant); f[1].x = x scale
 //  5 CC Smear (distort3::cc_smear): f[0] = (from x, from y, dx, dy); f[1] = (len², reach, radius)
@@ -264,7 +259,6 @@ fn fxs_warp(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
         }
         case 3u: {
-            clamped = true;
             let w = P.f[0].x;
             let h = P.f[0].y;
             let cx = P.f[0].z;
@@ -277,14 +271,17 @@ fn fxs_warp(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let a0 = atan2(dx, -dy);
                 let a = a0 - floor(a0 / FXS_TAU) * FXS_TAU;
                 let r = sqrt(dx * dx + dy * dy) / rmax;
-                pp = vec2<f32>(a / FXS_TAU * w, h - r * h);
+                pp = vec2<f32>(a / FXS_TAU * w, r * h);
             } else {
                 let a = x / w * FXS_TAU;
-                let r = (h - y) / h * rmax;
+                let r = y / h * rmax;
                 pp = vec2<f32>(cx + r * sin(a), cy - r * cos(a));
             }
             let amt = P.f[1].y;
             s = vec2<f32>(x + (pp.x - x) * amt, y + (pp.y - y) * amt);
+            if (P.u[0].y != 0u) {
+                s.x = clamp(s.x, 0.5, max(w - 0.5, 0.5));
+            }
         }
         case 4u: {
             let fl = P.f[0].xy;

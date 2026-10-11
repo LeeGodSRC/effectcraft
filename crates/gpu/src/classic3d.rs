@@ -126,6 +126,12 @@ const LIGHT_BYTES: usize = 6 * 16;
 /// Composite a prepared Classic 3D run over `canvas`. `None` when it cannot run here (the
 /// caller draws it on the CPU).
 pub(crate) fn draw_run(e: &mut Enc, run: &Run3d, canvas: &GpuImage) -> Option<GpuImage> {
+    draw_run_with(e, run, canvas, &HashMap::new())
+}
+
+/// [`draw_run`]; `held`: by layer id, the pixels of planes that are on the device already (a
+/// held plane's buffer only describes them: it has a size but no pixels).
+pub(crate) fn draw_run_with(e: &mut Enc, run: &Run3d, canvas: &GpuImage, held: &HashMap<u32, GpuImage>) -> Option<GpuImage> {
     let (w, h) = (canvas.width, canvas.height);
     let boxes: Vec<[i64; 4]> = run.planes.iter().filter(|p| p.draw).map(|p| p.bbox).collect();
     if boxes.is_empty() {
@@ -140,7 +146,12 @@ pub(crate) fn draw_run(e: &mut Enc, run: &Run3d, canvas: &GpuImage) -> Option<Gp
     // here when the plane has it.
     let mut texs: Vec<(GpuImage, [f64; 2])> = Vec::with_capacity(run.planes.len());
     for p in &run.planes {
-        let up = e.g.upload_buf(&p.buf)?;
+        let up = if p.buf.img.data.is_empty() {
+            // A description without pixels: the texture has to be held here.
+            held.get(&p.layer_id)?.clone()
+        } else {
+            e.g.upload_buf(&p.buf)?
+        };
         match &p.dof {
             Some(d) => {
                 let pad = d.pad as f64;

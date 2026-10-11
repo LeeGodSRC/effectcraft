@@ -5,7 +5,7 @@ use effectcraft_geom::{Mat3, vec2};
 use effectcraft_keyframe::Value;
 use effectcraft_path::{FillRule, StrokeStyle};
 use effectcraft_project::{FeatherFalloff, GroupKind, Layer, MaskMode, MaskMotionBlur};
-use effectcraft_raster::{Mask, box_blur, gaussian_blur};
+use effectcraft_raster::{Mask, box_blur_mask, gaussian_blur_mask};
 use rayon::prelude::*;
 
 use crate::eval::EvalCtx;
@@ -89,15 +89,13 @@ fn coverage_at(ctx: &EvalCtx, layer: &Layer, g: &effectcraft_project::PropGroup,
     }
     let feather = ctx.v2(layer, g, "feather", [0.0; 2]);
     if feather[0] > 0.0 || feather[1] > 0.0 {
-        let img = cov.to_image();
-        let b = if linear {
+        cov = if linear {
             // One box pass: a straight ramp `feather` pixels wide across the edge.
             let r = |f: f64| ((f * buf.scale / 2.0).round() as usize).max(if f > 0.0 { 1 } else { 0 });
-            box_blur(&img, r(feather[0]), r(feather[1]), 1, false)
+            box_blur_mask(&cov, r(feather[0]), r(feather[1]), 1)
         } else {
-            gaussian_blur(&img, feather[0] * buf.scale / 2.0, feather[1] * buf.scale / 2.0, false)
+            gaussian_blur_mask(&cov, feather[0] * buf.scale / 2.0, feather[1] * buf.scale / 2.0)
         };
-        cov = Mask::from_alpha(&b);
     }
     Some(cov)
 }
@@ -114,10 +112,8 @@ pub fn shapes(ctx: &EvalCtx, layer: &Layer) -> Vec<effectcraft_effects::MaskShap
         let mut pts: Vec<[f64; 2]> = Vec::new();
         let mut closed = false;
         kurbo::flatten(path.iter(), 0.25, |el| match el {
-            effectcraft_path::PathEl::MoveTo(p) | effectcraft_path::PathEl::LineTo(p) => {
-                if pts.last() != Some(&[p.x, p.y]) {
-                    pts.push([p.x, p.y]);
-                }
+            effectcraft_path::PathEl::MoveTo(p) | effectcraft_path::PathEl::LineTo(p) if pts.last() != Some(&[p.x, p.y]) => {
+                pts.push([p.x, p.y]);
             }
             effectcraft_path::PathEl::ClosePath => closed = true,
             _ => {}
@@ -145,9 +141,16 @@ pub fn apply(ctx: &EvalCtx, layer: &Layer, buf: &mut Buf, blur: MaskBlur) -> boo
     let n = (buf.img.width * buf.img.height) as usize;
     let first_sub = matches!(list[0].kind, GroupKind::Mask { mode: MaskMode::Subtract, .. });
     let mut acc = vec![if first_sub { 1.0f32 } else { 0.0 }; n];
+    // The first mask has nothing to combine with. Intersect and Darken would multiply or
+    // minimise against that empty coverage and hide the layer; they cover like Add instead.
+    // Lighten and Difference already do. Filling the accumulator first would make Add show
+    // the whole layer.
+    let mut first = true;
     for g in list {
         let GroupKind::Mask { mode, inverted, .. } = g.kind else { continue };
         let Some(mut cov) = coverage(ctx, layer, g, buf, blur) else { continue };
+        let mode = if first && matches!(mode, MaskMode::Intersect | MaskMode::Darken) { MaskMode::Add } else { mode };
+        first = false;
         let op = (ctx.f(layer, g, "opacity", 100.0) / 100.0) as f32;
         cov.data.par_iter_mut().for_each(|c| {
             if inverted {

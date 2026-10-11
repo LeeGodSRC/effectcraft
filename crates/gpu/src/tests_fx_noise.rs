@@ -136,6 +136,15 @@ fn fractal_noise_other_modes() {
 }
 
 #[test]
+fn fractal_noise_normal_blend_keeps_masked_source_alpha() {
+    // Exercise both the Soft Linear fast path and the general noise kernel on
+    // the parity fixture's transparent and partially transparent source pixels.
+    for noise in [2, 3] {
+        effect_case("ec.noise.fractal", &[("noiseType", e(noise)), ("blendingMode", e(1)), ("opacity", n(37.0)), ("blend", n(21.0))]);
+    }
+}
+
+#[test]
 fn noise_alpha_and_hls() {
     effect_case("ec.noise.noisealpha", &[("amount", n(40.0))]);
     effect_case("ec.noise.noisealpha", &[("amount", n(70.0)), ("noise", e(3)), ("originalAlpha", e(2)), ("overflow", e(1)), ("noisePhase", n(100.0))]);

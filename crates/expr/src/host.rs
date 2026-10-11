@@ -236,6 +236,9 @@ fn compact(s: &str) -> String {
 fn alias(key: &str) -> &str {
     match key {
         "anchorPoint" => "anchor",
+        "xPosition" => "positionX",
+        "yPosition" => "positionY",
+        "zPosition" => "positionZ",
         "xRotation" => "rotationX",
         "yRotation" => "rotationY",
         "zRotation" => "rotation",

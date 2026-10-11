@@ -14,7 +14,8 @@
 //! * **Blend Colors Using 1.0 Gamma**: only blending is linear. Each layer's finished pixels
 //!   are linearised just before they are transformed and blended, the comp accumulates in linear
 //!   and is encoded back to the working space when the comp is done (so precomps hand encoded
-//!   pixels to their parent). Without a working space the sRGB curve is used.
+//!   pixels to their parent). Without a working space the Working Gamma's curve is used (sRGB
+//!   at 2.2, a pure 2.4 power curve at 2.4); so is it for Interpret As Linear Light footage.
 
 use effectcraft_color::{ColorSpace, Conversion};
 use effectcraft_project::{Footage, HdrMode, ProjectSettings};
@@ -36,6 +37,8 @@ pub struct Pipe {
     pub out: ColorSpace,
     /// HDR handling for standard-dynamic-range output.
     pub hdr: HdrMode,
+    /// Unmanaged with Working Gamma 2.4: the pure 2.4 power curve instead of sRGB's.
+    pub gamma24: bool,
 }
 
 impl Pipe {
@@ -49,12 +52,20 @@ impl Pipe {
             linear_blend: s.blend_linear && !linear,
             out: s.output_space.unwrap_or(ColorSpace::Srgb),
             hdr: s.hdr,
+            gamma24: s.working_space.is_none() && s.working_gamma_24(),
         }
     }
 
-    /// The space whose curve encodes working-space pixels (sRGB when unmanaged).
+    /// The space whose curve encodes working-space pixels (unmanaged: the Working Gamma's, sRGB
+    /// at 2.2 and Rec. 709's pure 2.4 power curve at 2.4).
     fn curve(&self) -> ColorSpace {
-        self.space.unwrap_or(ColorSpace::Srgb)
+        self.space.unwrap_or(if self.gamma24 { ColorSpace::Rec709 } else { ColorSpace::Srgb })
+    }
+
+    /// The space Interpret As Linear Light encodes footage `f` in: its colour profile, else sRGB
+    /// (managed; the working space converts from there) or the Working Gamma's curve (unmanaged).
+    pub fn linear_footage_space(&self, f: &Footage) -> ColorSpace {
+        f.color_profile.unwrap_or(if self.space.is_some() { ColorSpace::Srgb } else { self.curve() })
     }
 
     /// Footage `f` from its colour profile (`None` = sRGB) → working space; nothing for
@@ -99,11 +110,11 @@ impl Pipe {
     }
 
     /// One pixel clamped and quantised to the bit depth.
-    pub fn quantize_px(&self, mut p: [f32; 4]) -> [f32; 4] {
-        if let Some(l) = self.levels {
-            quantize_px(&mut p, l, 1.0 / l);
+    pub fn quantize_px(&self, p: [f32; 4]) -> [f32; 4] {
+        match self.levels {
+            Some(l) => effectcraft_raster::quantize_px(p, l, 1.0 / l),
+            None => p,
         }
-        p
     }
 
     /// Clamp and quantise to the bit depth (no-op in 32 bpc).
@@ -149,6 +160,7 @@ impl Pipe {
         k = k.wrapping_mul(31).wrapping_add(self.space.map_or(7, |s| s as u64 + 11));
         k = k.wrapping_mul(31).wrapping_add(self.linear as u64 * 2 + self.linear_blend as u64);
         k = k.wrapping_mul(31).wrapping_add(self.out as u64 * 4 + self.hdr as u64);
+        k = k.wrapping_mul(31).wrapping_add(self.gamma24 as u64);
         k
     }
 }
@@ -190,19 +202,6 @@ pub fn quantize(img: &mut Image, levels: f32) {
     quantize_rect(img, PxRect { x0: 0, y0: 0, x1: img.width, y1: img.height }, levels);
 }
 
-/// Clamp (colour ≤ alpha ≤ 1, NaN → 0) and round half up; values are non-negative after the
-/// clamp, so the integer conversion rounds like `round()` and vectorises.
-#[allow(clippy::manual_clamp)] // max/min map NaN to 0; clamp would keep NaN
-#[inline(always)]
-fn quantize_px(p: &mut [f32; 4], levels: f32, inv: f32) {
-    let a = (p[3].max(0.0).min(1.0) * levels + 0.5) as u32 as f32 * inv;
-    let hi = [a, a, a, a];
-    for c in 0..3 {
-        p[c] = (p[c].max(0.0).min(hi[c]) * levels + 0.5) as u32 as f32 * inv;
-    }
-    p[3] = a;
-}
-
 /// [`quantize`] restricted to a rectangle (already clamped to the image), row-parallel.
 fn quantize_rect(img: &mut Image, r: PxRect, levels: f32) {
     if r.x0 >= r.x1 || r.y0 >= r.y1 {
@@ -213,7 +212,7 @@ fn quantize_rect(img: &mut Image, r: PxRect, levels: f32) {
     let (x0, x1) = (r.x0 as usize, r.x1 as usize);
     img.data[r.y0 as usize * w..r.y1 as usize * w].par_chunks_mut(w).for_each(|row| {
         for p in &mut row[x0..x1] {
-            quantize_px(p, levels, inv);
+            *p = effectcraft_raster::quantize_px(*p, levels, inv);
         }
     });
 }
@@ -267,4 +266,23 @@ pub fn output_hdr(img: &mut Image, to_linear: Option<Conversion>, mode: HdrMode,
         let o = encode.apply(c);
         *p = [o[0] * a, o[1] * a, o[2] * a, a];
     });
+}
+
+#[cfg(test)]
+mod tests {
+    /// Both forms `round_half_up` picks between agree on everything quantising feeds it:
+    /// 0..=levels, exact halves included.
+    #[test]
+    fn rounding_forms_agree() {
+        for levels in [255.0f32, 32_768.0] {
+            for i in 0..=(levels as u32 * 16) {
+                let v = i as f32 / 16.0;
+                assert_eq!((v + 0.5).floor(), (v + 0.5) as u32 as f32, "{v}");
+            }
+            for i in 0..=100_000 {
+                let v = (i as f32 / 100_000.0) * levels;
+                assert_eq!((v + 0.5).floor(), (v + 0.5) as u32 as f32, "{v}");
+            }
+        }
+    }
 }

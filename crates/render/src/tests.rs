@@ -57,6 +57,28 @@ fn opacity_and_blend_modes() {
 }
 
 #[test]
+fn clipping_layers_recolor_without_increasing_underlying_alpha() {
+    for three_d in [false, true] {
+        for opacity in [0.0, 50.0, 100.0] {
+            let (mut p, cid, comp) = setup();
+            let mut bottom = solid(&mut p, &comp, [1.0, 0.0, 0.0], 200, 100);
+            bottom.props.prop_mut("transform/opacity").unwrap().value = Value::Scalar(25.0);
+            bottom.switches.three_d = three_d;
+            let mut top = solid(&mut p, &comp, [0.0, 1.0, 0.0], 200, 100);
+            top.preserve_transparency = true;
+            top.switches.three_d = three_d;
+            top.props.prop_mut("transform/opacity").unwrap().value = Value::Scalar(opacity);
+            p.comp_mut(cid).unwrap().layers = vec![top, bottom];
+            let img = render_frame(&p, cid, Tick::ZERO, 1.0);
+            let actual = img.get(100, 50);
+            let f = opacity as f32 / 100.0;
+            let expected = [0.25 * (1.0 - f), 0.25 * f, 0.0, 0.25];
+            assert!(actual.iter().zip(expected).all(|(a, b)| (a - b).abs() < 1e-5), "3d={three_d}, {opacity}: {actual:?}");
+        }
+    }
+}
+
+#[test]
 fn half_resolution() {
     let (mut p, cid, comp) = setup();
     let l = solid(&mut p, &comp, [1.0, 1.0, 1.0], 200, 100);
@@ -78,6 +100,45 @@ fn mask_cuts_layer() {
     let img = render_frame(&p, cid, Tick::ZERO, 1.0);
     assert!(img.get(50, 50)[3] > 0.99);
     assert!(img.get(150, 50)[3] < 0.01);
+}
+
+#[test]
+fn first_intersect_and_darken_keep_their_rectangle() {
+    let render = |modes: &[MaskMode], centers: &[[f64; 2]]| {
+        let (mut p, cid, comp) = setup();
+        let mut l = solid(&mut p, &comp, [1.0, 1.0, 1.0], 200, 100);
+        for (i, (mode, center)) in modes.iter().zip(centers).enumerate() {
+            let mut next = p.next_id;
+            let m = build::mask(&mut Ids(&mut next), &format!("Mask {}", i + 1), ShapePath::rect(*center, 40.0, 40.0), *mode, [255, 255, 0]);
+            p.next_id = next;
+            l.props.sub_mut("masks").unwrap().children.push(m.into());
+        }
+        p.comp_mut(cid).unwrap().layers.push(l);
+        render_frame(&p, cid, Tick::ZERO, 1.0)
+    };
+    // A first Intersect or Darken has nothing to combine with, so it covers like Add.
+    // Lighten and Difference already do; Subtract still starts from the whole layer.
+    for mode in [MaskMode::Intersect, MaskMode::Darken, MaskMode::Add, MaskMode::Lighten, MaskMode::Difference] {
+        let img = render(&[mode], &[[50.0, 50.0]]);
+        assert!(img.get(50, 50)[3] > 0.99, "{mode:?} keeps the rectangle");
+        assert!(img.get(150, 50)[3] < 0.01, "{mode:?} stays outside it");
+    }
+    let hole = render(&[MaskMode::Subtract], &[[50.0, 50.0]]);
+    assert!(hole.get(50, 50)[3] < 0.01, "subtract still cuts its rectangle");
+    assert!(hole.get(150, 50)[3] > 0.99, "subtract leaves the rest of the layer");
+
+    // Add, then Intersect with a shifted rectangle: only the overlap remains.
+    let overlap = render(&[MaskMode::Add, MaskMode::Intersect], &[[50.0, 50.0], [70.0, 50.0]]);
+    assert!(overlap.get(50, 50)[3] > 0.99, "overlap stays");
+    assert!(overlap.get(35, 50)[3] < 0.01, "the first rectangle's exclusive side is cut");
+    assert!(overlap.get(85, 50)[3] < 0.01, "the second rectangle's exclusive side is cut");
+    let darkened = render(&[MaskMode::Add, MaskMode::Darken], &[[50.0, 50.0], [70.0, 50.0]]);
+    assert!(darkened.get(50, 50)[3] > 0.99 && darkened.get(35, 50)[3] < 0.01 && darkened.get(85, 50)[3] < 0.01);
+
+    // A later disjoint Add still contributes after a first Intersect.
+    let both = render(&[MaskMode::Intersect, MaskMode::Add], &[[50.0, 50.0], [150.0, 50.0]]);
+    assert!(both.get(50, 50)[3] > 0.99 && both.get(150, 50)[3] > 0.99);
+    assert!(both.get(100, 50)[3] < 0.01);
 }
 
 #[test]
@@ -190,6 +251,37 @@ fn particle_world_scene(pan: f64) -> (Project, ItemId) {
     }
     p.comp_mut(cid).unwrap().layers = vec![cam, l];
     (p, cid)
+}
+
+#[test]
+fn particle_texture_animation_starts_at_effect_layer_in_point() {
+    let (mut p, cid, comp) = setup();
+    let mut texture = solid(&mut p, &comp, [1.0; 3], 16, 16);
+    texture.switches.video = false;
+    add_effect(&mut p, &mut texture, "ec.color.tint", [16.0; 2], &[]);
+    texture.props.prop_mut("effects/#1/white").unwrap().keys =
+        vec![Keyframe::new(Tick::from_seconds_f64(-0.5), Value::Color([0.0, 1.0, 0.0, 1.0])), Keyframe::new(Tick::ZERO, Value::Color([1.0, 0.0, 0.0, 1.0]))];
+    let mut emitter = solid(&mut p, &comp, [0.0; 3], 200, 100);
+    // Trimmed: in point differs from both composition zero and the layer start.
+    emitter.start_time = Tick::from_seconds_f64(-2.0);
+    emitter.in_point = Tick::from_seconds_f64(-1.0);
+    let vals = [
+        ("birthRate", Value::Scalar(2.0)),
+        ("longevity", Value::Scalar(0.2)),
+        ("particle/particleType", Value::Enum(8)),
+        ("particle/birthSize", Value::Scalar(1.0)),
+        ("particle/deathSize", Value::Scalar(1.0)),
+        ("particle/birthColor", Value::Color([1.0; 4])),
+        ("particle/deathColor", Value::Color([1.0; 4])),
+        ("texture/layer", Value::Layer(Some(texture.id.0))),
+        ("texture/time", Value::Enum(2)),
+        ("extras/compositeWithOriginal", Value::Bool(false)),
+    ];
+    add_effect(&mut p, &mut emitter, "ec.sim.ccparticleworld", [200.0, 100.0], &vals);
+    p.comp_mut(cid).unwrap().layers = vec![emitter, texture];
+    let img = render_frame(&p, cid, Tick::from_seconds_f64(-0.5), 1.0);
+    assert!(img.data.iter().map(|p| p[1]).sum::<f32>() > 1.0);
+    assert!(img.data.iter().all(|p| p[0] == 0.0));
 }
 
 /// The red-weighted centre of the particles (x).
@@ -584,5 +676,272 @@ fn layer_parameters_see_a_whole_shape_layer() {
     }
     for (x, y) in [(20, 10), (180, 90), (190, 50)] {
         assert!(f.get(x, y)[3] < 0.01, "outside at ({x}, {y}): {:?}", f.get(x, y));
+    }
+}
+
+/// A layer with a 2D track matte is composited in one pass over the canvas, reading buffers that
+/// land on whole pixels in place: the same pixels, bit for bit, as drawing the layer and its
+/// matte into canvas-sized images, multiplying, blending and quantising.
+#[test]
+fn matted_layers_composite_in_one_pass_like_the_isolated_way() {
+    use crate::{NoFootage, RenderOpts, Renderer};
+    use effectcraft_raster::Image;
+    for kind in [MatteKind::Alpha, MatteKind::AlphaInverted, MatteKind::Luma, MatteKind::LumaInverted] {
+        // Whole-pixel and sub-pixel matte positions, and a fill larger than the comp or off it.
+        for (matte_pos, fill_size, fill_pos) in [
+            ([50.0, 40.0], (200, 100), [100.0, 50.0]),
+            ([50.3, 40.6], (200, 100), [100.0, 50.0]),
+            ([70.0, 30.0], (260, 140), [90.0, 60.0]),
+            ([70.0, 30.0], (120, 60), [100.5, 50.0]),
+        ] {
+            let mut p = Project::default();
+            p.settings.bit_depth = effectcraft_project::BitDepth::Bpc8;
+            let comp = Comp::new(200, 100, FrameRate::FPS_30, Tick::from_seconds_f64(2.0));
+            let cid = p.add_item("Comp", Label::Sandstone, None, ItemKind::Comp(comp.clone().into()));
+            let mut matte = solid(&mut p, &comp, [0.9, 0.5, 0.1], 60, 40);
+            matte.props.prop_mut("transform/position").unwrap().value = Value::Vec3([matte_pos[0], matte_pos[1], 0.0]);
+            matte.props.prop_mut("transform/opacity").unwrap().value = Value::Scalar(50.0);
+            matte.switches.video = false;
+            let mut fill = solid(&mut p, &comp, [0.2, 0.4, 1.0], fill_size.0, fill_size.1);
+            fill.props.prop_mut("transform/position").unwrap().value = Value::Vec3([fill_pos[0], fill_pos[1], 0.0]);
+            fill.track_matte = Some(TrackMatte { layer: matte.id, kind });
+            fill.blend_mode = BlendMode::Screen;
+            let fill_id = fill.id;
+            let c = p.comp_mut(cid).unwrap();
+            c.layers.push(matte);
+            c.layers.push(fill);
+            let r = Renderer::new(&p, &NoFootage, RenderOpts::default());
+            let ctx = r.eval_ctx(cid, Tick::ZERO).unwrap();
+            let fill = ctx.comp.layer(fill_id).unwrap();
+            let buf = r.layer_buf(&ctx, fill).unwrap();
+            // (A canvas is on the 8 bpc grid before every layer.)
+            let mut below = Image::filled(200, 100, [0.4, 0.2, 0.6, 0.8]);
+            r.pipe.quantize(&mut below);
+
+            let mut expected = below.clone();
+            let mut iso = Image::new(200, 100);
+            r.place(&ctx, fill, &buf, &mut iso, BlendMode::Normal, 1.0);
+            r.composite_iso(&ctx, fill, iso, &mut expected, 0.7);
+            r.pipe.quantize(&mut expected);
+
+            let mut got = below.clone();
+            assert!(r.composite_layer(&ctx, fill, &buf, &mut got, 0.7), "the pixels written are quantised");
+            if let Some(i) = got.data.iter().zip(&expected.data).position(|(a, b)| a != b) {
+                panic!(
+                    "{kind:?}, matte at {matte_pos:?}, fill {fill_size:?} at {fill_pos:?}: pixel ({}, {}) is {:?}, expected {:?}",
+                    i % 200,
+                    i / 200,
+                    got.data[i],
+                    expected.data[i]
+                );
+            }
+            assert!(got != below);
+        }
+    }
+}
+
+#[test]
+fn set_matte_self_source_and_masks_precede_effects() {
+    for source in [0, 1] {
+        let (mut p, cid, comp) = setup();
+        let mut l = solid(&mut p, &comp, [1.0, 0.0, 0.0], 200, 100);
+        let mut next = p.next_id;
+        let mask = build::mask(&mut Ids(&mut next), "Left", ShapePath::rect([50.0, 50.0], 80.0, 80.0), MaskMode::Add, [255, 255, 0]);
+        p.next_id = next;
+        l.props.sub_mut("masks").unwrap().children.push(mask.into());
+        let id = l.id.0;
+        add_effect_200(&mut p, &mut l, "ec.channel.invert", &[("channel", Value::Enum(effectcraft_effects::INVERT_ALPHA))]);
+        add_effect_200(
+            &mut p,
+            &mut l,
+            "ec.channel.setmatte",
+            &[
+                ("takeMatteFromLayer", Value::Layer(Some(id))),
+                ("takeMatteFromLayerSource", Value::Enum(source)),
+                ("compositeMatteWithOriginal", Value::Bool(false)),
+            ],
+        );
+        p.comp_mut(cid).unwrap().layers.push(l);
+        let img = render_frame(&p, cid, Tick::ZERO, 1.0);
+        assert!(img.get(50, 50)[3] > 0.99, "original alpha must survive preceding alpha inversion");
+        assert!((img.get(150, 50)[3] - if source == 0 { 1.0 } else { 0.0 }).abs() < 0.01, "Source and Masks must remain distinct");
+    }
+}
+
+#[test]
+fn cc_composite_restores_stack_input_on_layers_and_adjustments() {
+    for adjustment in [false, true] {
+        for mode in [0, 1] {
+            let (mut p, cid, comp) = setup();
+            let mut l = solid(&mut p, &comp, [1.0, 0.0, 0.0], 200, 100);
+            l.switches.adjustment = adjustment;
+            add_effect_200(&mut p, &mut l, "ec.channel.invert", &[]);
+            add_effect_200(&mut p, &mut l, "ec.channel.cccomposite", &[("compositeOriginal", Value::Enum(mode))]);
+            p.comp_mut(cid).unwrap().layers.push(l);
+            if adjustment {
+                let bg = solid(&mut p, &comp, [1.0, 0.0, 0.0], 200, 100);
+                p.comp_mut(cid).unwrap().layers.push(bg);
+            }
+            let img = render_frame(&p, cid, Tick::ZERO, 1.0);
+            let want = if mode == 0 { [1.0, 0.0, 0.0, 1.0] } else { [0.0, 1.0, 1.0, 1.0] };
+            assert_eq!(img.get(50, 50), want, "adjustment={adjustment} mode={mode}");
+        }
+    }
+}
+
+#[test]
+fn self_inputs_share_source_semantics_across_effects_and_times() {
+    use crate::{EffectHost, FxHost, NoFootage, RenderOpts, Renderer};
+    let (mut p, cid, comp) = setup();
+    let mut l = solid(&mut p, &comp, [1.0, 0.0, 0.0], 200, 100);
+    let mut next = p.next_id;
+    let mask = build::mask(&mut Ids(&mut next), "Left", ShapePath::rect([50.0, 50.0], 80.0, 80.0), MaskMode::Add, [255, 255, 0]);
+    p.next_id = next;
+    l.props.sub_mut("masks").unwrap().children.push(mask.into());
+    p.comp_mut(cid).unwrap().layers.push(l.clone());
+    let c = p.comp(cid).unwrap();
+    let ctx = crate::eval::EvalCtx::new(&p, cid, c, Tick::ZERO);
+    let renderer = Renderer::new(&p, &NoFootage, RenderOpts::default());
+    let host = FxHost { r: &renderer, ctx: &ctx, layer: &l, origin: [0.0; 2], index: Default::default(), original: None };
+    assert_eq!(host.layer(l.id.0, false).unwrap().buf.img.get(150, 50)[3], 1.0);
+    assert_eq!(host.layer_masks(l.id.0).unwrap().buf.img.get(150, 50)[3], 0.0);
+    assert_eq!(host.layer_at(l.id.0, 0.5, false).unwrap().buf.img.get(150, 50)[3], 1.0);
+    assert!(host.layer(l.id.0, true).is_none(), "full-stack self references must not recurse");
+    assert!(host.layer_at(l.id.0, 0.5, true).is_none());
+    assert!(host.layer_at(l.id.0, f64::NAN, false).is_none());
+    // A second built-in using the shared selector: Invert(red) then Blend(original red).
+    l.props.sub_mut("masks").unwrap().children.clear();
+    add_effect_200(&mut p, &mut l, "ec.channel.invert", &[]);
+    let id = l.id.0;
+    add_effect_200(
+        &mut p,
+        &mut l,
+        "ec.channel.blend",
+        &[("blendWithLayer", Value::Layer(Some(id))), ("blendWithLayerSource", Value::Enum(0)), ("blendWithOriginal", Value::Scalar(0.0))],
+    );
+    p.comp_mut(cid).unwrap().layers = vec![l];
+    let c = p.comp(cid).unwrap();
+    let ctx = crate::eval::EvalCtx::new(&p, cid, c, Tick::ZERO);
+    assert!(crate::cache::input_key(&ctx, &c.layers[0], 1.0, false, false, 1).is_some());
+    assert!(crate::cache::input_key(&ctx, &c.layers[0], 1.0, false, false, 2).is_some());
+    assert_eq!(render_frame(&p, cid, Tick::ZERO, 1.0).get(50, 50), [1.0, 0.0, 0.0, 1.0]);
+}
+
+#[test]
+fn timed_source_reads_preserve_other_layer_masks() {
+    use effectcraft_effects::EffectHost;
+    let (mut p, cid, comp) = setup();
+    let owner = solid(&mut p, &comp, [1.0, 0.0, 0.0], 200, 100);
+    let mut other = solid(&mut p, &comp, [0.0, 1.0, 0.0], 200, 100);
+    let mut next = p.next_id;
+    let mask = build::mask(&mut Ids(&mut next), "Left", ShapePath::rect([50.0, 50.0], 80.0, 80.0), MaskMode::Add, [255, 255, 0]);
+    p.next_id = next;
+    other.props.sub_mut("masks").unwrap().children.push(mask.into());
+    p.comp_mut(cid).unwrap().layers = vec![owner.clone(), other.clone()];
+    let ctx = crate::EvalCtx::new(&p, cid, p.comp(cid).unwrap(), Tick::ZERO);
+    let renderer = crate::Renderer::new(&p, &crate::NoFootage, crate::RenderOpts::default());
+    let host = crate::FxHost { r: &renderer, ctx: &ctx, layer: &owner, origin: [0.0; 2], index: Default::default(), original: None };
+    // Current Source and timed Source had different contracts before this fix. Keep
+    // the existing timed read (used by Clone/Time effects) masked for other layers.
+    assert_eq!(host.layer(other.id.0, false).unwrap().buf.img.get(150, 50)[3], 1.0);
+    let timed = host.layer_at(other.id.0, 0.5, false).unwrap();
+    assert_eq!(timed.buf.img.get(50, 50)[3], 1.0);
+    assert_eq!(timed.buf.img.get(150, 50)[3], 0.0);
+}
+
+#[test]
+fn layer_dependencies_remain_cacheable_and_invalidate_only_related_edits() {
+    let (mut p, cid, comp) = setup();
+    let mut owner = solid(&mut p, &comp, [1.0, 0.0, 0.0], 200, 100);
+    let mut source = solid(&mut p, &comp, [0.0, 1.0, 0.0], 200, 100);
+    let third = solid(&mut p, &comp, [0.0, 0.0, 1.0], 200, 100);
+    let unrelated = solid(&mut p, &comp, [0.2, 0.3, 0.4], 200, 100);
+    add_effect_200(&mut p, &mut source, "ec.channel.blend", &[("blendWithLayer", Value::Layer(Some(third.id.0))), ("blendWithOriginal", Value::Scalar(0.0))]);
+    add_effect_200(&mut p, &mut owner, "ec.channel.blend", &[("blendWithLayer", Value::Layer(Some(source.id.0))), ("blendWithOriginal", Value::Scalar(0.0))]);
+    p.comp_mut(cid).unwrap().layers = vec![owner, source, third, unrelated];
+    let key = |p: &Project, time: f64, limit| {
+        let comp = p.comp(cid).unwrap();
+        let ctx = crate::EvalCtx::new(p, cid, comp, Tick::from_seconds_f64(time));
+        crate::cache::input_key(&ctx, &comp.layers[0], 1.0, false, false, limit).unwrap()
+    };
+    let initial = key(&p, 0.0, 1);
+    let input = key(&p, 0.0, 0);
+    assert_eq!(initial, key(&p, 0.5, 1), "static dependencies reuse across frames");
+    let cache = crate::LayerCache::default();
+    let before = render_cached(&p, cid, Tick::ZERO, Some(&cache));
+    render_cached(&p, cid, Tick::ZERO, Some(&cache));
+    assert!(cache.stats().hits > 0, "layer parameters must not disable caching");
+    let LayerSource::Solid { item: unrelated } = p.comp(cid).unwrap().layers[3].source else { panic!() };
+    let ItemKind::Solid(s) = &mut p.item_mut(unrelated).unwrap().kind else { panic!() };
+    s.color = [0.9, 0.8, 0.7];
+    assert_eq!(initial, key(&p, 0.0, 1), "unrelated edits preserve the owner key");
+    let LayerSource::Solid { item: third } = p.comp(cid).unwrap().layers[2].source else { panic!() };
+    let ItemKind::Solid(s) = &mut p.item_mut(third).unwrap().kind else { panic!() };
+    s.color = [1.0, 0.0, 1.0];
+    assert_ne!(initial, key(&p, 0.0, 1), "transitive source edits invalidate the owner");
+    assert_eq!(input, key(&p, 0.0, 0), "effects after an input prefix do not affect its key");
+    let cached = render_cached(&p, cid, Tick::ZERO, Some(&cache));
+    let fresh = render_cached(&p, cid, Tick::ZERO, None);
+    assert_same(&cached, &fresh, "transitive dependency edit");
+    assert_ne!(before.get(50, 50), fresh.get(50, 50));
+    let owner_id = p.comp(cid).unwrap().layers[0].id;
+    p.comp_mut(cid).unwrap().layers[1].props.prop_mut("effects/#1/blendWithLayer").unwrap().value = Value::Layer(Some(owner_id.0));
+    let comp = p.comp(cid).unwrap();
+    let ctx = crate::EvalCtx::new(&p, cid, comp, Tick::ZERO);
+    assert!(crate::cache::layer_key(&ctx, &comp.layers[0], 1.0, false, false).is_none(), "cycles decline caching without recursion");
+}
+
+#[test]
+fn precomp_dependencies_hash_nested_sources_and_evaluated_animation() {
+    let (mut p, cid, comp) = setup();
+    let mut child = solid(&mut p, &comp, [0.0, 0.0, 1.0], 200, 100);
+    let LayerSource::Solid { item: source } = child.source else { panic!() };
+    child.props.prop_mut("transform/opacity").unwrap().keys =
+        vec![Keyframe::new(Tick::ZERO, Value::Scalar(100.0)), Keyframe::new(Tick::from_seconds_f64(1.0), Value::Scalar(50.0))];
+    let mut nested = comp.clone();
+    nested.layers = vec![child];
+    let nested_id = p.add_item("Nested", Label::Sandstone, None, ItemKind::Comp(nested.into()));
+    let pre = build::layer(&mut p, &comp, "Precomp", LayerSource::Comp { item: nested_id }, (200, 100), None);
+    let mut owner = solid(&mut p, &comp, [1.0, 0.0, 0.0], 200, 100);
+    add_effect_200(&mut p, &mut owner, "ec.channel.blend", &[("blendWithLayer", Value::Layer(Some(pre.id.0))), ("blendWithOriginal", Value::Scalar(0.0))]);
+    p.comp_mut(cid).unwrap().layers = vec![owner, pre];
+    let key = |p: &Project, time| {
+        let c = p.comp(cid).unwrap();
+        crate::cache::layer_key(&crate::EvalCtx::new(p, cid, c, time), &c.layers[0], 1.0, false, false).unwrap()
+    };
+    let cache = crate::LayerCache::default();
+    let before = render_cached(&p, cid, Tick::ZERO, Some(&cache));
+    let initial = key(&p, Tick::ZERO);
+    let later = Tick::from_seconds_f64(0.5);
+    assert_ne!(initial, key(&p, later));
+    assert_same(&render_cached(&p, cid, later, Some(&cache)), &render_cached(&p, cid, later, None), "animated precomp dependency");
+    let ItemKind::Solid(s) = &mut p.item_mut(source).unwrap().kind else { panic!() };
+    s.color = [0.0, 1.0, 0.0];
+    assert_ne!(initial, key(&p, Tick::ZERO), "items used inside the precomp invalidate the owner");
+    let fresh = render_cached(&p, cid, Tick::ZERO, None);
+    assert_same(&render_cached(&p, cid, Tick::ZERO, Some(&cache)), &fresh, "precomp source edit");
+    assert_ne!(before.get(50, 50), fresh.get(50, 50));
+}
+
+/// #352: a shape layer's bounds (snapping, Align) are its visual edges: a 100×100 rectangle is
+/// exactly ±50, and a 10 px stroke adds half its width, with no anti-aliasing padding.
+#[test]
+fn shape_content_bounds_are_the_visual_edges() {
+    for (stroke, half) in [(None, 50.0), (Some(10.0), 55.0)] {
+        let (mut p, cid, comp) = setup();
+        let mut l = build::layer(&mut p, &comp, "Shape Layer 1", LayerSource::Shape, (200, 100), None);
+        let mut next = p.next_id;
+        let mut ids = Ids(&mut next);
+        let mut items = vec![build::shape_rect(&mut ids, [100.0, 100.0], [0.0, 0.0], 0.0), build::shape_fill(&mut ids, [1.0, 0.0, 0.0, 1.0])];
+        if let Some(w) = stroke {
+            items.push(build::shape_stroke(&mut ids, [1.0, 1.0, 1.0, 1.0], w));
+        }
+        let g = build::shape_group(&mut ids, "Rectangle 1", items);
+        p.next_id = next;
+        l.props.sub_mut("contents").unwrap().children.push(g.into());
+        p.comp_mut(cid).unwrap().layers.push(l.clone());
+        let ctx = crate::EvalCtx::new(&p, cid, p.comp(cid).unwrap(), Tick::ZERO);
+        let b = crate::content_bounds(&ctx, &l).unwrap();
+        assert!(b.iter().zip([-half, -half, half, half]).all(|(a, e)| (a - e).abs() < 1e-6), "{stroke:?}: {b:?}");
     }
 }

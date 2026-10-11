@@ -1,0 +1,8 @@
+asset:        fallback_order.rs
+title:        Synthetic font for fallback-order regression testing
+author:       EffectCraft contributors
+source:       original work
+license:      MIT OR Apache-2.0
+license-file: LICENSE-MIT
+added:        2026-10-10 by Codex
+notes:        Adapted from EffectCraft's existing synthetic blank-glyph font test; three original triangle points stand in for a covered glyph. Family labels test matching and contain no third-party font outlines.

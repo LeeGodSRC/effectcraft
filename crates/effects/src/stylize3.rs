@@ -354,9 +354,12 @@ fn hex_cell(x: f64, y: f64, r: f64) -> ((f64, f64), (i64, i64)) {
     let cy = -cx - cz;
     let (mut rx, ry, mut rz) = (cx.round(), cy.round(), cz.round());
     let (dx, dy, dz) = ((rx - cx).abs(), (ry - cy).abs(), (rz - cz).abs());
-    if dx > dy && dx > dz {
+    // Cell edges have equal cube residuals. Resolve those ties in z/y/x order at
+    // f32 coordinate precision, so a GPU's last-bit error cannot choose the opposite tile.
+    let tie = 8.0 * f32::EPSILON as f64 * cx.abs().max(cz.abs()).max(1.0);
+    if dx > dy + tie && dx > dz + tie {
         rx = -ry - rz;
-    } else if dy <= dz {
+    } else if dy <= dz + tie {
         rz = -rx - ry;
     }
     let px = r * 3f64.sqrt() * (rx + rz / 2.0);
@@ -639,6 +642,16 @@ mod tests {
         assert!(max_diff(&o.img, &img) > 0.01);
         // Alpha is untouched.
         assert!(o.img.data.iter().zip(&img.data).all(|(a, b)| (a[3] - b[3]).abs() < 1e-6));
+    }
+
+    #[test]
+    fn hex_edge_ties_have_one_cell_owner_across_float_precisions() {
+        // Pixel (17,2), centered at (17.5,11), radius 9.3 at half resolution.
+        // Its cube x/y residuals are equal; rounding one ulp either way used to swap tiles.
+        for x in [-1e-10, 0.0, 1e-10] {
+            assert_eq!(hex_cell(x, -8.5, 4.65).1, (1, -1));
+            assert_eq!(hex_cell(x, -8.5, 4.65f32 as f64).1, (1, -1));
+        }
     }
 
     #[test]

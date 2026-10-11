@@ -19,7 +19,7 @@ use effectcraft_project::render_queue::{AudioFormat, Channels};
 use effectcraft_time::{TICKS_PER_SECOND, Tick};
 
 use crate::encode::{mix, pcm_bytes};
-use crate::{Cx, Report, Result, State, batch_size, io, wants_audio};
+use crate::{Cx, Report, Result, State, io, wants_audio};
 
 pub(crate) const OPUS_RATE: u32 = 48_000;
 
@@ -252,7 +252,7 @@ pub(crate) async fn webm(job: &Cx<'_>, comp: &Comp, w: u32, h: u32, st: &mut Sta
         }
     };
 
-    let batch = batch_size();
+    let batch = job.batch();
     let mut i = 0;
     while i < total {
         let end = (i + batch).min(total);
@@ -344,7 +344,9 @@ pub(crate) fn audio_file(job: &Cx, comp: &Comp, aiff: bool, st: &mut State) -> R
     let mut reported = 0u64;
     while done < n {
         let k = block.min(n - done);
-        let t = Tick((((start + done as i64) as i128 * TICKS_PER_SECOND as i128) / sr as i128) as i64);
+        let sample = start + done as i64;
+        let t = Tick::from_units(sample, i64::from(sr));
+        let t = if t.to_units_floor(i64::from(sr)) < sample { Tick(t.0.saturating_add(1)) } else { t };
         pcm.extend(pcm_bytes(&mix(job, t, k, sr), fmt, aiff));
         done += k;
         let now = (done as u64 * total_frames / n.max(1) as u64).min(total_frames);

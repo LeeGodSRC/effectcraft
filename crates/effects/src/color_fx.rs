@@ -31,7 +31,7 @@ fn tritone(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let mid = ctx.params.color("midtones");
     let sh = ctx.params.color("shadows");
     let blend = 1.0 - ctx.params.f("blend") as f32 / 100.0;
-    b.img.map_straight(|c| {
+    b.img.map_straight_quantized(ctx.env.levels, |c| {
         let l = luminance(c[0], c[1], c[2]).clamp(0.0, 1.0);
         let t = if l < 0.5 {
             mix([sh[0], sh[1], sh[2]], [mid[0], mid[1], mid[2]], l * 2.0)
@@ -647,6 +647,13 @@ pub struct ColoramaPalette {
 }
 
 impl ColoramaPalette {
+    /// The Output Cycle of a Colorama instance: its preset, or the custom stops.
+    pub fn of(pr: &crate::Params) -> ColoramaPalette {
+        let preset = pr.e("outputCycle/usePresetPalette");
+        if preset as usize == COLORAMA_PRESETS.len() - 1 { ColoramaPalette::parse(pr.s("outputCycle/palette")) } else { None }
+            .unwrap_or_else(|| ColoramaPalette::preset(preset))
+    }
+
     /// Built-in palette `i` of [`COLORAMA_PRESETS`].
     pub fn preset(i: u32) -> ColoramaPalette {
         let s = |v: &[(f32, [f32; 3])]| ColoramaPalette { stops: v.iter().map(|(p, c)| (*p, [c[0], c[1], c[2], 1.0])).collect() };
@@ -741,9 +748,7 @@ fn colorama(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let mode = pr.e("inputPhase/mode");
     let cycles = pr.f("outputCycle/cycles").max(0.0) as f32;
     let smooth = pr.get("outputCycle/interpolatePalette").is_none_or(|v| v.as_bool());
-    let preset = pr.e("outputCycle/usePresetPalette");
-    let palette = if preset as usize == COLORAMA_PRESETS.len() - 1 { ColoramaPalette::parse(pr.s("outputCycle/palette")) } else { None }
-        .unwrap_or_else(|| ColoramaPalette::preset(preset));
+    let palette = ColoramaPalette::of(pr);
     let blend = 1.0 - pr.f("blend") as f32 / 100.0;
     // Add Phase.
     let add = ctx.layer_param("inputPhase/addPhase", true).map(|o| crate::util::fit_layer(ctx, &b, &o, true));

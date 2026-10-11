@@ -1341,7 +1341,7 @@ mod tests {
         let d1 = run_fx("ec.vr.denoise", &[("noiseType", Value::Enum(1))], img.clone(), 0.0, EffectEnv::default());
         assert_ne!(d0.img.data, d1.img.data);
         let n: Vec<_> =
-            (0..4).map(|t| run_fx("ec.vr.fractalnoise", &[("fractalType", Value::Enum(t))], img.clone(), 0.0, EffectEnv::default()).img.data).collect();
+            (0..4).map(|t| run_fx("ec.vr.fractalnoise", &[("fractalType", Value::Enum(t))], img.clone(), 0.0, EffectEnv::default()).img.data.clone()).collect();
         assert!(n[0] != n[1] && n[1] != n[2] && n[2] != n[3]);
     }
 

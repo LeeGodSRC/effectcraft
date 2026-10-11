@@ -10,31 +10,127 @@ pub mod channels3d;
 pub mod cuts;
 pub mod flow;
 pub mod inpaint;
+pub mod pool;
 pub mod scopes;
 pub mod warp;
 
 use effectcraft_color::{BlendMode, blend_pixel};
 use rayon::prelude::*;
 
-pub use blur::{box_blur, directional_blur, gaussian_blur, radial_blur};
+pub use blur::{box_blur, box_blur_mask, box_blur_owned, directional_blur, gaussian_blur, gaussian_blur_mask, gaussian_blur_owned, radial_blur};
 pub use channels3d::AuxChannels;
-pub use warp::{Sampling, WarpOpts, accumulate_warp, composite_warp, composite_warp_reference, resample};
+pub use warp::{Sampling, WarpOpts, accumulate_warp, composite_warp, composite_warp_quantized, composite_warp_reference, resample};
 
 pub type Px = [f32; 4];
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Debug, Default, PartialEq)]
 pub struct Image {
     pub width: u32,
     pub height: u32,
     pub data: Vec<Px>,
 }
 
+/// Bit depths below this many levels quantise in float arithmetic (8 and 16 bpc do).
+const FLOAT_LEVELS: f32 = 4_000_000.0;
+
+/// `t` rounded down, for `0 ≤ t < 2²³`: adding and subtracting 2²³ rounds to the nearest whole
+/// number (ties to even), one too many when that rounded up.
+#[inline(always)]
+fn trunc_small(t: f32) -> f32 {
+    const M: f32 = 8_388_608.0;
+    let r = (t + M) - M;
+    if r > t { r - 1.0 } else { r }
+}
+
+/// A premultiplied pixel clamped (colour ≤ alpha ≤ 1, NaN → 0) and rounded half up to `levels`
+/// steps (`inv` = 1 / `levels`): an integer comp's pixel. Values are non-negative after the
+/// clamp, so truncating rounds like `round()`; below [`FLOAT_LEVELS`] the truncation is done in
+/// float arithmetic (exact there, see [`trunc_small`]), which keeps row loops vectorising where
+/// saturating float → integer casts would not. Both ways give the same bits.
+#[inline(always)]
+pub fn quantize_px(p: Px, levels: f32, inv: f32) -> Px {
+    if levels < FLOAT_LEVELS { quantize_float(p, levels, inv) } else { quantize_int(p, levels, inv) }
+}
+
+#[allow(clippy::manual_clamp)] // max/min map NaN to 0; clamp would keep NaN
+#[inline(always)]
+fn quantize_int(p: Px, levels: f32, inv: f32) -> Px {
+    let a = (p[3].max(0.0).min(1.0) * levels + 0.5) as u32 as f32 * inv;
+    let c = [p[0], p[1], p[2]].map(|v| (v.max(0.0).min(a) * levels + 0.5) as u32 as f32 * inv);
+    [c[0], c[1], c[2], a]
+}
+
+#[allow(clippy::manual_clamp)] // max/min map NaN to 0; clamp would keep NaN
+#[inline(always)]
+fn quantize_float(p: Px, levels: f32, inv: f32) -> Px {
+    let a = trunc_small(p[3].max(0.0).min(1.0) * levels + 0.5) * inv;
+    let c = [p[0], p[1], p[2]].map(|v| trunc_small(v.max(0.0).min(a) * levels + 0.5) * inv);
+    [c[0], c[1], c[2], a]
+}
+
+/// Buffers of at least this many pixels are filled and copied in parallel.
+const PARALLEL_PIXELS: usize = 1 << 16;
+
+/// Pixels per parallel task when filling or copying a large buffer.
+const FILL_CHUNK: usize = 1 << 14;
+
+/// `n` pixels, each written by `fill` from its chunk's offset. Large buffers start as untouched
+/// zero pages and are written in parallel, so the memory is first touched (and paged in) by
+/// every core instead of one.
+fn pixels_with(n: usize, serial: impl FnOnce() -> Vec<Px>, fill: impl Fn(usize, &mut [Px]) + Sync) -> Vec<Px> {
+    if n < PARALLEL_PIXELS {
+        return serial();
+    }
+    // (A recycled buffer holds old pixels; `fill` writes every one.)
+    let mut data = pool::take(n).unwrap_or_else(|| vec![[0.0; 4]; n]);
+    data.par_chunks_mut(FILL_CHUNK).enumerate().for_each(|(i, chunk)| fill(i * FILL_CHUNK, chunk));
+    data
+}
+
+impl Clone for Image {
+    fn clone(&self) -> Image {
+        let src = &self.data;
+        let data = pixels_with(
+            src.len(),
+            || src.clone(),
+            |at, chunk| {
+                if let Some(from) = src.get(at..at + chunk.len()) {
+                    chunk.copy_from_slice(from);
+                }
+            },
+        );
+        Image { width: self.width, height: self.height, data }
+    }
+}
+
+/// Large pixel buffers are recycled ([`pool`]).
+impl Drop for Image {
+    fn drop(&mut self) {
+        pool::give(std::mem::take(&mut self.data));
+    }
+}
+
 impl Image {
     pub fn new(width: u32, height: u32) -> Image {
-        Image { width, height, data: vec![[0.0; 4]; width as usize * height as usize] }
+        let n = width as usize * height as usize;
+        // A fresh allocation is already zero; a recycled one is cleared.
+        let data = match pool::take(n) {
+            Some(mut data) => {
+                data.par_chunks_mut(FILL_CHUNK).for_each(|chunk| chunk.fill([0.0; 4]));
+                data
+            }
+            None => vec![[0.0; 4]; n],
+        };
+        Image { width, height, data }
+    }
+    /// An image whose pixels are unspecified (a recycled buffer's old ones, or transparent): for
+    /// a caller that writes every pixel, which saves clearing them first.
+    pub fn scratch(width: u32, height: u32) -> Image {
+        Image { width, height, data: pool::scratch(width as usize * height as usize) }
     }
     pub fn filled(width: u32, height: u32, px: Px) -> Image {
-        Image { width, height, data: vec![px; width as usize * height as usize] }
+        let n = width as usize * height as usize;
+        Image { width, height, data: pixels_with(n, || vec![px; n], |_, chunk| chunk.fill(px)) }
     }
     pub fn is_empty(&self) -> bool {
         self.width == 0 || self.height == 0
@@ -238,18 +334,34 @@ impl Image {
     }
     /// Map every pixel through `f` on straight colour (keeps alpha).
     pub fn map_straight(&mut self, f: impl Fn([f32; 3]) -> [f32; 3] + Sync) {
+        self.map_straight_quantized(None, f);
+    }
+    /// [`Self::map_straight`], rounding the pixels it writes to `levels` steps ([`quantize_px`])
+    /// in the same pass.
+    pub fn map_straight_quantized(&mut self, levels: Option<f32>, f: impl Fn([f32; 3]) -> [f32; 3] + Sync) {
+        let inv = levels.map_or(1.0, |l| 1.0 / l);
         self.data.par_iter_mut().for_each(|p| {
             let a = p[3];
             if a <= 0.0 {
                 return;
             }
             let c = f([p[0] / a, p[1] / a, p[2] / a]);
-            *p = [c[0] * a, c[1] * a, c[2] * a, a];
+            let px = [c[0] * a, c[1] * a, c[2] * a, a];
+            *p = match levels {
+                Some(l) => quantize_px(px, l, inv),
+                None => px,
+            };
         });
     }
     /// Blend `src` (same size) onto self with a mode and opacity.
     pub fn blend_from(&mut self, src: &Image, mode: BlendMode, opacity: f32, seed: u32) {
+        self.blend_from_quantized(src, mode, opacity, seed, None);
+    }
+    /// [`Self::blend_from`], rounding every pixel it writes to `levels` steps
+    /// ([`quantize_px`]): an integer comp's canvas stays quantised without a second pass.
+    pub fn blend_from_quantized(&mut self, src: &Image, mode: BlendMode, opacity: f32, seed: u32, levels: Option<f32>) {
         let w = self.width as usize;
+        let inv = levels.map_or(1.0, |l| 1.0 / l);
         self.data.par_chunks_mut(w.max(1)).zip(src.data.par_chunks(w.max(1))).enumerate().for_each(|(y, (d, s))| {
             for x in 0..d.len() {
                 let mut sp = s[x];
@@ -260,7 +372,11 @@ impl Image {
                     *c *= opacity;
                 }
                 let n = if matches!(mode, BlendMode::Dissolve | BlendMode::DancingDissolve) { hash_noise(x as u32, y as u32, seed) } else { 0.5 };
-                d[x] = blend_pixel(mode, d[x], sp, n);
+                let px = blend_pixel(mode, d[x], sp, n);
+                d[x] = match levels {
+                    Some(l) => quantize_px(px, l, inv),
+                    None => px,
+                };
             }
         });
     }
@@ -315,6 +431,50 @@ impl Mask {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The float quantiser is the integer one, bit for bit: every level and the values around
+    /// it and around the rounding ties, out-of-range, infinite and NaN channels.
+    #[test]
+    fn float_quantise_matches_integer_quantise() {
+        for levels in [255.0f32, 32768.0, 65535.0] {
+            let inv = 1.0 / levels;
+            let mut values = vec![-1.0, -0.0, 0.0, f32::MIN_POSITIVE, 1.0, 1.5, 2.0, 1e9, f32::MAX, f32::INFINITY, f32::NEG_INFINITY, f32::NAN];
+            for k in 0..=levels as u32 {
+                for base in [k as f32 * inv, (k as f32 + 0.5) * inv, k as f32 / levels] {
+                    values.extend([f32::from_bits(base.to_bits().saturating_sub(1)), base, f32::from_bits(base.to_bits() + 1)]);
+                }
+            }
+            let mut seed = 0x2545_f491u32;
+            for (i, &v) in values.iter().enumerate() {
+                // Colour against a few alphas: itself, opaque and a pseudo-random one.
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let other = values[seed as usize % values.len()];
+                for a in [v, 1.0, other] {
+                    let p = [v, other, values[i / 2], a];
+                    let (x, y) = (quantize_int(p, levels, inv), quantize_float(p, levels, inv));
+                    assert_eq!(x.map(f32::to_bits), y.map(f32::to_bits), "{p:?} at {levels} levels");
+                }
+            }
+        }
+    }
+
+    /// Large buffers are filled and copied in parallel chunks: same pixels as the serial path.
+    #[test]
+    fn large_fill_and_clone_match_small_ones() {
+        let (w, h) = (701u32, 257u32);
+        assert!((w * h) as usize >= PARALLEL_PIXELS && !(w * h).is_multiple_of(FILL_CHUNK as u32));
+        let px = [0.25, 0.5, 0.75, 1.0];
+        let filled = Image::filled(w, h, px);
+        assert_eq!(filled.data, vec![px; (w * h) as usize]);
+        let mut img = Image::new(w, h);
+        for (i, p) in img.data.iter_mut().enumerate() {
+            *p = [i as f32, (i * 3) as f32, -(i as f32), 1.0];
+        }
+        let copy = img.clone();
+        assert_eq!((copy.width, copy.height), (w, h));
+        assert_eq!(copy.data, img.data);
+        assert_eq!(Image::new(0, 0).clone().data.len(), 0);
+    }
 
     #[test]
     fn rgba8_roundtrip() {

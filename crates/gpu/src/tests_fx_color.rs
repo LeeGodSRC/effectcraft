@@ -32,6 +32,19 @@ fn black_white_colorama_selective_color() {
     effect_case("ec.color.colorama", &[]);
     effect_case("ec.color.colorama", &[("inputPhase/mode", e(4)), ("inputPhase/phaseShift", n(75.0)), ("outputCycle/cycles", n(2.5)), ("blend", n(40.0))]);
     effect_case("ec.color.colorama", &[("inputPhase/mode", e(8)), ("outputCycle/cycles", n(1.3))]);
+    // Preset and custom palettes (stops with alpha), and Modify Alpha.
+    effect_case("ec.color.colorama", &[("outputCycle/usePresetPalette", e(2)), ("inputPhase/phaseShift", n(40.0))]);
+    effect_case("ec.color.colorama", &[("outputCycle/usePresetPalette", e(7)), ("modify/modifyAlpha", on()), ("blend", n(25.0))]);
+    effect_case(
+        "ec.color.colorama",
+        &[
+            ("outputCycle/usePresetPalette", e(8)),
+            ("outputCycle/palette", Value::Str("0:1,1,1,1 0.0023:1,0,0,0 0.66:1,1,0,0.8 0.9:0.2,0.4,1,0.5".into())),
+            ("modify/modifyAlpha", on()),
+            ("inputPhase/mode", e(8)),
+        ],
+    );
+    effect_case("ec.color.colorama", &[("modify/modifyAlpha", on())]);
     effect_case(
         "ec.color.selectivecolor",
         &[

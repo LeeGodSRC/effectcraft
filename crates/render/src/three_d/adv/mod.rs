@@ -324,6 +324,14 @@ fn solo_matte(ctx: &EvalCtx, l: &Layer) -> Option<(Layer, bool)> {
     Some((solo, m.is_active_at(ctx.time)))
 }
 
+/// The layer's 3D track matte as the camera sees it (`None` when its matte is not a 3D layer;
+/// empty while the matte layer is not active).
+pub(crate) fn matte_image(r: &Renderer, ctx: &EvalCtx, l: &Layer, out: (u32, u32)) -> Option<Image> {
+    solo_matte(ctx, l).map(|(solo, active)| {
+        if active { render_layers(r, ctx, &[&solo], out).map(|(i, _)| i).unwrap_or_else(|| Image::new(out.0, out.1)) } else { Image::new(out.0, out.1) }
+    })
+}
+
 /// Layers whose blend mode, track matte or Preserve Transparency needs the 2D compositing path.
 fn needs_2d_composite(ctx: &EvalCtx, l: &Layer) -> bool {
     l.blend_mode != effectcraft_color::BlendMode::Normal
@@ -363,9 +371,7 @@ pub(crate) fn draw_run(r: &Renderer, ctx: &EvalCtx, run: &[&Layer], canvas: &mut
             });
         }
         // A 3D matte layer is drawn through the camera too.
-        let matte3d = solo_matte(ctx, l).map(|(solo, active)| {
-            if active { render_layers(r, ctx, &[&solo], out).map(|(i, _)| i).unwrap_or_else(|| Image::new(out.0, out.1)) } else { Image::new(out.0, out.1) }
-        });
+        let matte3d = matte_image(r, ctx, l, out);
         r.composite_iso_with(ctx, l, iso, canvas, 1.0, matte3d);
     }
 }

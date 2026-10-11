@@ -147,18 +147,35 @@ pub fn shape_value(shape: Shape, f: f64) -> f64 {
     }
 }
 
-/// Ease High / Low remap of a selection value `v` (0..1): positive values slow the change near
-/// the fully selected (high) or unselected (low) end, negative values make it more abrupt. A cubic
-/// Bezier `y(t)` with control values `(1 - low)/3` and `1 - (1 - high)/3`; monotonic for -1..1.
+/// Ease High / Low remap of a selection value `v` (0..1). Positive ease moves
+/// the handle along the input axis (slow change); negative ease moves it along
+/// the output axis (fast change). Evaluate y at the parameter whose x equals v,
+/// rather than treating the input value as the Bezier parameter.
 pub fn ease(v: f64, high: f64, low: f64) -> f64 {
-    if high == 0.0 && low == 0.0 {
+    let v = v.clamp(0.0, 1.0);
+    if (high == 0.0 && low == 0.0) || v == 0.0 || v == 1.0 {
         return v;
     }
-    let t = v.clamp(0.0, 1.0);
-    let p1 = (1.0 - low.clamp(-1.0, 1.0)) / 3.0;
-    let p2 = 1.0 - (1.0 - high.clamp(-1.0, 1.0)) / 3.0;
-    let u = 1.0 - t;
-    3.0 * u * u * t * p1 + 3.0 * u * t * t * p2 + t * t * t
+    let high = high.clamp(-1.0, 1.0);
+    let low = low.clamp(-1.0, 1.0);
+    let (x1, y1) = (low.max(0.0), (-low).max(0.0));
+    let (x2, y2) = (1.0 - high.max(0.0), 1.0 + high.min(0.0));
+    let bezier = |t: f64, p1: f64, p2: f64| {
+        let u = 1.0 - t;
+        3.0 * u * u * t * p1 + 3.0 * u * t * t * p2 + t * t * t
+    };
+    // x is monotone for these handles, including the stationary midpoint when
+    // both eases are 100%. Bisection is bounded and needs no division by dx/dt.
+    let (mut a, mut b) = (0.0, 1.0);
+    for _ in 0..40 {
+        let t = (a + b) * 0.5;
+        if bezier(t, x1, x2) < v {
+            a = t;
+        } else {
+            b = t;
+        }
+    }
+    bezier((a + b) * 0.5, y1, y2)
 }
 
 /// Selection of unit `i` of `n` (0-based, after any random reordering) by a range selector.
@@ -184,7 +201,7 @@ pub fn range_value(r: &Range, i: usize, n: usize) -> f64 {
                     0.0
                 }
             };
-            if e - s <= 1e-12 { 0.0 } else { edge(c - s).min(edge(e - c)) }
+            if e - s <= 1e-12 { 0.0 } else { (edge(c - s) + edge(e - c) - 1.0).clamp(0.0, 1.0) }
         }
         shape => {
             if e - s <= 1e-12 {
@@ -195,11 +212,11 @@ pub fn range_value(r: &Range, i: usize, n: usize) -> f64 {
                     _ => 0.0,
                 }
             } else {
-                ease(shape_value(shape, (c - s) / (e - s)), r.ease_high, r.ease_low)
+                shape_value(shape, (c - s) / (e - s))
             }
         }
     };
-    v * r.amount
+    ease(v, r.ease_high, r.ease_low) * r.amount
 }
 
 /// SplitMix64 step (deterministic hashing for seeds and noise lattices).
@@ -339,6 +356,42 @@ mod tests {
         // Monotonic.
         let v: Vec<f64> = (0..=20).map(|i| ease(i as f64 / 20.0, -1.0, 1.0)).collect();
         assert!(v.windows(2).all(|w| w[1] >= w[0]));
+    }
+
+    #[test]
+    fn selector_ease_solves_the_input_axis_and_handles_signed_ease() {
+        // At parameter 1/2, these control points give x=0.755 and y=0.5.
+        // Using v directly as the parameter prematurely applies scale and blur.
+        assert!((ease(0.755, 0.0, 0.68) - 0.5).abs() < 1e-9);
+        assert!((ease(0.245, 0.68, 0.0) - 0.5).abs() < 1e-9);
+        assert!((ease(0.5, 0.0, -0.68) - 0.755).abs() < 1e-9);
+        assert!((ease(0.5, -0.68, 0.0) - 0.245).abs() < 1e-9);
+        // With both positive handles at their extremes, x has zero derivative
+        // in the middle. Solving it must still be finite, bounded and monotone.
+        let samples: Vec<_> = (0..=100).map(|i| ease(f64::from(i) / 100.0, 1.0, 1.0)).collect();
+        assert!(samples.iter().all(|v| v.is_finite() && (0.0..=1.0).contains(v)));
+        assert!(samples.windows(2).all(|v| v[0] <= v[1]));
+        assert!((samples[50] - 0.5).abs() < 1e-5);
+        // Smoothness belongs to Square: it must not change a Ramp Up's curve.
+        let ramp = Range { shape: Shape::RampUp, ease_low: 0.68, ..Range::default() };
+        let hard = Range { smoothness: 0.0, ..ramp };
+        assert_eq!(range_value(&ramp, 3, 10), range_value(&hard, 3, 10));
+    }
+
+    #[test]
+    fn square_edges_obey_ease_and_short_ranges_measure_coverage() {
+        let linear = r(0.0, 0.3, Shape::Square);
+        let low = Range { ease_low: 1.0, ..linear };
+        let high = Range { ease_high: 1.0, ..linear };
+        let v = range_value(&linear, 1, 4);
+        assert!((v - 0.2).abs() < 1e-9);
+        assert!(range_value(&low, 1, 4) < v);
+        assert!(range_value(&high, 1, 4) > v);
+        let hard = Range { smoothness: 0.0, ..high };
+        assert_eq!(range_value(&hard, 1, 4), 0.0);
+        assert_eq!(range_value(&hard, 0, 4), 1.0);
+        // A range narrower than a character covers only that fraction of its cell.
+        assert!((range_value(&r(0.4, 0.6, Shape::Square), 0, 1) - 0.2).abs() < 1e-9);
     }
 
     #[test]

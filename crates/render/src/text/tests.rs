@@ -135,8 +135,137 @@ fn selector_modes_and_randomize() {
     assert_eq!(r1.iter().sum::<f64>(), 4.0);
     assert_ne!(r1, vec![1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]);
     assert_eq!(r1, selection(&p, cid, 0.0, a));
-    set(&mut p.comp_mut(cid).unwrap().layers[0], &format!("{s1}/advanced/randomSeed"), Value::Scalar(5.0));
-    assert_ne!(selection(&p, cid, 0.0, a), r1);
+    // Different permutations can select the same half of eight letters. Check several
+    // seeds, rather than assuming one particular pair has different selected sets.
+    assert!((1..=16).any(|seed| {
+        set(&mut p.comp_mut(cid).unwrap().layers[0], &format!("{s1}/advanced/randomSeed"), Value::Scalar(seed as f64));
+        selection(&p, cid, 0.0, a) != r1
+    }));
+}
+
+#[test]
+fn range_seed_zero_is_per_animator_and_explicit_seed_is_portable() {
+    let (mut p, cid, comp) = setup(600, 200);
+    let mut l = text_layer(&mut p, &comp, doc("ABCDEFGHIJKL", 30.0));
+    for a in 1..=2 {
+        animator(&mut p, &mut l, &["opacity"], &["range"]);
+        let path = format!("text/animators/#{a}/selectors/#1");
+        set(&mut l, &format!("{path}/end"), Value::Scalar(50.0));
+        set(&mut l, &format!("{path}/advanced/randomize"), Value::Bool(true));
+    }
+    p.comp_mut(cid).unwrap().layers.push(l);
+    assert_ne!(selection(&p, cid, 0.0, 1), selection(&p, cid, 0.0, 2));
+    for a in 1..=2 {
+        set(&mut p.comp_mut(cid).unwrap().layers[0], &format!("text/animators/#{a}/selectors/#1/advanced/randomSeed"), Value::Scalar(17.0));
+    }
+    let first = selection(&p, cid, 0.0, 1);
+    assert_eq!(first, selection(&p, cid, 2.0, 2));
+    p.comp_mut(cid).unwrap().layers[0].id.0 += 1000;
+    assert_eq!(first, selection(&p, cid, 0.0, 1));
+}
+
+#[test]
+fn grouping_alignment_centers_capitals_before_animator_scale() {
+    let (mut p, cid, comp) = setup(600, 300);
+    let mut l = text_layer(&mut p, &comp, doc("H", 80.0));
+    animator(&mut p, &mut l, &["scale"], &["range"]);
+    set(&mut l, "text/moreOptions/groupingAlignment", Value::Vec2([0.0, -50.0]));
+    p.comp_mut(cid).unwrap().layers.push(l);
+    let before = bounds_of(&glyph_paths(&ctx(&p, cid, 0.0), &p.comp(cid).unwrap().layers[0]));
+    set(&mut p.comp_mut(cid).unwrap().layers[0], "text/animators/#1/properties/scale", Value::Vec3([25.0, 2000.0, 100.0]));
+    let after = bounds_of(&glyph_paths(&ctx(&p, cid, 0.0), &p.comp(cid).unwrap().layers[0]));
+    assert!((before.center().y - after.center().y).abs() < 0.01, "{before:?} → {after:?}");
+    assert!((after.height() / before.height() - 20.0).abs() < 0.01);
+    assert!((after.width() / before.width() - 0.25).abs() < 0.01);
+}
+
+#[test]
+fn character_blur_is_in_layer_pixels_after_character_scale_and_rotation() {
+    let (mut p, cid, comp) = setup(600, 600);
+    let mut l = text_layer(&mut p, &comp, doc("H", 40.0));
+    animator(&mut p, &mut l, &["scale", "blur", "rotation"], &["range"]);
+    set(&mut l, "text/animators/#1/properties/scale", Value::Vec3([20.0, 800.0, 100.0]));
+    p.comp_mut(cid).unwrap().layers.push(l);
+    let image = |p: &Project| render(&ctx(p, cid, 0.0), &p.comp(cid).unwrap().layers[0], 1.0).img;
+    let variance = |img: &Image| {
+        let mut mass = 0.0;
+        let mut first = [0.0; 2];
+        let mut second = [0.0; 2];
+        for (i, pixel) in img.data.iter().enumerate() {
+            let a = f64::from(pixel[3]);
+            mass += a;
+            for (axis, v) in [(i % img.width as usize) as f64, (i / img.width as usize) as f64].into_iter().enumerate() {
+                first[axis] += a * v;
+                second[axis] += a * v * v;
+            }
+        }
+        [0, 1].map(|axis| second[axis] / mass - (first[axis] / mass).powi(2))
+    };
+    for angle in [0.0, 90.0] {
+        let l = &mut p.comp_mut(cid).unwrap().layers[0];
+        set(l, "text/animators/#1/properties/rotation", Value::Scalar(angle));
+        set(l, "text/animators/#1/properties/blur", Value::Vec2([0.0, 0.0]));
+        let sharp = variance(&image(&p));
+        set(&mut p.comp_mut(cid).unwrap().layers[0], "text/animators/#1/properties/blur", Value::Vec2([80.0, 10.0]));
+        let blurred = variance(&image(&p));
+        // A Gaussian adds sigma squared to the spatial variance on each layer axis.
+        // Neither the character's nonuniform scale nor its rotation changes sigma.
+        for axis in 0..2 {
+            let expected = [1600.0, 25.0][axis];
+            assert!(((blurred[axis] - sharp[axis]) / expected - 1.0).abs() < 0.12, "angle={angle}: {sharp:?} -> {blurred:?}");
+        }
+    }
+}
+
+#[test]
+fn selector_amount_weights_scale_opacity_and_blur_before_compositing() {
+    let (mut p, cid, comp) = setup(600, 200);
+    let mut l = text_layer(&mut p, &comp, doc("AB", 40.0));
+    animator(&mut p, &mut l, &["scale", "opacity", "blur"], &["range"]);
+    set(&mut l, "text/animators/#1/properties/scale", Value::Vec3([20.0, 3000.0, 100.0]));
+    set(&mut l, "text/animators/#1/properties/opacity", Value::Scalar(0.0));
+    set(&mut l, "text/animators/#1/properties/blur", Value::Vec2([200.0, 20.0]));
+    set(&mut l, "text/animators/#1/selectors/#1/advanced/amount", Value::Scalar(25.0));
+    p.comp_mut(cid).unwrap().layers.push(l);
+    let c = ctx(&p, cid, 0.0);
+    let geom = text_geom(&c, &p.comp(cid).unwrap().layers[0]).unwrap();
+    for glyph in geom.glyphs {
+        assert_eq!(glyph.xf.scale, [80.0, 825.0, 100.0]);
+        assert_eq!(glyph.xf.opacity, 75.0);
+        assert_eq!(glyph.xf.blur, [50.0, 5.0]);
+    }
+}
+
+#[test]
+fn very_tall_text_keeps_horizontal_detail_with_a_bounded_buffer() {
+    let (mut p, cid, comp) = setup(600, 600);
+    let mut l = text_layer(&mut p, &comp, doc("H", 40.0));
+    animator(&mut p, &mut l, &["scale"], &["range"]);
+    set(&mut l, "text/animators/#1/properties/scale", Value::Vec3([100.0, 100000.0, 100.0]));
+    p.comp_mut(cid).unwrap().layers.push(l);
+    let buf = render(&ctx(&p, cid, 0.0), &p.comp(cid).unwrap().layers[0], 0.5);
+    assert!(buf.img.data.len() < 4_100_000);
+    assert!(buf.img.height <= 16384);
+    assert!(buf.scale > 0.3, "a narrow glyph should retain horizontal samples: {}", buf.scale);
+    assert!(alpha_bbox(&buf.img).is_some());
+}
+
+#[test]
+fn selector_keyframes_use_layer_time_with_negative_start_and_reversal() {
+    let (mut p, cid, comp) = setup(600, 200);
+    let mut l = text_layer(&mut p, &comp, doc("ABCD", 40.0));
+    animator(&mut p, &mut l, &["opacity"], &["range"]);
+    l.props.prop_mut("text/animators/#1/selectors/#1/start").unwrap().keys =
+        vec![Keyframe::new(Tick::from_seconds_f64(1.0), Value::Scalar(0.0)), Keyframe::new(Tick::from_seconds_f64(2.0), Value::Scalar(100.0))];
+    l.start_time = Tick::from_seconds_f64(-1.0);
+    p.comp_mut(cid).unwrap().layers.push(l);
+    let forward: Vec<_> = [0.0, 0.25, 0.5, 0.75, 1.0].map(|t| selection(&p, cid, t, 1)).into();
+    let l = &mut p.comp_mut(cid).unwrap().layers[0];
+    l.start_time = Tick::from_seconds_f64(3.0);
+    l.stretch = -100.0;
+    for (want, t) in forward.iter().zip([2.0, 1.75, 1.5, 1.25, 1.0]) {
+        assert_eq!(*want, selection(&p, cid, t, 1));
+    }
 }
 
 #[test]
@@ -309,10 +438,14 @@ fn path_text_follows_a_mask() {
 }
 
 fn alpha_bbox(img: &crate::Image) -> Option<[i64; 4]> {
+    alpha_bbox_at(img, 0.2)
+}
+
+fn alpha_bbox_at(img: &crate::Image, threshold: f32) -> Option<[i64; 4]> {
     let mut b: Option<[i64; 4]> = None;
     for y in 0..img.height as i64 {
         for x in 0..img.width as i64 {
-            if img.get(x, y)[3] > 0.2 {
+            if img.get(x, y)[3] > threshold {
                 b = Some(match b {
                     None => [x, y, x, y],
                     Some(r) => [r[0].min(x), r[1].min(y), r[2].max(x), r[3].max(y)],

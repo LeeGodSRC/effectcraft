@@ -94,8 +94,15 @@ impl DirectorySource {
                 dirs.push(h.join(".fonts"));
             }
         }
+        dirs.extend(extra_dirs(std::env::var_os("EFFECTCRAFT_FONT_DIRS").as_deref()));
         Self { dirs }
     }
+}
+
+/// Extra font folders from `EFFECTCRAFT_FONT_DIRS` (a path list, `:`-separated, `;` on Windows), so a
+/// tool can hand EffectCraft its own font library without installing the fonts system-wide.
+fn extra_dirs(var: Option<&std::ffi::OsStr>) -> Vec<PathBuf> {
+    var.map(|v| std::env::split_paths(v).filter(|p| !p.as_os_str().is_empty()).collect()).unwrap_or_default()
 }
 
 fn walk(dir: &std::path::Path, depth: u32, out: &mut Vec<PathBuf>) {
@@ -119,6 +126,7 @@ impl FontSource for DirectorySource {
             walk(d, 0, &mut files);
         }
         files.sort();
+        files.dedup();
         let mut out = Vec::new();
         for f in files {
             let Ok(mut file) = std::fs::File::open(&f) else { continue };
@@ -753,7 +761,7 @@ fn fallback_cache() -> &'static RwLock<std::collections::HashMap<(u32, FaceId), 
     CACHE.get_or_init(Default::default)
 }
 
-/// A face that covers `c`, preferring `prefer`. Bundled faces and faces already loaded are tried
+/// A face that covers `c`, preferring `prefer`. Bundled faces are tried
 /// first (cheap); then, for CJK characters, the platform's usual family for that language, in the
 /// preferred face's style; then any installed face that covers the character. `prefer` when
 /// nothing does (the glyph renders as the missing-glyph box).
@@ -763,13 +771,10 @@ pub fn fallback_for(c: char, prefer: FaceId) -> FaceId {
         return prefer;
     }
     let faces = all_faces();
-    // prefer a face of the same italic-ness that is bundled (cheap), then anything loaded already
+    // Loading a font for an earlier layer must not change later layers' fallback family
+    // or weight. In particular a loaded Mincho face must not override Japanese Gothic,
+    // and a loaded Regular face must not override a requested Bold face.
     for f in faces.iter().filter(|f| f.info.origin == "bundled") {
-        if f.has_char(c) {
-            return f.id;
-        }
-    }
-    for f in faces.iter().filter(|f| f.info.origin != "bundled" && f.bytes.get().is_some()) {
         if f.has_char(c) {
             return f.id;
         }
@@ -823,6 +828,14 @@ fn system_fallback(c: char, style: &str) -> Option<FaceId> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extra_font_dirs_come_from_a_path_list() {
+        assert!(extra_dirs(None).is_empty());
+        let v = std::env::join_paths(["/a/fonts", "/b/more"]).unwrap_or_default();
+        assert_eq!(extra_dirs(Some(&v)), vec![PathBuf::from("/a/fonts"), PathBuf::from("/b/more")]);
+        assert!(extra_dirs(Some(std::ffi::OsStr::new(""))).is_empty());
+    }
 
     #[test]
     fn bundled_families_and_resolution() {

@@ -157,6 +157,37 @@ fn powz(x: f32, y: f32) -> f32 {
     return pow(x, y);
 }
 
+// IEEE round-to-nearest-even division for finite normal inputs. Threshold kernels need
+// the CPU's exact f32 result: Vulkan permits approximate division and some drivers
+// fold residual-correction fma expressions back into reciprocal multiplication.
+// The 24-bit long division below uses integer remainders, independent of fast math.
+fn div_rn(a: f32, b: f32) -> f32 {
+    let ab = bitcast<u32>(a);
+    let bb = bitcast<u32>(b);
+    let ae = (ab >> 23u) & 255u;
+    let be = (bb >> 23u) & 255u;
+    if ((ab & 0x7fffffffu) == 0u && be > 0u && be < 255u) {
+        return bitcast<f32>((ab ^ bb) & 0x80000000u);
+    }
+    if (ae == 0u || be == 0u || ae == 255u || be == 255u) { return a / b; }
+    var numerator = (ab & 0x7fffffu) | 0x800000u;
+    let denominator = (bb & 0x7fffffu) | 0x800000u;
+    var exponent = i32(ae) - i32(be) + 127;
+    if (numerator < denominator) { numerator <<= 1u; exponent -= 1; }
+    var remainder = numerator - denominator;
+    var quotient = 1u;
+    for (var i = 0u; i < 23u; i += 1u) {
+        remainder <<= 1u;
+        quotient <<= 1u;
+        if (remainder >= denominator) { remainder -= denominator; quotient |= 1u; }
+    }
+    let twice = remainder << 1u;
+    if (twice > denominator || (twice == denominator && (quotient & 1u) != 0u)) { quotient += 1u; }
+    if (quotient == 0x1000000u) { quotient >>= 1u; exponent += 1; }
+    if (exponent <= 0 || exponent >= 255) { return a / b; }
+    return bitcast<f32>(((ab ^ bb) & 0x80000000u) | (u32(exponent) << 23u) | (quotient & 0x7fffffu));
+}
+
 // Rust's f32::round (half away from zero; WGSL's round() is half to even).
 fn round_away(x: f32) -> f32 {
     let t = trunc(x);
@@ -235,7 +266,7 @@ fn separable(mode: u32, cb: f32, cs: f32) -> f32 {
             if (cs <= 0.0) {
                 return 0.0;
             }
-            return max(1.0 - (1.0 - cb) / cs, 0.0);
+            return 1.0 - (1.0 - cb) / cs;
         }
         case 7u: { return max(cb + cs - 1.0, 0.0); }
         case 9u, 14u: { return cb + cs; }
@@ -343,7 +374,7 @@ fn non_separable(mode: u32, cb: vec3<f32>, cs: vec3<f32>) -> vec3<f32> {
 
 fn supports_hdr(mode: u32) -> bool {
     switch mode {
-        case 0u, 1u, 2u, 3u, 4u, 7u, 8u, 9u, 10u, 11u, 14u, 15u, 23u, 24u, 26u, 27u, 32u, 33u, 34u, 35u, 36u, 37u: { return true; }
+        case 0u, 1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u, 9u, 10u, 11u, 14u, 15u, 16u, 23u, 24u, 25u, 26u, 27u, 31u, 32u, 33u, 34u, 35u, 36u, 37u: { return true; }
         default: { return false; }
     }
 }
@@ -388,8 +419,18 @@ fn blend_pixel(mode: u32, dst: vec4<f32>, src: vec4<f32>, noise: f32) -> vec4<f3
         cs = clamp(cs, vec3<f32>(0.0), vec3<f32>(1.0));
         cb = clamp(cb, vec3<f32>(0.0), vec3<f32>(1.0));
     }
-    let b = non_separable(mode, cb, cs);
     let ao = sa + da - sa * da;
+    // Classic Color Dodge / Difference (neutral 0) and Classic Color Burn (neutral 1): the
+    // source fades toward the neutral colour by its coverage, then the formula applies.
+    if (mode == 13u || mode == 24u || mode == 6u) {
+        var neutral = 0.0;
+        if (mode == 6u) {
+            neutral = 1.0;
+        }
+        let bc = non_separable(mode, cb, neutral + sa * (cs - neutral));
+        return vec4<f32>((1.0 - da) * src.xyz + da * bc, ao);
+    }
+    let b = non_separable(mode, cb, cs);
     return vec4<f32>((1.0 - da) * src.xyz + (1.0 - sa) * dst.xyz + sa * da * b, ao);
 }
 
@@ -528,4 +569,14 @@ fn curve_encode(curve: u32, v: f32) -> f32 {
         e = hlg_encode(a);
     }
     return select(e, -e, v < 0.0);
+}
+
+// render::preserve_pixel: clipping layers retain the destination coverage.
+fn preserve_pixel(mode: u32, dst: vec4<f32>, src: vec4<f32>, noise: f32) -> vec4<f32> {
+    if (dst.w <= 0.0) {
+        return vec4<f32>(0.0);
+    }
+    let opaque = vec4<f32>(dst.xyz / dst.w, 1.0);
+    let blended = blend_pixel(mode, opaque, src, noise);
+    return vec4<f32>(blended.xyz * dst.w, dst.w);
 }

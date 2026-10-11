@@ -184,7 +184,7 @@ See [docs/agents.md](docs/agents.md) and [docs/control-protocol.md](docs/control
 
 Installers for each version are on the [Releases](https://github.com/storytold/effectcraft/releases)
 page: a universal macOS app; Windows MSIs and portable zips for x64, x86 and ARM64; Linux
-AppImage, Flatpak, deb, rpm and tar.gz for x86_64 and aarch64; a FreeBSD x86_64 tarball; and the
+AppImage, Flatpak, deb, rpm and tar.gz for x86_64 and aarch64, plus a riscv64 tar.gz; a FreeBSD x86_64 tarball; and the
 web build. [Downloads](#downloads) lists every file. The Windows ARM64 build runs natively on
 Windows on ARM, without x64 emulation. CI installs that MSI on Windows 11 ARM64 hardware, checks
 both programs are ARM64 and runs the command-line tool there, but it doesn't open the app's window
@@ -224,8 +224,11 @@ exists, including all of its effects, but existing is not the same as behaving e
 Effects, and we haven't measured that yet. Today it's a good place to try things and to tell us
 what breaks. It isn't yet a replacement for After Effects on client work. In particular:
 
-- **After Effects projects can't be opened.** Projects are saved as `.ecproj`, readable versioned
-  JSON, but EffectCraft can't open `.aep` / `.aepx` files, and After Effects plug-ins don't run.
+- **Experimental After Effects project import (`.aep`):** Opens binary RIFX projects with
+  compositions, folders, layer timing, nested sources, solids, transforms and animation.
+  Missing footage and unsupported content are reported. Save imported projects as `.ecproj`;
+  the original `.aep` is never overwritten. Supported effects, masks, vector contents, text
+  styling and expressions are reconstructed, with rendering fidelity still experimental. `.aepx` is explicitly unsupported.
 - **Behaviour still differs from After Effects in places.** Nothing yet compares our renders with
   After Effects automatically, so please report differences.
 - **macOS is the most tested platform.** Linux and Windows users have hit basic interaction
@@ -234,8 +237,10 @@ what breaks. It isn't yet a replacement for After Effects on client work. In par
   Settings ▸ Roto Brush) and face tracking can use Google's MediaPipe Face Landmarker (an optional
   3.8 MB download in Settings ▸ Face Tracking). Neither is compared with After Effects yet.
 
-The [ROADMAP](ROADMAP.md) has the plan and [docs/gaps.md](docs/gaps.md) the full, honest
-assessment. The web build ([docs/web.md](docs/web.md)) runs the full app in the browser.
+EffectCraft is in **alpha**: about 91% of After Effects' features exist, and we estimate it is
+about 45% of the way to replacing After Effects for professional work. The [ROADMAP](ROADMAP.md)
+has the plan, [docs/target-app-parity.md](docs/target-app-parity.md) the measurement and
+[docs/gaps.md](docs/gaps.md) every known shortfall. The web build ([docs/web.md](docs/web.md)) runs the full app in the browser.
 [Bug reports](https://github.com/storytold/effectcraft/issues) are the most useful thing you can
 send us right now.
 
@@ -264,7 +269,9 @@ send us right now.
 | arm64 (Snapdragon and other ARM PCs) | `effectcraft-<ver>-windows-arm64.msi` | `effectcraft-<ver>-windows-arm64-portable.zip` |
 | x86 (32-bit) | `effectcraft-<ver>-windows-x86.msi` | `effectcraft-<ver>-windows-x86-portable.zip` |
 
-Installers and executables are code-signed.
+Installers and executables are code-signed. The installer asks where to install EffectCraft
+(Program Files by default), and later versions install into the same folder. To install silently
+into a folder of your choice: `msiexec /i effectcraft-<ver>-windows-x64.msi /qn INSTALLFOLDER="D:\Apps\EffectCraft"`.
 
 ### macOS
 
@@ -282,6 +289,22 @@ Installers and executables are code-signed.
 | Debian/Ubuntu | `effectcraft-<ver>-linux-x86_64.deb` | `effectcraft-<ver>-linux-aarch64.deb` | |
 | Fedora/RHEL/openSUSE | `effectcraft-<ver>-linux-x86_64.rpm` | `effectcraft-<ver>-linux-aarch64.rpm` | |
 | Tarball | `effectcraft-<ver>-linux-x86_64.tar.gz` | `effectcraft-<ver>-linux-aarch64.tar.gz` | Unpack anywhere |
+
+RISC-V 64-bit: `effectcraft-<ver>-linux-riscv64.tar.gz` (tarball only; needs glibc 2.39+, e.g. Ubuntu 24.04+ or Debian 13+).
+
+**File drag-and-drop on Linux:** The current eframe/winit 0.30 native Wayland backend does not
+deliver file-hover or file-drop events. On Hyprland and other native Wayland sessions, use
+**File ▸ Import ▸ File…** (which accepts multiple files), or start EffectCraft via XWayland if
+XWayland is installed and `DISPLAY` is set:
+
+```sh
+env -u WAYLAND_DISPLAY effectcraft
+```
+
+When the backend delivers events (X11/XWayland, Windows and macOS), dropping media anywhere
+in the window imports it, and a drop-target hint appears while hovering. On native Wayland the
+app cannot detect an attempt that generates no event; it shows a startup notice with the
+File ▸ Import fallback instead.
 
 ### FreeBSD
 
@@ -307,7 +330,7 @@ stand on its own.
 | <img src="https://raw.githubusercontent.com/storytold/vectorcraft/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.vectorcraft.png" alt="" width="32" height="32"> | **VectorCraft** | Vector illustration | [GitHub](https://github.com/storytold/vectorcraft) | [Website](https://getartcraft.com/apps/vectorcraft) |
 | <img src="https://raw.githubusercontent.com/storytold/filmcraft/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.filmcraft.png" alt="" width="32" height="32"> | **FilmCraft** | Video editing, color and sound | [GitHub](https://github.com/storytold/filmcraft) | [Website](https://getartcraft.com/apps/filmcraft) |
 | <img src="https://raw.githubusercontent.com/storytold/lightcraft/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.lightcraft.png" alt="" width="32" height="32"> | **LightCraft** | Photo library and raw development | [GitHub](https://github.com/storytold/lightcraft) | [Website](https://getartcraft.com/apps/lightcraft) |
-| <img src="https://raw.githubusercontent.com/storytold/pdfcraft/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.pdfcraft.png" alt="" width="32" height="32"> | **PdfCraft** | Reading, organizing and protecting PDFs | [GitHub](https://github.com/storytold/pdfcraft) | [Website](https://getartcraft.com/apps/pdfcraft) |
+| <img src="https://raw.githubusercontent.com/storytold/printcraft/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.printcraft.png" alt="" width="32" height="32"> | **PrintCraft** | Reading, organizing and protecting PDFs | [GitHub](https://github.com/storytold/printcraft) | [Website](https://getartcraft.com/apps/printcraft) |
 | <img src="https://raw.githubusercontent.com/storytold/effectcraft/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.effectcraft.png" alt="" width="32" height="32"> | **EffectCraft** | **Motion graphics and visual effects · you are here** | [GitHub](https://github.com/storytold/effectcraft) | [Website](https://getartcraft.com/apps/effectcraft) |
 | <img src="https://raw.githubusercontent.com/storytold/designcraft/main/assets/app-icon/hicolor/64x64/apps/ai.storyteller.designcraft.png" alt="" width="32" height="32"> | **DesignCraft** | Page layout and publishing | [GitHub](https://github.com/storytold/designcraft) | [Website](https://getartcraft.com/apps/designcraft) |
 

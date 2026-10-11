@@ -41,6 +41,9 @@ pub(crate) const IDS: &[&str] = &[
 
 /// Run effect `id` (one of [`IDS`]); `None` = this parameter combination runs on the CPU.
 pub(crate) fn apply(e: &mut Enc, id: &str, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
+    if id == "ec.sim.ccparticleworld" && effectcraft_effects::particle_world_textured(ctx) {
+        return None;
+    }
     let geo = Buf { img: Image::new(0, 0), offset: b.offset, scale: b.scale };
     match id {
         "ec.sim.ccparticleworld" | "ec.sim.ccparticlesystems2" => match effectcraft_effects::sprite_plan(id, ctx, &geo) {

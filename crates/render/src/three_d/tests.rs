@@ -351,6 +351,42 @@ fn camera(p: &mut Project, comp: &Comp) -> Layer {
 }
 
 #[test]
+fn motion_blur_keeps_the_frame_camera_across_its_in_point() {
+    for time in [Tick::ZERO, Tick::from_seconds_f64(0.5)] {
+        let (mut p, cid, comp) = setup();
+        let mut cam = camera(&mut p, &comp);
+        // A one-node camera makes the later translation move the image, without
+        // a two-node camera's automatic pan back towards its Point of Interest.
+        cam.auto_orient = effectcraft_project::AutoOrient::Off;
+        cam.in_point = time;
+        set(&mut cam, "transform/position", Value::Vec3([100.0, 50.0, -zoom() * 0.5]));
+        push(&mut p, cid, cam);
+        let mut layer = solid3(&mut p, &comp, [1.0, 1.0, 1.0], 30, 20, [80.0, 50.0, 0.0]);
+        layer.switches.motion_blur = true;
+        push(&mut p, cid, layer);
+        p.comp_mut(cid).unwrap().enable_motion_blur = true;
+        let render = |p: &Project, motion_blur| Renderer::new(p, &NoFootage, RenderOpts { motion_blur, ..Default::default() }).comp_frame(cid, time);
+        let sharp = render(&p, false);
+        let blurred = render(&p, true);
+        for (a, b) in sharp.data.iter().zip(&blurred.data) {
+            assert!((a[3] - b[3]).abs() < 1e-5, "stationary shot at {time:?}: {a:?} != {b:?}");
+        }
+
+        // Keep evaluating camera motion at each sample, rather than freezing its pose.
+        let camera = &mut p.comp_mut(cid).unwrap().layers[0];
+        camera.props.prop_mut("transform/position").unwrap().keys = vec![
+            effectcraft_keyframe::Keyframe::new(time - Tick::from_units(1, 30), Value::Vec3([90.0, 50.0, -zoom() * 0.5])),
+            effectcraft_keyframe::Keyframe::new(time + Tick::from_units(1, 30), Value::Vec3([110.0, 50.0, -zoom() * 0.5])),
+        ];
+        let moving = render(&p, true);
+        assert!(moving.data.iter().zip(&sharp.data).any(|(a, b)| (a[3] - b[3]).abs() > 0.05));
+        // Extending this same camera's trim must not change the exposure.
+        p.comp_mut(cid).unwrap().layers[0].in_point = time - Tick::from_seconds_f64(1.0);
+        assert_eq!(moving, render(&p, true));
+    }
+}
+
+#[test]
 fn default_camera_layer_matches_comp_camera() {
     let (mut p, cid, comp) = setup();
     let cam = camera(&mut p, &comp);
@@ -540,4 +576,23 @@ fn rig_orbit_keeps_distance_and_pan_moves_both() {
     r.orbit(0.0, 500.0);
     let off = r.eye - r.poi;
     assert!(off.y.abs() / off.length() < 0.9999);
+}
+
+#[test]
+fn two_d_layer_takes_a_3d_track_matte_through_the_camera() {
+    let (mut p, cid, comp) = setup();
+    // A hidden 3D matte, half the comp in size, one camera distance behind the comp plane:
+    // on screen it is a quarter of the comp, centred.
+    let mut matte = solid3(&mut p, &comp, [1.0, 1.0, 1.0], W / 2, H / 2, [W as f64 / 2.0, H as f64 / 2.0, zoom()]);
+    matte.switches.video = false;
+    let sid = p.add_item("Fill", Label::Red, None, ItemKind::Solid(Solid { color: [0.0, 0.0, 1.0], width: W, height: H, pixel_aspect: 1.0 }));
+    let mut fill = build::layer(&mut p, &comp, "Fill", LayerSource::Solid { item: sid }, (W, H), None);
+    fill.track_matte = Some(effectcraft_project::TrackMatte { layer: matte.id, kind: effectcraft_project::MatteKind::Luma });
+    push(&mut p, cid, matte);
+    push(&mut p, cid, fill);
+    let img = render(&p, cid);
+    assert!(img.get(100, 50)[2] > 0.99, "inside the matte as the camera sees it");
+    // Inside the matte's own rectangle (were it placed flat, ignoring depth), outside what
+    // the camera sees of it.
+    assert!(img.get(140, 50)[3] < 0.01, "the matte is not placed flat");
 }

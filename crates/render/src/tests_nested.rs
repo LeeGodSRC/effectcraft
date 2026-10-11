@@ -88,3 +88,39 @@ fn a_nested_comp_shows_nothing_past_its_end() {
         assert!(render_frame(&p, cid, s(2.0), 1.0).get(50, 50)[3] < 0.01, "collapse {collapse}: past its end");
     }
 }
+
+/// Layers showing the same nested comp share its frame within a frame of the outer comp (the
+/// frame memo), each at its own time: three layers side by side, the middle one a second ahead.
+#[test]
+fn layers_sharing_a_nested_comp_show_it_at_their_own_times() {
+    for three_d in [false, true] {
+        let (mut p, _, iid) = nested(false, false);
+        let outer = Comp::new(300, 100, FrameRate::FPS_30, s(4.0));
+        let cid = p.add_item("Wide", Label::Sandstone, None, ItemKind::Comp(outer.clone().into()));
+        for (i, ahead) in [0.0, 1.0, 0.0].into_iter().enumerate() {
+            let mut pre = build::layer(&mut p, &outer, "Inner", LayerSource::Comp { item: iid }, (100, 100), None);
+            pre.props.prop_mut("transform/position").unwrap().value = Value::Vec3([50.0 + 100.0 * i as f64, 50.0, 0.0]);
+            pre.start_time = s(-ahead);
+            pre.in_point = Tick::ZERO;
+            pre.switches.three_d = three_d;
+            p.comp_mut(cid).unwrap().layers.push(pre);
+        }
+        // The solid is at x = 10 at 0 s and x = 50 at 1 s of the nested comp.
+        let img = render_frame(&p, cid, Tick::ZERO, 1.0);
+        let lit = |x: i64| img.get(x, 50)[3] > 0.9;
+        assert!(lit(10) && !lit(50), "3D {three_d}: the first layer shows 0 s");
+        assert!(lit(150) && !lit(110), "3D {three_d}: the second layer shows 1 s");
+        assert!(lit(210) && !lit(250), "3D {three_d}: the third layer shows 0 s again");
+        // And the shared frame is the one a single layer renders.
+        let (single, sid, _) = nested(false, false);
+        let alone = render_frame(&single, sid, Tick::ZERO, 1.0);
+        for y in 0..100 {
+            for x in 0..100 {
+                assert_eq!(img.get(x, y), alone.get(x, y), "3D {three_d}: first layer pixel ({x}, {y})");
+                if !three_d {
+                    assert_eq!(img.get(x + 200, y), alone.get(x, y), "third layer pixel ({x}, {y})");
+                }
+            }
+        }
+    }
+}

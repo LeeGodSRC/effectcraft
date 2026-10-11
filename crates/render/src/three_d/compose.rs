@@ -196,7 +196,11 @@ fn mb_samples(r: &Renderer, ctx: &EvalCtx, layer: &Layer) -> usize {
 
 /// Prepare a layer (buffer, geometry, material). `None` when it shows nothing.
 pub(crate) fn prepare<'a>(r: &Renderer, ctx: &EvalCtx<'a>, layer: &'a Layer, order: usize, out: (u32, u32), in_run: bool) -> Option<Item<'a>> {
-    let buf = r.blend_layer_buf(ctx, layer)?;
+    // (An accelerator may hold the layer's pixels itself: then only their description is here.)
+    let buf = match r.held.and_then(|h| h.get(&layer.id)) {
+        Some(buf) => buf.clone(),
+        None => r.blend_layer_buf(ctx, layer)?,
+    };
     prepare_with(r, ctx, layer, order, out, in_run, buf, Mat4::IDENTITY)
 }
 
@@ -254,11 +258,20 @@ fn prepare_with<'a>(
         let fd = ctx.comp.frame_duration().seconds();
         let angle = ctx.comp.shutter_angle / 360.0;
         let phase = ctx.comp.shutter_phase / 360.0;
+        // The frame selects the shot's camera. Sample its animated pose throughout
+        // the exposure, even before its in-point (e.g. a negative shutter phase at
+        // frame zero). Selecting again at each sample mixed in the default camera
+        // and drew a second, differently sized image of a stationary layer.
+        let exposure_camera = ctx.comp.active_camera(ctx.time);
         (0..n)
             .filter_map(|i| {
                 let f = phase + angle * i as f64 / (n - 1) as f64;
                 let sub = ctx.at(ctx.time + Tick::from_seconds_f64(f * fd));
-                let c = camera_for(r, &sub);
+                let c = if r.collapse3d.is_some() || (r.depth == 0 && r.opts.view.is_some()) {
+                    cam
+                } else {
+                    exposure_camera.map_or(cam, |layer| super::camera::layer_camera(&sub, layer))
+                };
                 geo(&c, outer * sub.world_matrix(layer) * local, bounds, comp, s, out, r.out_offset())
             })
             .collect()
@@ -356,6 +369,22 @@ fn dof_blur(cam: &CameraState, dof: &super::camera::Dof, world: Mat4, buf: Arc<B
     Arc::new(Buf { img: super::bokeh::progressive_blur(&pbuf.img, &dof.iris, &pr), offset: pbuf.offset, scale: pbuf.scale })
 }
 
+/// A 3D track matte layer as the camera sees it, drawn alone (its own matte, blend mode and
+/// Preserve Transparency are ignored).
+pub(crate) fn matte_image(r: &Renderer, ctx: &EvalCtx, m: &Layer, out: (u32, u32)) -> Image {
+    let mut img = Image::new(out.0, out.1);
+    let mut solo = m.clone();
+    solo.track_matte = None;
+    solo.preserve_transparency = false;
+    solo.blend_mode = BlendMode::Normal;
+    let its = prepare_all(r, ctx, &solo, 0, out, true);
+    if !its.is_empty() {
+        let lights = scene_lights(ctx);
+        composite(&mut img, &its, &lights, &[], m.id.0 as u32);
+    }
+    img
+}
+
 /// Screen-space track matte factor for a layer, or None.
 fn matte_for(r: &Renderer, ctx: &EvalCtx, layer: &Layer, out: (u32, u32)) -> Option<Arc<Vec<f32>>> {
     let tm = layer.track_matte?;
@@ -363,16 +392,7 @@ fn matte_for(r: &Renderer, ctx: &EvalCtx, layer: &Layer, out: (u32, u32)) -> Opt
     let mut img = Image::new(out.0, out.1);
     if m.is_active_at(ctx.time) {
         if m.is_3d() {
-            // Render the matte plane alone (its own matte is ignored).
-            let mut solo = m.clone();
-            solo.track_matte = None;
-            solo.preserve_transparency = false;
-            solo.blend_mode = BlendMode::Normal;
-            let its = prepare_all(r, ctx, &solo, 0, out, true);
-            if !its.is_empty() {
-                let lights = scene_lights(ctx);
-                composite(&mut img, &its, &lights, &[], m.id.0 as u32);
-            }
+            img = matte_image(r, ctx, m, out);
         } else if let Some(mb) = r.layer_buf(ctx, m) {
             r.place(ctx, m, &mb, &mut img, BlendMode::Normal, ctx.opacity(m) as f32);
         }
@@ -445,6 +465,13 @@ struct Gathered<'a> {
 fn gather<'a>(r: &Renderer<'a>, ctx: &EvalCtx<'a>, run: &[&'a Layer], out: (u32, u32)) -> Gathered<'a> {
     // A collapsed precomp's 3D layers are lit by the outer comp's lights.
     let lights = scene_lights(&r.collapse3d.map_or(*ctx, |c| c.parent));
+    // Planes showing the same nested comp frame render it once, before they all ask for it.
+    let precomps: Vec<&'a Layer> = run
+        .iter()
+        .copied()
+        .filter(|l| ctx.opacity(l) > 0.0 && r.quality(l) != effectcraft_project::Quality::Wireframe && r.collapsed(ctx, l).is_none())
+        .collect();
+    r.prewarm_precomps(ctx, &precomps);
     let mut items: Vec<Item> = run
         .par_iter()
         .enumerate()
@@ -567,7 +594,7 @@ fn composite(canvas: &mut Image, items: &[Item], lights: &[LightState], casters:
             for (_, _, px, k) in &frags {
                 let it = active[*k];
                 let mut s = *px;
-                let op = it.opacity * if it.preserve { d[3] } else { 1.0 };
+                let op = it.opacity;
                 for c in s.iter_mut() {
                     *c *= op;
                 }
@@ -577,7 +604,7 @@ fn composite(canvas: &mut Image, items: &[Item], lights: &[LightState], casters:
                 } else {
                     0.5
                 };
-                d = blend_pixel(mode, d, s, n);
+                d = if it.preserve { crate::preserve_pixel(mode, d, s, n) } else { blend_pixel(mode, d, s, n) };
             }
             row[x] = d;
         }
@@ -755,30 +782,53 @@ pub(crate) fn gpu_run(r: &Renderer, ctx: &EvalCtx, run: &[&Layer], out: (u32, u3
     // Depth of field is left to the accelerator (its blur runs where the planes are drawn).
     let rd = Renderer { defer_dof: true, ..*r };
     let g = gather(&rd, ctx, run, out);
-    let planes: Vec<Plane3d> = g
-        .items
-        .into_iter()
-        .chain(g.extra)
-        .map(|it| Plane3d {
-            layer_id: it.layer.id.0 as u32,
-            mode: it.layer.blend_mode,
-            buf: it.buf,
-            dof: it.dof,
-            bicubic: it.bicubic,
-            geos: it.geos,
-            mat: it.mat,
-            opacity: it.opacity,
-            draw: it.draw,
-            matte: it.matte,
-            preserve: it.preserve,
-            winv: it.winv,
-            bounds: it.bounds,
-            bbox: it.bbox,
-            order: it.order,
-        })
-        .collect();
+    let planes: Vec<Plane3d> = g.items.into_iter().chain(g.extra).map(plane_of).collect();
     let casters = planes.iter().enumerate().filter(|(_, p)| r.opts.shadows() && p.mat.casts_shadows != 0 && !p.geos.is_empty()).map(|(i, _)| i).collect();
     Some(Run3d { planes, casters, lights: g.lights, seed: run[0].id.0 as u32 })
+}
+
+fn plane_of(it: Item) -> Plane3d {
+    Plane3d {
+        layer_id: it.layer.id.0 as u32,
+        mode: it.layer.blend_mode,
+        buf: it.buf,
+        dof: it.dof,
+        bicubic: it.bicubic,
+        geos: it.geos,
+        mat: it.mat,
+        opacity: it.opacity,
+        draw: it.draw,
+        matte: it.matte,
+        preserve: it.preserve,
+        winv: it.winv,
+        bounds: it.bounds,
+        bbox: it.bbox,
+        order: it.order,
+    }
+}
+
+/// [`gpu_run`] of one layer drawn alone whose pixels the accelerator holds itself: `buf` only
+/// describes them (size, offset, scale). `None` as [`gpu_run`], and for per-character 3D text
+/// (one plane per character, cut from the CPU's buffer).
+pub(crate) fn gpu_run_of(r: &Renderer, ctx: &EvalCtx, layer: &Layer, out: (u32, u32), buf: Arc<Buf>) -> Option<Run3d> {
+    if layer.switches.adjustment
+        || layer.environment_background
+        || matches!(layer.source, effectcraft_project::LayerSource::Text)
+        || r.quality(layer) == effectcraft_project::Quality::Wireframe
+        || super::adv::active(r, ctx)
+    {
+        return None;
+    }
+    let rd = Renderer { defer_dof: true, ..*r };
+    let lights = scene_lights(&r.collapse3d.map_or(*ctx, |c| c.parent));
+    // Out of the camera's sight (or empty): a run that draws nothing, not a reason to ask the
+    // CPU renderer for the layer.
+    let Some(item) = prepare_with(&rd, ctx, layer, 0, out, true, buf, Mat4::IDENTITY) else {
+        return Some(Run3d { planes: vec![], casters: vec![], lights, seed: layer.id.0 as u32 });
+    };
+    let plane = plane_of(item);
+    let casters = if r.opts.shadows() && plane.mat.casts_shadows != 0 && !plane.geos.is_empty() { vec![0] } else { vec![] };
+    Some(Run3d { planes: vec![plane], casters, lights, seed: layer.id.0 as u32 })
 }
 
 // ------------------------------------------------------------------ auxiliary render pass

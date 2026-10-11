@@ -424,6 +424,37 @@ fn layer_styles_collapsed_precomps_and_cpu_fallbacks() {
     }
 }
 
+/// A precomp layer with masks keeps its nested frame on the device: the frame is multiplied by
+/// the masks' coverage there (with and without an effect stack after the masks).
+#[test]
+fn masked_precomp_layers_match_the_cpu() {
+    for depth in [BitDepth::Bpc8, BitDepth::Bpc32] {
+        for blur in [false, true] {
+            let mut s = Scene::new(depth);
+            let inner = Comp::new(60, 40, FrameRate::FPS_30, Tick::from_seconds_f64(2.0));
+            let inner_id = s.p.add_item("Inner", Label::Sandstone, None, ItemKind::Comp(inner.clone().into()));
+            let a = s.footage(60, 40);
+            let mut b = s.solid([0.2, 0.7, 0.4], 30, 20);
+            b.blend_mode = BlendMode::Difference;
+            s.p.comp_mut(inner_id).unwrap().layers = vec![b, a];
+            let bg = s.footage(97, 61);
+            s.push(bg);
+            let mut pre = build::layer(&mut s.p, &s.comp, "Inner", LayerSource::Comp { item: inner_id }, (60, 40), None);
+            let mut next = s.p.next_id;
+            let m = build::mask(&mut Ids(&mut next), "Mask 1", ShapePath::ellipse([30.0, 20.0], 44.0, 30.0), MaskMode::Add, [255, 255, 0]);
+            s.p.next_id = next;
+            pre.props.sub_mut("masks").unwrap().children.push(m.into());
+            set(&mut pre, "transform/rotation", Value::Scalar(15.0));
+            set(&mut pre, "transform/opacity", Value::Scalar(80.0));
+            if blur {
+                s.effect(&mut pre, "ec.blur.gaussian", &[("blurriness", Value::Scalar(3.0))]);
+            }
+            s.push(pre);
+            check(&format!("masked precomp {depth:?} blur {blur}"), compare_at(&s, opts(), Tick::ZERO), 0.0);
+        }
+    }
+}
+
 /// The effect alone on a buffer: GPU kernels vs the CPU effect (32-bit float), including the
 /// buffer geometry (padding, offset).
 pub(crate) fn effect_direct(id: &str, vals: &[(&str, Value)], adjustment: bool) {
@@ -744,4 +775,277 @@ fn within_memory_returns_the_work_when_there_is_room() {
     let Some(g) = gpu() else { return };
     let img = g.within_memory(|| g.ctx.image(64, 32)).expect("room for a 64×32 texture");
     assert_eq!((img.width, img.height), (64, 32));
+}
+
+/// A device of its own, so pool counters and a destroyed device stay out of the shared one.
+#[cfg(not(target_arch = "wasm32"))]
+fn own_gpu() -> Option<Gpu> {
+    hold_gpu_lock();
+    let g = Gpu::headless();
+    if g.is_none() {
+        eprintln!("effectcraft-gpu tests: no GPU adapter, skipping");
+    }
+    g
+}
+
+/// A long run of passes reuses the textures it releases instead of allocating a new one per
+/// pass until its encoder is submitted: that took 30 GB of video memory for one 1080p frame of
+/// a heavy comp and lost the device (and with it the app's window).
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_long_run_of_passes_reuses_its_textures() {
+    use crate::context::Enc;
+    let Some(g) = own_gpu() else { return };
+    let mut e = Enc::new(&g.ctx);
+    let mut img = e.image(1024, 1024);
+    // 64 passes of 16 MB each: 1 GB if none were reused.
+    for i in 0..64 {
+        img = crate::ops::quantize(&mut e, &img, if i % 2 == 0 { 255.0 } else { 65535.0 });
+    }
+    let out = e.download(&img).expect("readback");
+    assert_eq!((out.width, out.height), (1024, 1024));
+    let u = g.ctx.pool_usage();
+    assert!(u.peak_bytes < 512 << 20, "peak working textures: {} MB", u.peak_bytes >> 20);
+    assert!(u.hits > 32, "released textures were reused: {u:?}");
+    assert!(!g.ctx.memory_pressure());
+    drop((img, e));
+    let u = g.ctx.pool_usage();
+    assert_eq!(u.waiting_bytes, 0, "nothing waits once every encoder is submitted or dropped");
+    assert!(u.live_bytes <= 768 << 20, "only the free pool stays: {u:?}");
+}
+
+/// An encoder left open while other work runs (the comp walk waiting for a layer's pixels,
+/// whose effect chains have encoders of their own) pins what that work releases; parked, it
+/// does not.
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_parked_encoder_does_not_pin_nested_work() {
+    use crate::context::Enc;
+    let run = |park: bool| -> Option<usize> {
+        let g = own_gpu()?;
+        let mut outer = Enc::new(&g.ctx);
+        let canvas = outer.image(64, 64);
+        let canvas = crate::ops::quantize(&mut outer, &canvas, 255.0);
+        if park {
+            outer.park();
+        }
+        {
+            let mut inner = Enc::new(&g.ctx);
+            let mut img = inner.image(1024, 1024);
+            for i in 0..64 {
+                img = crate::ops::quantize(&mut inner, &img, if i % 2 == 0 { 255.0 } else { 65535.0 });
+            }
+            inner.download(&img)?;
+        }
+        outer.download(&canvas)?;
+        Some(g.ctx.pool_usage().peak_bytes)
+    };
+    let (Some(pinned), Some(parked)) = (run(false), run(true)) else { return };
+    assert!(parked < 512 << 20, "parked: {} MB", parked >> 20);
+    assert!(pinned > parked, "an open outer encoder pins nested work: {} MB vs {} MB", pinned >> 20, parked >> 20);
+}
+
+/// The oldest free textures make room for newly released ones, so the pool holds the sizes in
+/// use now, and its accounting follows what it drops.
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn the_free_pool_keeps_the_newest_sizes_within_its_budget() {
+    use crate::context::Enc;
+    let Some(g) = own_gpu() else { return };
+    // 2048² is 64 MB: 16 of them overflow the 768 MB pool.
+    let sizes: Vec<u32> = (0..16).map(|i| 2048 + i).collect();
+    for s in &sizes {
+        let mut e = Enc::new(&g.ctx);
+        drop(e.image(*s, 2048));
+    }
+    let u = g.ctx.pool_usage();
+    assert!(u.live_bytes <= 768 << 20, "{u:?}");
+    assert_eq!(u.misses, 16);
+    // The newest size is still there; the oldest was dropped.
+    let mut e = Enc::new(&g.ctx);
+    drop(e.scratch(2048 + 15, 2048));
+    assert_eq!(g.ctx.pool_usage().hits, 1);
+    drop(e.scratch(2048, 2048));
+    assert_eq!(g.ctx.pool_usage().hits, 1, "the oldest size made room");
+    drop(e);
+    g.ctx.clear_uploads();
+    assert_eq!(g.ctx.pool_usage().live_bytes, 0);
+}
+
+/// After its device is lost the compositor stops instead of panicking: `create_buffer_init`
+/// panics on a lost device ("Failed to get mapped range for buffer created with
+/// mapped_at_creation"), which every frame thread hit about twenty times after a device loss.
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_lost_device_stops_the_compositor_without_panicking() {
+    use crate::context::Enc;
+    let Some(g) = own_gpu() else { return };
+    let mut e = Enc::new(&g.ctx);
+    let img = e.image(64, 64);
+    let img = crate::ops::quantize(&mut e, &img, 255.0);
+    assert!(e.download(&img).is_some());
+    assert!(!g.ctx.is_retired());
+    g.ctx.device.destroy();
+    let _ = g.ctx.device.poll(wgpu::PollType::Poll);
+    assert!(g.ctx.is_retired(), "the device-lost callback retires the context");
+    assert!(g.ctx.check_health().is_err_and(|e| e.contains("lost")));
+    // Work in progress keeps going through the same calls: none of them may panic.
+    let after = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let next = crate::ops::quantize(&mut e, &img, 65535.0);
+        let _ = e.data(&[1.0, 2.0, 3.0]);
+        let _ = e.bytes(vec![1, 2, 3]);
+        let _ = g.ctx.buffer_init(None, &[0; 64], wgpu::BufferUsages::UNIFORM);
+        e.submit();
+        e.download(&next)
+    }));
+    assert!(matches!(after, Ok(None)), "no panic and no pixels from a lost device");
+    assert!(g.within_memory(|| ()).is_err());
+    let scene = Scene::new(BitDepth::default());
+    let r = Renderer::new(&scene.p, &Pattern, RenderOpts::default());
+    assert!(g.render(&r, scene.cid, Tick::ZERO).is_none(), "the CPU renders the frame");
+    assert!(g.render_display(&r, scene.cid, Tick::ZERO).is_none());
+}
+
+/// Running out of video memory abandons the work in progress (its frames render on the CPU)
+/// and leaves the compositor usable, instead of recording passes on a texture the device
+/// refused: those were validation errors, which retire the compositor for good.
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn running_out_of_video_memory_abandons_the_work_in_progress() {
+    use crate::context::Enc;
+    let Some(g) = own_gpu() else { return };
+    let scene = Scene::new(BitDepth::default());
+    let r = Renderer::new(&scene.p, &Pattern, RenderOpts::default());
+    let failed = g.within_memory(|| {
+        let mut e = Enc::new(&g.ctx);
+        let img = e.image(64, 64);
+        assert!(!e.dead());
+        // What `GpuContext::texture` does when the device refuses an allocation.
+        g.ctx.out_of_memory("synthetic");
+        assert!(e.dead());
+        let next = crate::ops::quantize(&mut e, &img, 255.0);
+        e.download(&next)
+    });
+    assert_eq!(failed.err().as_deref(), Some("out of video memory"));
+    assert!(g.ctx.check_health().is_ok(), "the device is fine: only that work was abandoned");
+    assert!(g.ctx.pool_usage().live_bytes < 1 << 20, "what was kept for reuse was released");
+    // The next frame renders on the GPU again.
+    assert!(g.within_memory(|| g.render(&r, scene.cid, Tick::ZERO)).is_ok_and(|f| f.is_some()));
+}
+
+/// Frames are admitted to the GPU while the working textures have room for them; the rest
+/// render on the CPU (frame threads start up to sixteen at once).
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn frames_are_admitted_within_the_working_budget() {
+    use crate::context::Enc;
+    let Some(g) = own_gpu() else { return };
+    // Nothing allocated yet: each frame reserves 512 MB of the 3 GB budget.
+    let mut slots: Vec<_> = (0..16).map_while(|_| g.ctx.admit_frame()).collect();
+    assert_eq!(slots.len(), 7);
+    assert!(g.ctx.admit_frame().is_none());
+    slots.pop();
+    assert!(g.ctx.admit_frame().is_some(), "a finished frame makes room");
+    slots.clear();
+    // A frame holding 1 GB of working textures leaves room for fewer.
+    let mut e = Enc::new(&g.ctx);
+    let held: Vec<_> = (0..16).map(|_| e.image(2048, 2048)).collect();
+    assert_eq!(g.ctx.pool_usage().live_bytes, 16 * 2048 * 2048 * 16);
+    let slots: Vec<_> = (0..16).map_while(|_| g.ctx.admit_frame()).collect();
+    assert_eq!(slots.len(), 5);
+    drop((held, e, slots));
+}
+
+/// A buffer whose allocation fails (here: over the device's buffer size limit; on Adreno an
+/// internal `ERROR_INITIALIZATION_FAILED`) is reported to the caller's error scope instead of
+/// panicking in `create_buffer_init`'s mapped range on a frame thread (#591).
+#[test]
+fn a_failed_buffer_allocation_is_an_error_not_a_panic() {
+    hold_gpu_lock();
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return };
+    let required_limits =
+        wgpu::Limits { max_buffer_size: 4096, max_storage_buffer_binding_size: 4096, max_uniform_buffer_binding_size: 4096, ..Default::default() };
+    let desc = wgpu::DeviceDescriptor { required_limits, ..Default::default() };
+    let (device, queue) = pollster::block_on(adapter.request_device(&desc)).expect("a device with a small buffer limit");
+    let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let made = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::context::buffer_init(&device, &queue, Some("too big"), &[0u8; 8192], wgpu::BufferUsages::STORAGE);
+        crate::context::buffer_init(&device, &queue, Some("unaligned"), &[1u8; 7], wgpu::BufferUsages::UNIFORM);
+    }));
+    let error = pollster::block_on(scope.pop());
+    assert!(made.is_ok(), "a failed allocation must not panic");
+    assert!(error.is_some(), "the failed allocation reaches the error scope");
+}
+
+/// Precomp layers (not collapsed) render their nested comp resident on the GPU
+/// (`walk::draw_precomp`): match the CPU (nested blend modes, effects inside and outside,
+/// transforms, opacity, a blend mode on the precomp layer, half resolution,
+/// two instances at different times of the same nested comp).
+#[test]
+fn nested_precomps_render_resident() {
+    for depth in [BitDepth::Bpc8, BitDepth::Bpc32] {
+        let mut s = Scene::new(depth);
+        let inner = Comp::new(60, 40, FrameRate::FPS_30, Tick::from_seconds_f64(2.0));
+        let inner_id = s.p.add_item("Inner", Label::Sandstone, None, ItemKind::Comp(inner.clone().into()));
+        {
+            let mut ins = Scene { p: std::mem::take(&mut s.p), cid: inner_id, comp: inner };
+            let mut a = ins.footage(50, 30);
+            ins.effect(&mut a, "ec.blur.gaussian", &[("blurriness", n(3.0))]);
+            ins.push(a);
+            let mut b = ins.solid([0.2, 0.7, 0.4], 30, 20);
+            b.blend_mode = BlendMode::Difference;
+            set(&mut b, "transform/rotation", Value::Scalar(15.0));
+            ins.push(b);
+            s.p = ins.p;
+        }
+        let bg = s.footage(97, 61);
+        s.push(bg);
+        let mut pre = build::layer(&mut s.p, &s.comp, "Inner", LayerSource::Comp { item: inner_id }, (60, 40), None);
+        set(&mut pre, "transform/rotation", Value::Scalar(25.0));
+        set(&mut pre, "transform/opacity", Value::Scalar(80.0));
+        s.effect(&mut pre, "ec.color.levels", &[("gamma", n(1.3))]);
+        pre.blend_mode = BlendMode::Screen;
+        s.push(pre);
+        // A second instance, later in the nested comp's time.
+        let mut pre2 = build::layer(&mut s.p, &s.comp, "Inner 2", LayerSource::Comp { item: inner_id }, (60, 40), None);
+        set(&mut pre2, "transform/position", v3(70.0, 40.0));
+        pre2.start_time = Tick::from_seconds_f64(-0.5);
+        s.push(pre2);
+        check(&format!("nested precomps {depth:?}"), compare_at(&s, opts(), Tick::from_seconds_f64(0.2)), 0.0);
+        let half = RenderOpts { scale: 0.5, ..opts() };
+        check(&format!("nested precomps half {depth:?}"), compare_at(&s, half, Tick::from_seconds_f64(0.2)), 0.0);
+    }
+}
+
+/// #613: an effect kernel the device's shader compiler rejects (FXC on DirectX 12 aborting on
+/// `pointwise`) no longer turns the whole GPU compositor off: the context is built without it,
+/// lists it, and the effects that need it render on the CPU, matching the CPU render.
+#[test]
+fn effects_whose_kernels_failed_render_on_the_cpu() {
+    if gpu().is_none() {
+        return;
+    }
+    let Ok(mut ctx) = pollster::block_on(crate::context::GpuContext::request()) else { return };
+    ctx.drop_kernel("pointwise");
+    ctx.drop_kernel("box_h");
+    let names: Vec<&str> = ctx.unavailable_kernels().iter().map(|(e, _)| *e).collect();
+    assert_eq!(names, ["pointwise", "box_h"]);
+    let g = Gpu::from_context(ctx);
+    for depth in [BitDepth::Bpc8, BitDepth::Bpc32] {
+        let mut s = Scene::new(depth);
+        let mut l = s.footage(80, 50);
+        s.effect(&mut l, "ec.color.exposure", &[("master/exposure", n(0.7))]);
+        s.effect(&mut l, "ec.color.tint", &[("black", c(0.1, 0.0, 0.3)), ("amount", n(80.0))]);
+        s.effect(&mut l, "ec.blur.gaussian", &[("blurriness", n(5.0))]);
+        s.effect(&mut l, "ec.channel.invert", &[("blend", n(50.0))]);
+        s.push(l);
+        let cpu = Renderer::new(&s.p, &Pattern, RenderOpts { backend: Backend::Cpu, ..opts() }).comp_frame_cpu(s.cid, Tick::ZERO);
+        let mut r = Renderer::new(&s.p, &Pattern, RenderOpts { backend: Backend::Gpu, ..opts() });
+        r.accel = Some(&g);
+        let img = g.render(&r, s.cid, Tick::ZERO).expect("the GPU renders the frame");
+        let mut d = diff(&cpu, &img, tolerance(depth));
+        d.quantized = depth != BitDepth::Bpc32;
+        check(&format!("missing kernels {depth:?}"), Some(d), 0.0);
+    }
 }

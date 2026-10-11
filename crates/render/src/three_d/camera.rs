@@ -181,10 +181,7 @@ pub fn layer_rotation(ctx: &EvalCtx, layer: &Layer) -> Mat4 {
 
 /// World matrix of a layer's parent chain (identity when unparented).
 pub fn parent_world(ctx: &EvalCtx, layer: &Layer) -> Mat4 {
-    match layer.parent.and_then(|p| ctx.comp.layer(p)) {
-        Some(p) => ctx.world_matrix(p),
-        None => Mat4::IDENTITY,
-    }
+    ctx.parent_matrix(layer)
 }
 
 /// Rotation (local → parent) of a frame whose +z is `fwd` and whose +y is as close to

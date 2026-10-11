@@ -26,6 +26,7 @@ mod distort2;
 mod distort3;
 pub mod distort4;
 pub mod face_track;
+pub mod fidelity;
 mod generate;
 mod generate2;
 mod generate3;
@@ -77,7 +78,7 @@ pub use color2::{Curve, auto_correct_settings, color_link_mode, color_link_sampl
 pub use color3::OffsetCurve;
 pub use distort::transform_shutter;
 pub use distort2::{MAGNIFY_MODES, bezier_grid, parse_mesh};
-pub use distort3::{RESHAPE_POINTS, ReshapeSetup, SmearSetup, reshape_setup, smear_setup, warp_inverse_map};
+pub use distort3::{RESHAPE_POINTS, ReshapeSetup, SmearSetup, cc_smear_pad, reshape_setup, smear_setup, warp_inverse_map};
 pub use distort4::liquify_mesh;
 use effectcraft_keyframe::Value;
 use effectcraft_project::build::Ids;
@@ -110,7 +111,7 @@ pub use ocio::color_stabilizer_maps;
 // GPU effects, part B (3D Channel, Immersive Video, colour management, simulation render passes).
 pub use channel3d::{CRYPTO_LAYERS, id_color, selection_hashes};
 pub use ocio::{ColorOp, Straight, Tf, color_program};
-pub use sim::{Acc, Blob, Bubble, Post, Shape, Sprite, SpritePlan, Tint, bubble_list, drizzle_drops, mercury_blobs, sprite_plan};
+pub use sim::{Acc, Blob, Bubble, Post, Shape, Sprite, SpritePlan, Tint, bubble_list, drizzle_drops, mercury_blobs, particle_world_textured, sprite_plan};
 pub use sim2::{
     CausticsSetup, FoamDisc, FoamEnv, FoamPlan, Piece, PiecePlan, PieceTex, PixelPlan, WavePlan, Waves, caustics_setup, foam_full_plan, piece_plan, pixel_plan,
     wave_world_plan,
@@ -297,10 +298,40 @@ pub struct LayerPixels {
     pub size: [f64; 2],
 }
 
+/// [`LayerPixels`] sharing the layer's rendered buffer instead of owning a copy of it, for
+/// effects that only read it (a particle system showing a layer at each particle's birth frame
+/// reads hundreds of them per frame). `offset` is where layer coordinate (0, 0) falls in the
+/// buffer, in place of the buffer's own.
+#[derive(Clone, Debug)]
+pub struct LayerView {
+    pub buf: std::sync::Arc<Buf>,
+    pub offset: [f64; 2],
+    pub size: [f64; 2],
+}
+
+impl LayerView {
+    /// [`Buf::to_px`] through this view's offset.
+    pub fn to_px(&self, p: [f64; 2]) -> (f64, f64) {
+        (p[0] * self.buf.scale + self.offset[0], p[1] * self.buf.scale + self.offset[1])
+    }
+}
+
+impl From<LayerPixels> for LayerView {
+    fn from(p: LayerPixels) -> LayerView {
+        LayerView { offset: p.buf.offset, size: p.size, buf: std::sync::Arc::new(p.buf) }
+    }
+}
+
 /// Services the renderer offers effects that look beyond their own pixels.
 pub trait EffectHost: Sync {
+    /// Pixels entering the effect stack, in effect space, before any effects. For an
+    /// adjustment layer this is the composition below it, in the effect working space.
+    fn original(&self) -> Option<&Buf> {
+        None
+    }
+
     /// Layer `id` of the same composition at the current comp time. `masks_and_effects`
-    /// selects "Effects & Masks" over "Source". `None` for missing/self/recursive references.
+    /// selects "Effects & Masks" over "Source". `None` for missing/recursive references; own Source reads are supported.
     fn layer(&self, id: u64, masks_and_effects: bool) -> Option<LayerPixels>;
     /// `frames` stereo sample frames (interleaved L R …) of layer `id`'s audio starting at comp
     /// time `start` seconds, at `rate` Hz. `None` when the layer has no audio.
@@ -322,6 +353,14 @@ pub trait EffectHost: Sync {
     fn layer_at(&self, _id: u64, _comp_time: f64, _masks_and_effects: bool) -> Option<LayerPixels> {
         None
     }
+    /// [`EffectHost::layer`] to read only: the renderer shares its buffer instead of copying it.
+    fn layer_view(&self, id: u64, masks_and_effects: bool) -> Option<LayerView> {
+        self.layer(id, masks_and_effects).map(LayerView::from)
+    }
+    /// [`EffectHost::layer_at`] to read only (see [`EffectHost::layer_view`]).
+    fn layer_view_at(&self, id: u64, comp_time: f64, masks_and_effects: bool) -> Option<LayerView> {
+        self.layer_at(id, comp_time, masks_and_effects).map(LayerView::from)
+    }
     /// Auxiliary 3D channels (depth, object / material IDs, normals, Cryptomatte, any named
     /// EXR channel) of the effect's own layer source at the current time, in layer space (see
     /// [`AuxChannels`]). `None` when the source has none (the 3D Channel effects then pass the
@@ -334,8 +373,11 @@ pub trait EffectHost: Sync {
     fn comp_scene(&self) -> Option<CompScene> {
         None
     }
-    /// The running effect's own parameters evaluated at another **layer time** (Radio Waves'
-    /// Parameters Are Set At: Birth). `None` when unavailable.
+    /// Stable fingerprint of this effect's complete animation, or zero when dependencies are unknown.
+    fn params_revision(&self) -> u64 {
+        0
+    }
+    /// The running effect's parameters at another layer time; `None` when unavailable.
     fn params_at(&self, _layer_time: f64) -> Option<Params> {
         None
     }
@@ -354,6 +396,8 @@ pub struct EffectEnv<'a> {
     pub host: Option<&'a dyn EffectHost>,
     /// Composition time in seconds.
     pub comp_time: f64,
+    /// The effect layer's in point in composition seconds (texture animations may start here).
+    pub layer_in_point: f64,
     /// Composition frame rate (0 when unknown).
     pub frame_rate: f64,
     /// Index of the running effect in its layer's stack (for [`EffectHost::self_at`]).
@@ -366,7 +410,24 @@ pub struct EffectEnv<'a> {
     /// comp's and the layer's motion blur switches are on (Transform's Use Composition's
     /// Shutter Angle).
     pub shutter: Option<(f64, f64, u32)>,
+    /// Set for the effects in [`QUANTIZES`] when the comp is 8 or 16 bpc: the number of levels
+    /// to round the output to ([`effectcraft_raster::quantize_px`]) while writing it, which
+    /// saves the renderer a pass over the buffer after the effect.
+    pub levels: Option<f32>,
+    /// Set for the effects in [`TAKES_SOLID_INPUT`] when their input is one colour everywhere
+    /// (the first effect on an unmasked solid): that pixel. The buffer then has the right size
+    /// but unspecified pixels, which the effect must not read and must all write.
+    pub solid_input: Option<[f32; 4]>,
 }
+
+/// Effects that write every pixel and can take their input as one colour
+/// ([`EffectEnv::solid_input`]) instead of reading it: the renderer then skips filling the solid
+/// they run on, a pass over the whole layer.
+pub const TAKES_SOLID_INPUT: [&str; 2] = ["ec.noise.fractal", "ec.noise.turbulent"];
+
+/// Effects that round their output to [`EffectEnv::levels`] themselves. The renderer gives them
+/// pixels already on that grid; each must leave every pixel on it.
+pub const QUANTIZES: [&str; 5] = ["ec.noise.fractal", "ec.noise.turbulent", "ec.color.tritone", "ec.color.colorbalancehls", "ec.color.curves"];
 
 /// What an effect gets to render with.
 pub struct EffectCtx<'a> {
@@ -422,6 +483,10 @@ pub(crate) fn p(id: &'static str, name: &'static str, default: Value, ui: ParamU
 }
 pub(crate) fn slider(min: f64, max: f64, smin: f64, smax: f64, decimals: u8) -> ParamUi {
     ParamUi::Slider { min, max, slider_min: smin, slider_max: smax, decimals }
+}
+/// A file parameter offering files with these extensions (Effect Controls' Choose…).
+pub(crate) fn file_ui(exts: &[&str]) -> ParamUi {
+    ParamUi::File { filters: exts.iter().map(|s| s.to_string()).collect() }
 }
 pub(crate) fn popup(opts: &[&str]) -> ParamUi {
     ParamUi::Popup { options: opts.iter().map(|s| s.to_string()).collect() }
@@ -1201,6 +1266,57 @@ pub(crate) fn run_fx(id: &str, vals: &[(&str, Value)], img: Image, time: f64, en
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An effect told its input is one colour ([`TAKES_SOLID_INPUT`]) never reads the buffer:
+    /// whatever the buffer holds, it writes what it would on a buffer filled with that colour.
+    #[test]
+    fn solid_input_effects_do_not_read_their_buffer() {
+        let px = [0.2, 0.4, 0.6, 1.0];
+        let junk = || {
+            let mut img = Image::new(40, 24);
+            img.data.iter_mut().enumerate().for_each(|(i, p)| *p = [f32::NAN, i as f32, -3.0, 0.5]);
+            img
+        };
+        for id in TAKES_SOLID_INPUT {
+            for vals in [
+                vec![],
+                vec![("blendingMode", Value::Enum(1))],
+                vec![("blendingMode", Value::Enum(3)), ("opacity", Value::Scalar(40.0)), ("blend", Value::Scalar(25.0))],
+            ] {
+                let filled = run_fx(id, &vals, Image::filled(40, 24, px), 0.25, EffectEnv::default()).img;
+                let told = run_fx(id, &vals, junk(), 0.25, EffectEnv { solid_input: Some(px), ..Default::default() }).img;
+                assert!(told == filled, "{id} {vals:?}");
+            }
+        }
+    }
+
+    /// An effect that rounds its own output ([`QUANTIZES`]) leaves the pixels the renderer's
+    /// pass over its output would: every one on the grid, bit for bit.
+    #[test]
+    fn self_quantising_effects_match_a_pass_over_their_output() {
+        let (levels, inv) = (255.0f32, 1.0 / 255.0);
+        let mut img = Image::new(48, 32);
+        for (i, p) in img.data.iter_mut().enumerate() {
+            let a = [0.0, 0.25, 0.6, 1.0][(i / 7) % 4];
+            *p = effectcraft_raster::quantize_px([a * ((i % 11) as f32 / 10.0), a * ((i % 5) as f32 / 4.0), a * 0.37, a], levels, inv);
+        }
+        let cases: [(&str, Vec<(&str, Value)>); 7] = [
+            ("ec.noise.fractal", vec![]),
+            ("ec.noise.fractal", vec![("blendingMode", Value::Enum(5)), ("opacity", Value::Scalar(60.0))]),
+            ("ec.noise.turbulent", vec![]),
+            ("ec.color.tritone", vec![("blend", Value::Scalar(30.0))]),
+            ("ec.color.colorbalancehls", vec![("hue", Value::Scalar(40.0)), ("lightness", Value::Scalar(-20.0)), ("saturation", Value::Scalar(35.0))]),
+            ("ec.color.curves", vec![]),
+            ("ec.color.curves", vec![("rgb", Value::Str("0,0.1;0.5,0.7;1,0.9".into())), ("alpha", Value::Str("0,0.2;1,1".into()))]),
+        ];
+        assert!(QUANTIZES.iter().all(|id| cases.iter().any(|c| c.0 == *id)), "every self-quantising effect is checked");
+        for (id, vals) in &cases {
+            let mut two = run_fx(id, vals, img.clone(), 0.5, EffectEnv::default()).img;
+            two.data.iter_mut().for_each(|p| *p = effectcraft_raster::quantize_px(*p, levels, inv));
+            let one = run_fx(id, vals, img.clone(), 0.5, EffectEnv { levels: Some(levels), ..Default::default() }).img;
+            assert!(one == two, "{id} {vals:?}");
+        }
+    }
 
     #[test]
     fn run_fx_passthrough() {

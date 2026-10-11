@@ -26,9 +26,13 @@ fn rows(m: &Mat3) -> [[f32; 4]; 3] {
 }
 
 /// Box-filter halving (minification pre-filter).
-pub fn half(e: &mut Enc, src: &GpuImage) -> GpuImage {
-    let out = e.scratch(src.width.div_ceil(2).max(1), src.height.div_ceil(2).max(1));
-    e.pixels("half", &Params::default(), src, None, &out, None);
+fn half(e: &mut Enc, src: &GpuImage, axes: [bool; 2]) -> GpuImage {
+    let step_x = if axes[0] { 2 } else { 1 };
+    let step_y = if axes[1] { 2 } else { 1 };
+    let out = e.scratch(src.width.div_ceil(step_x).max(1), src.height.div_ceil(step_y).max(1));
+    let mut p = Params::default();
+    p.u[0] = [step_x, step_y, 0, 0];
+    e.pixels("half", &p, src, None, &out, None);
     out
 }
 
@@ -67,20 +71,26 @@ pub fn warp_q(
         return dst.clone();
     }
     let Some(inv0) = m.inverse() else { return dst.clone() };
-    // Minification: pick a pre-filtered level so sampling doesn't alias.
-    let scale = m.mean_scale();
+    // Match raster::warp: filter each source axis by its inverse-transform footprint.
+    let mut footprint = [inv0.0[0][0].hypot(inv0.0[0][1]), inv0.0[1][0].hypot(inv0.0[1][1])];
+    let mut factors = [1.0; 2];
     let mut img = src.clone();
     let mut inv = inv0;
-    if scale < 0.5 && m.is_affine() {
-        let mut s = scale * 2.0;
-        let mut f = 0.5;
-        img = half(e, src);
-        while s < 0.5 && img.width > 1 && img.height > 1 {
-            img = half(e, &img);
-            f *= 0.5;
-            s *= 2.0;
+    if m.is_affine() {
+        loop {
+            let axes = [footprint[0] > 2.0 && img.width > 1, footprint[1] > 2.0 && img.height > 1];
+            if !axes[0] && !axes[1] {
+                break;
+            }
+            img = half(e, &img, axes);
+            for axis in 0..2 {
+                if axes[axis] {
+                    footprint[axis] *= 0.5;
+                    factors[axis] *= 0.5;
+                }
+            }
         }
-        inv = Mat3::scale(vec2(f, f)) * inv;
+        inv = Mat3::scale(vec2(factors[0], factors[1])) * inv;
     }
     let bounds = m.map_rect(&Rect::from_size(src.width as f64, src.height as f64)).inflate(1.0).round_out();
     let area = bounds.intersect(&Rect::from_size(dst.width as f64, dst.height as f64));
@@ -131,10 +141,14 @@ pub fn matte(e: &mut Enc, iso: &GpuImage, matte: &GpuImage, kind: MatteKind) -> 
     out
 }
 
-/// Preserve Transparency: multiply by the alpha below.
-pub fn preserve(e: &mut Enc, iso: &GpuImage, canvas: &GpuImage) -> GpuImage {
-    let out = e.scratch(iso.width, iso.height);
-    e.pixels("preserve", &Params::default(), iso, Some(canvas), &out, None);
+/// Blend a clipping layer while retaining the coverage below it.
+pub fn preserve(e: &mut Enc, iso: &GpuImage, canvas: &GpuImage, mode: BlendMode, opacity: f32, seed: u32, levels: Option<f32>) -> GpuImage {
+    let mut p = Params::default();
+    p.u[0] = [mode_id(mode), 0, seed, 0];
+    p.f[0] = [opacity, levels.unwrap_or(0.0), levels.map_or(0.0, |v| 1.0 / v), 0.0];
+    let mut out = e.scratch(iso.width, iso.height);
+    e.pixels("preserve", &p, iso, Some(canvas), &out, None);
+    out.levels = levels;
     out
 }
 
@@ -204,4 +218,36 @@ pub fn convert(e: &mut Enc, img: &GpuImage, c: &Conversion) -> GpuImage {
     let out = e.scratch(img.width, img.height);
     e.pixels("convert", &p, img, None, &out, None);
     out
+}
+
+#[cfg(test)]
+mod round_one_parity {
+    use effectcraft_keyframe::Value;
+    use effectcraft_project::BitDepth;
+    use effectcraft_time::Tick;
+
+    use crate::tests::{Scene, check, compare_at, effect_case, n, opts, set};
+
+    #[test]
+    fn nonuniform_minification_matches_cpu() {
+        for (w, h, scale) in [(1024, 61, [8.0, 100.0, 100.0]), (97, 1024, [100.0, 4.0, 100.0]), (1024, 1, [8.0, 100.0, 100.0])] {
+            for rotation in [0.0, 17.0] {
+                let mut s = Scene::new(BitDepth::Bpc32);
+                let mut layer = s.footage(w, h);
+                set(&mut layer, "transform/scale", Value::Vec3(scale));
+                set(&mut layer, "transform/rotation", n(rotation));
+                s.push(layer);
+                check("per-axis minification", compare_at(&s, opts(), Tick::ZERO), 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn inverted_noise_with_brightness_matches_cpu() {
+        for id in ["ec.noise.fractal", "ec.noise.turbulent"] {
+            for overflow in 0..4 {
+                effect_case(id, &[("invert", Value::Bool(true)), ("brightness", n(-69.0)), ("contrast", n(238.0)), ("overflow", Value::Enum(overflow))]);
+            }
+        }
+    }
 }

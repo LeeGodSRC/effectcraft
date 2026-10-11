@@ -12,12 +12,20 @@
 
 // Built everywhere so its tests run on every platform; only Linux AppImages use it.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod allocator;
+mod appearance;
 mod appimage;
+#[cfg(target_os = "macos")]
+mod apple_events;
 mod audio_out;
 mod control_server;
+mod device_loss;
 mod launch_guard;
 #[cfg(target_os = "macos")]
 mod native_menu;
+// Built everywhere so it stays checked; only the macOS app uses it.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod sheet_dialogs;
 
 use effectcraft_ui_egui::EffectcraftApp;
 use serde_json::json;
@@ -34,6 +42,22 @@ fn app_icon() -> egui::IconData {
     #[cfg(not(target_os = "macos"))]
     let png: &[u8] = ICON_PNG;
     eframe::icon_data::from_png_bytes(png).unwrap_or_default()
+}
+
+/// Both native JSON projects and Save a Copy As XML projects are openable on launch.
+/// Keep this classification shared by project opening and the subsequent media-import pass.
+fn is_project_file(path: &str) -> bool {
+    std::path::Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ["ecproj", "ecprojx", "aep", "aepx"].iter().any(|e| ext.eq_ignore_ascii_case(e)))
+}
+
+/// winit 0.30 cannot deliver native Wayland file drops. XWayland can.
+#[cfg(target_os = "linux")]
+fn wayland_drop_notice(wayland_display: Option<&std::ffi::OsStr>, backend: Option<&std::ffi::OsStr>) -> Option<&'static str> {
+    (wayland_display.is_some_and(|v| !v.is_empty()) && backend != Some(std::ffi::OsStr::new("x11")))
+        .then_some("Native Wayland file drops are unavailable. Use File ▸ Import ▸ File… or run via XWayland (see README, Linux).")
 }
 
 /// The command line.
@@ -66,6 +90,8 @@ fn parse_args(args: impl IntoIterator<Item = String>, env_port: Option<String>) 
 }
 
 fn main() -> eframe::Result {
+    // Before anything is opened: this may start the program again (see the module).
+    allocator::tune();
     // Help ▸ Enable Logging writes through this logger; warnings feed the compatibility report.
     effectcraft_engine::logging::install();
     effectcraft_engine::logging::install_panic_hook();
@@ -78,8 +104,8 @@ fn main() -> eframe::Result {
     // Wayland shows the window's icon from its desktop entry: an AppImage brings its own.
     #[cfg(target_os = "linux")]
     appimage::integrate_from_env(ICON_PNG);
-    // Settings ▸ Startup & Repair ▸ Window Graphics, switched to OpenGL when the last launch's
-    // window never drew (a crashing graphics driver, #243).
+    // Settings ▸ Startup & Repair ▸ Window Graphics, switched to OpenGL when the last launch
+    // stopped as its window opened (a crashing graphics driver, #243).
     let mut launch = launch_guard::Launch::begin(effectcraft_host::config_dir().as_deref(), std::env::var_os("WGPU_BACKEND").is_some());
     let on_gl = launch.backends == Some(eframe::wgpu::Backends::GL);
     let notice = launch.notice.take();
@@ -101,6 +127,12 @@ fn main() -> eframe::Result {
     // Start-up milestones: with `RUST_LOG=info` they go to stderr, so a window that never
     // appears shows how far start-up got (#234).
     log::info!("effectcraft {}: opening the window", env!("CARGO_PKG_VERSION"));
+    // Registered before the event loop starts, so it catches the Finder event that launched us as
+    // well as later ones. Lives until the event loop returns; the app creator only borrows it.
+    #[cfg(target_os = "macos")]
+    let apple_events = apple_events::AppleEvents::install();
+    #[cfg(target_os = "macos")]
+    let apple_events = &apple_events;
     let result = eframe::run_native(
         "EffectCraft",
         options,
@@ -125,6 +157,7 @@ fn main() -> eframe::Result {
                 rs.device.set_device_lost_callback(move |reason, message| {
                     lost.report(&format!("GPU device lost ({reason:?}): {message}"), true);
                 });
+                device_loss::simulate_from_env(&rs.device, &cc.egui_ctx);
             }
             let mut session = effectcraft_host::session();
             // Lazy open and non-blocking auto-save: footage is checked and auto-saves are
@@ -143,7 +176,7 @@ fn main() -> eframe::Result {
             }
             session.load_settings();
             let recovery = if control_port.is_none() { session.begin_recovery() } else { None };
-            let project = files.iter().find(|f| f.ends_with(".ecproj")).cloned();
+            let project = files.iter().find(|f| is_project_file(f)).cloned();
             if let Some(p) = project {
                 if let Err(e) = session.execute("file.open", json!({"path": p})) {
                     eprintln!("effectcraft: {e}");
@@ -151,7 +184,7 @@ fn main() -> eframe::Result {
             } else if demo {
                 let _ = session.execute("file.openDemoProject", json!({}));
             }
-            let media: Vec<String> = files.iter().filter(|f| !f.ends_with(".ecproj")).cloned().collect();
+            let media: Vec<String> = files.iter().filter(|f| !is_project_file(f)).cloned().collect();
             if !media.is_empty()
                 && let Err(e) = session.execute("file.import", json!({"paths": media}))
             {
@@ -162,13 +195,33 @@ fn main() -> eframe::Result {
             // reported in a toast and forgotten).
             let _ = session.execute("window.restoreScriptPanels", json!({}));
             let mut app = EffectcraftApp::new(session);
+            // A lost device can't be recreated under eframe, whose next paint aborts the
+            // process: the frontend saves a recovery copy and the app restarts from here.
+            let leave = device_loss::Leave::new(app.recovery_slot(), gpu_failures.clone(), control_port);
+            leave.install_panic_hook();
+            app.hooks.presentation_lost = Some(Box::new(move |lost| leave.now(&lost.reason, lost.project.as_deref(), lost.recovery.as_ref())));
             app.set_gpu_failure_bridge(gpu_failures);
             app.ui.start_screen = show_home;
             if let Some(n) = notice {
                 app.ui.status = n;
             }
+            // Restarted after a lost device: compositing on the GPU may be what lost it.
+            if let Some(n) = device_loss::notice_from_env() {
+                log::warn!("{n}");
+                app.disable_gpu_compositor("GPU compositing is off for this session: the graphics device was lost");
+                app.ui.status = n;
+            }
+            if app.session.last_aep_report.as_ref().is_some_and(|r| r.has_issues()) {
+                app.dialog = Some(effectcraft_ui_egui::Dialog::AepReport);
+            }
             if let Some(r) = recovery {
                 app.offer_recovery(r);
+            }
+            #[cfg(target_os = "linux")]
+            if let Some(note) = wayland_drop_notice(std::env::var_os("WAYLAND_DISPLAY").as_deref(), std::env::var_os("WINIT_UNIX_BACKEND").as_deref())
+                && app.ui.status.is_empty()
+            {
+                app.ui.status = note.into();
             }
             app.hooks.pick_files = Some(Box::new(|exts: &[&str]| {
                 rfd::FileDialog::new().add_filter("Media", exts).pick_files().unwrap_or_default().into_iter().map(|p| p.to_string_lossy().to_string()).collect()
@@ -176,9 +229,31 @@ fn main() -> eframe::Result {
             app.hooks.pick_save = Some(Box::new(|name: &str| {
                 rfd::FileDialog::new().add_filter("EffectCraft Project", &["ecproj"]).set_file_name(name).save_file().map(|p| p.to_string_lossy().to_string())
             }));
+            // The window closes after a lost graphics device (#591); say why, unless an agent drives
+            // the app through the control channel.
+            if control_port.is_none() {
+                app.hooks.device_lost = Some(Box::new(|saved: Option<Result<String, String>>| {
+                    let saved = match saved {
+                        Some(Ok(path)) => format!("\n\nYour unsaved changes were saved to:\n{path}\n\nReopen EffectCraft to recover them."),
+                        Some(Err(e)) => format!("\n\nYour unsaved changes could not be saved ({e})."),
+                        None => String::new(),
+                    };
+                    rfd::MessageDialog::new()
+                        .set_level(rfd::MessageLevel::Error)
+                        .set_title("EffectCraft: graphics device lost")
+                        .set_description(format!("The graphics driver stopped responding, so EffectCraft has to close.{saved}"))
+                        .show();
+                }));
+            }
             app.hooks.pick_open_project = Some(Box::new(|| {
-                rfd::FileDialog::new().add_filter("EffectCraft Project", &["ecproj", "ecprojx"]).pick_file().map(|p| p.to_string_lossy().to_string())
+                rfd::FileDialog::new()
+                    .add_filter("All Projects", &["ecproj", "ecprojx", "aep", "aepx"])
+                    .add_filter("After Effects Project", &["aep", "aepx"])
+                    .add_filter("EffectCraft Project", &["ecproj", "ecprojx"])
+                    .pick_file()
+                    .map(|p| p.to_string_lossy().to_string())
             }));
+            app.hooks.system_theme = appearance::service();
             app.hooks.audio_device = Some(Box::new(audio_out::open));
             app.hooks.audio_devices = Some(Box::new(audio_out::devices));
             app.hooks.pick_folder = Some(Box::new(|| rfd::FileDialog::new().pick_folder().map(|p| p.to_string_lossy().to_string())));
@@ -195,6 +270,9 @@ fn main() -> eframe::Result {
             }));
             #[cfg(target_os = "macos")]
             {
+                // The commands' file dialogs open as sheets instead of nested modal loops (#511).
+                let ctx = cc.egui_ctx.clone();
+                app.hooks.file_dialog_async = Some(Box::new(move |dialog, done| sheet_dialogs::show(dialog, done, ctx.clone())));
                 app.hooks.app_action = Some(Box::new(native_menu::app_action));
                 app.hooks.clipboard_text = Some(Box::new(native_menu::clipboard_text));
             }
@@ -207,6 +285,8 @@ fn main() -> eframe::Result {
             Ok(Box::new(Desktop {
                 #[cfg(target_os = "macos")]
                 menu: native_menu::NativeBar::new(&cc.egui_ctx),
+                #[cfg(target_os = "macos")]
+                apple_events: apple_events.connect(&cc.egui_ctx),
                 app,
                 launch,
                 drawn: false,
@@ -236,6 +316,9 @@ fn wgpu_options(backends: Option<eframe::wgpu::Backends>) -> eframe::WgpuConfigu
         if let Some(b) = backends {
             setup.instance_descriptor.backends = b;
         }
+        // Refuse new textures and buffers with an error near the driver's memory budget; past
+        // it the driver fails command submission, which loses the device and the window.
+        setup.instance_descriptor.memory_budget_thresholds.for_resource_creation = Some(effectcraft_ui_egui::gpu_failure::MEMORY_BUDGET_PERCENT);
         setup.device_descriptor = std::sync::Arc::new(|adapter| eframe::wgpu::DeviceDescriptor {
             label: Some("EffectCraft device"),
             required_limits: device_limits(adapter.limits()),
@@ -274,6 +357,9 @@ struct Desktop {
     app: EffectcraftApp,
     #[cfg(target_os = "macos")]
     menu: native_menu::NativeBar,
+    /// Documents opened from Finder, the Dock or `open` (macOS).
+    #[cfg(target_os = "macos")]
+    apple_events: apple_events::Opened,
     launch: launch_guard::Launch,
     /// The first frame was drawn (logged once).
     drawn: bool,
@@ -288,18 +374,27 @@ impl eframe::App for Desktop {
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         self.app.ui(ui, frame);
+        // A device lost during this frame: leave before eframe paints through it.
+        self.app.poll_gpu_failure(ui.ctx());
         if !self.drawn {
             self.drawn = true;
-            self.launch.drawn();
             log::info!("first frame drawn");
+        }
+        // The launch guard's marker goes once the window has kept drawing for a few seconds: a
+        // driver may still crash as the window is shown and its surface re-created.
+        if let Some(left) = self.launch.frame_drawn() {
+            ui.ctx().request_repaint_after(left);
         }
     }
 
     fn on_exit(&mut self) {
+        self.launch.exited();
         self.app.on_exit();
     }
 
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        #[cfg(target_os = "macos")]
+        self.apple_events.feed(self.app.is_ready(), ctx, raw_input);
         self.app.raw_input_hook(ctx, raw_input);
     }
 }
@@ -340,6 +435,17 @@ mod tests {
         parse_args(args.iter().map(|a| a.to_string()), None)
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wayland_drop_notice_recommends_import_or_xwayland() {
+        use std::ffi::OsStr;
+        let warning = super::wayland_drop_notice(Some(OsStr::new("wayland-0")), None).unwrap();
+        assert!(warning.contains("File ▸ Import") && warning.contains("XWayland"));
+        assert!(super::wayland_drop_notice(None, None).is_none());
+        assert!(super::wayland_drop_notice(Some(OsStr::new("")), None).is_none());
+        assert!(super::wayland_drop_notice(Some(OsStr::new("wayland-0")), Some(OsStr::new("x11"))).is_none());
+    }
+
     /// The window's device never asks for more than the adapter offers (#198).
     #[test]
     fn device_limits_fit_the_adapter() {
@@ -351,6 +457,20 @@ mod tests {
         }
         let big = Limits { max_texture_dimension_2d: 32768, ..Limits::default() };
         assert_eq!(super::device_limits(big).max_texture_dimension_2d, 16384);
+    }
+
+    /// A positional .ecprojx is a project file, not an unsupported media import (#528).
+    #[test]
+    fn launch_classifies_xml_and_json_projects_as_projects() {
+        for path in ["Copy.ecprojx", "/tmp/Scene.ecproj", "C:\\\\work\\\\Shot.ECPROJX"] {
+            assert!(super::is_project_file(path), "{path}");
+        }
+        for path in ["scene.ecprojx.png", "scene.mp4", "scene", "copy.ecprojx.bak"] {
+            assert!(!super::is_project_file(path), "{path}");
+        }
+        let files = ["scene.ecprojx".to_string(), "clip.mov".to_string()];
+        assert_eq!(files.iter().find(|f| super::is_project_file(f)).map(String::as_str), Some("scene.ecprojx"));
+        assert_eq!(files.iter().filter(|f| !super::is_project_file(f)).map(String::as_str).collect::<Vec<_>>(), vec!["clip.mov"],);
     }
 
     /// Launching without a project opens an empty project, not the demo (#204).

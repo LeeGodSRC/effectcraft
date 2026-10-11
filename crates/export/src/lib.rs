@@ -20,8 +20,9 @@
 //! Overflow and a [`StorageQuota`] hook, files that don't fit go to the overflow folders. A
 //! render log (Errors Only / Plus Settings / Plus Per Frame Info) is written next to the output.
 //!
-//! Frames are rendered in parallel batches (rayon; one batch ≈ one frame per core) and handed to
-//! the encoder in order. They share the job's layer cache, as viewer frames share the viewer's:
+//! Frames are rendered in parallel batches (rayon; a few frames at a time within the available
+//! memory, see [`batch_size`]; the job's first frame alone) and handed to the encoder in order,
+//! which encodes a batch while the next one renders. They share the job's layer cache, as viewer frames share the viewer's:
 //! static and transform-only layers render once per job. Progress is reported after each batch through a callback that can cancel
 //! the job by returning `false`. Codecs and the MP4/MOV muxer are FilmCraft's pure-Rust crates
 //! (plan ADR 0001); nothing outside this crate touches them.
@@ -103,6 +104,9 @@ pub struct JobOptions<'a> {
     pub storage: Option<&'a dyn StorageQuota>,
     /// Overflow folders, in order.
     pub overflow: Vec<String>,
+    /// Memory (bytes) the system can hand out without swapping when the job starts; bounds how
+    /// many frames render at the same time. `None`: unknown.
+    pub available_memory: Option<u64>,
 }
 
 /// Progress after a batch of frames.
@@ -200,6 +204,8 @@ async fn export_with(cx: &Cx<'_>, progress: &mut dyn FnMut(&Progress) -> bool, t
         f if f.is_sequence() => sequence(cx, comp, w, h, &mut st).await?,
         f => return Err(ExportError::Unsupported(f.label().into())),
     };
+    // The job's frames are done: the pixel buffers waiting for reuse go back to the system.
+    effectcraft_raster::pool::trim();
     report.seconds = t0.elapsed().as_secs_f64();
     report.frames = total;
     (report.width, report.height) = (w, h);
@@ -225,9 +231,24 @@ impl State<'_> {
     }
 }
 
-/// Frames per parallel batch.
-pub(crate) fn batch_size() -> u64 {
-    rayon::current_num_threads().clamp(2, 16) as u64
+/// Working buffers a frame in flight holds at its peak, in full-frame RGBA f32 images: the
+/// canvas, the layer being drawn with its effect and matte scratch, nested comp frames and the
+/// encoder's copy. Measured on effect-heavy comps; a comp with oversized precomps needs more,
+/// which is why only a quarter of the available memory is planned for.
+const FRAME_BUFFERS: u64 = 28;
+
+/// Frames per parallel batch: one for every four threads (2 to 4), as many as `available` bytes of
+/// memory hold. Each frame's pixel loops are parallel themselves, so the threads stay busy with
+/// few frames in flight, and an effect-heavy frame is bound by memory traffic rather than by
+/// cores: measured on 28 threads, 2 to 12 frames at a time rendered at the same rate, the larger
+/// batches only holding more memory.
+/// The same holds when the frames composite on the GPU: 3, 4 and 5 in flight measured the same
+/// rate, and 6 overran the video memory (16 GB) and took nearly three times as long.
+pub(crate) fn batch_size(width: u32, height: u32, available: Option<u64>) -> u64 {
+    let threads = (rayon::current_num_threads() as u64 / 4).clamp(2, 4);
+    let Some(available) = available else { return threads };
+    let frame = (width.max(1) as u64).saturating_mul(height.max(1) as u64).saturating_mul(16 * FRAME_BUFFERS);
+    threads.min((available / 4 / frame).max(1))
 }
 
 /// Crop/pad 8-bit RGBA to `w`×`h` (codec rounding).
@@ -255,7 +276,7 @@ async fn sequence(cx: &Cx<'_>, comp: &Comp, w: u32, h: u32, st: &mut State<'_>) 
         Channels::Rgba if !fmt.supports_alpha() => Channels::Rgb,
         c => c,
     };
-    let batch = batch_size();
+    let batch = cx.batch();
     let mut bytes = 0u64;
     let mut i = 0;
     while i < st.total {
@@ -365,7 +386,7 @@ async fn gif_export(job: &Cx<'_>, comp: &Comp, w: u32, h: u32, st: &mut State<'_
     let cs_per_frame = 100.0 * rate.den as f64 / rate.num as f64;
     let mut clock = 0.0f64;
     let mut emitted = 0u64;
-    let batch = batch_size();
+    let batch = job.batch();
     let mut i = 0;
     while i < st.total {
         let end = (i + batch).min(st.total);

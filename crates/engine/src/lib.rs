@@ -10,12 +10,15 @@
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+pub mod aep;
+
 pub mod autosave;
 pub mod camera_track;
 pub mod commands;
 pub mod config;
 pub mod demo;
 pub mod footage_check;
+pub mod footage_reload;
 pub mod guard;
 pub mod history;
 pub mod jobs;
@@ -96,10 +99,40 @@ pub type Result<T> = std::result::Result<T, EngineError>;
 /// Host services (file access) injected by the frontend.
 pub trait Services: Send + Sync {
     fn read_file(&self, path: &str) -> std::io::Result<Vec<u8>>;
+    /// Read a project, enforcing the AEP limit even when its extension is missing.
+    /// Memory-backed hosts already hold the bytes; native hosts inspect a small header
+    /// before reading the remainder so a hostile AEP cannot exhaust memory first.
+    fn read_project_file(&self, path: &str) -> std::io::Result<Vec<u8>> {
+        if aep::is_aep_path(path) {
+            return self.read_file_limited(path, aep::MAX_FILE_BYTES);
+        }
+        let data = self.read_file(path)?;
+        if (aep::is_aep(&data) || aep::is_aepx(&data)) && data.len() > aep::MAX_FILE_BYTES {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "file exceeds import size limit"));
+        }
+        Ok(data)
+    }
+    /// Read a bounded import. Native hosts cap reads before allocation; memory-backed hosts
+    /// can use this default to enforce the same format limit.
+    fn read_file_limited(&self, path: &str, limit: usize) -> std::io::Result<Vec<u8>> {
+        let data = self.read_file(path)?;
+        if data.len() > limit {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "file exceeds import size limit"));
+        }
+        Ok(data)
+    }
+
     fn write_file(&self, path: &str, data: &[u8]) -> std::io::Result<()>;
     /// Whether a file exists (the background footage check after open).
     fn exists(&self, path: &str) -> bool {
         std::path::Path::new(path).exists()
+    }
+    /// A file's size and modification time (nanoseconds since 1970), to notice that it changed
+    /// on disk (Settings ▸ Import ▸ Reload Footage Changed on Disk); `None` when it can't be read.
+    fn stamp(&self, path: &str) -> Option<(u64, u128)> {
+        let meta = std::fs::metadata(path).ok()?;
+        let modified = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
+        Some((meta.len(), modified.as_nanos()))
     }
     /// Keep a file the app made for itself (footage extracted from a template): like
     /// [`Services::write_file`], creating its folder, but never offered as a download (web: it
@@ -128,6 +161,49 @@ pub trait Services: Send + Sync {
 /// Native filesystem.
 pub struct FsServices;
 impl Services for FsServices {
+    fn read_project_file(&self, path: &str) -> std::io::Result<Vec<u8>> {
+        use std::io::Read;
+        let mut file = std::fs::File::open(path)?;
+        let mut data = Vec::new();
+        (&mut file).take(4096).read_to_end(&mut data)?;
+        // A UTF-8 character can straddle the fixed header boundary. Recognition only
+        // needs the XML root, so retain the complete UTF-8 prefix for that check.
+        let text_header = match std::str::from_utf8(&data) {
+            Ok(_) => data.as_slice(),
+            Err(error) => data.get(..error.valid_up_to()).unwrap_or_default(),
+        };
+        if aep::is_aep_path(path) || aep::is_aep(&data) || aep::is_aepx(text_header) {
+            let limit = aep::MAX_FILE_BYTES;
+            if file.metadata()?.len() > limit as u64 {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "file exceeds import size limit"));
+            }
+            // Bound the same open file as well: it may grow after the metadata check.
+            let remaining = limit.saturating_add(1).saturating_sub(data.len());
+            file.take(remaining as u64).read_to_end(&mut data)?;
+            if data.len() > limit {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "file exceeds import size limit"));
+            }
+        } else {
+            // Native projects retain their existing size semantics.
+            file.read_to_end(&mut data)?;
+        }
+        Ok(data)
+    }
+
+    fn read_file_limited(&self, path: &str, limit: usize) -> std::io::Result<Vec<u8>> {
+        use std::io::Read;
+        let file = std::fs::File::open(path)?;
+        if file.metadata()?.len() > limit as u64 {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "file exceeds import size limit"));
+        }
+        let mut data = Vec::new();
+        file.take((limit as u64).saturating_add(1)).read_to_end(&mut data)?;
+        if data.len() > limit {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "file exceeds import size limit"));
+        }
+        Ok(data)
+    }
+
     fn read_file(&self, path: &str) -> std::io::Result<Vec<u8>> {
         std::fs::read(path)
     }
@@ -208,6 +284,10 @@ pub struct EditorState {
     /// The last copy was keyframes (Paste pastes keys at the CTI).
     #[serde(skip)]
     pub clip_is_keys: bool,
+    /// Values of selected unanimated properties (match path, value), copied with Edit ▸ Copy;
+    /// Paste sets the same properties of the selected layers.
+    #[serde(skip)]
+    pub value_clipboard: Vec<(String, effectcraft_keyframe::Value)>,
     /// Copied effect instances (Edit ▸ Copy with effects selected); Paste adds them to the
     /// selected layers.
     #[serde(skip)]
@@ -360,6 +440,9 @@ pub struct Session {
     /// Why there is no [`Session::accel`] (`render.backend`'s `why`): the host's reason, e.g. a
     /// headless start without `--gpu` or the compositor's setup error.
     pub accel_note: Option<String>,
+    /// The graphics adapter and backend the window draws with (`NVIDIA GeForce RTX 4070
+    /// (Vulkan)`), as the host reports it: the System Compatibility Report shows it.
+    pub window_adapter: Option<String>,
     /// Expression syntax checker (set by the host that links the expression engine).
     pub expr_check: Option<fn(&str) -> std::result::Result<(), String>>,
     pub importer: Option<Arc<dyn Importer>>,
@@ -459,7 +542,24 @@ pub struct Session {
     /// event loop (the desktop app) turn this on; headless sessions run `footage.check` when
     /// they want it.
     pub check_footage_on_open: bool,
+    /// Last report generated when opening an After Effects (`.aep` / `.aepx`) project.
+    pub last_aep_report: Option<crate::aep::AepReport>,
+    /// Original AEP sources remain write-protected even after dismissing or replacing a report.
+    pub protected_aep_sources: Vec<String>,
+    /// Each footage file's size and modification time when last seen (Settings ▸ Import ▸
+    /// Reload Footage Changed on Disk, [`footage_reload`]).
+    pub footage_stamps: std::collections::HashMap<String, footage_reload::Stamp>,
+    /// The stamps being taken on a worker thread ([`footage_reload::start_scan`]).
+    pub footage_scan: Option<footage_reload::Scan>,
+    /// How many script-issued commands are running ([`Session::execute_for_script`]): while one
+    /// is, settings that guard what scripts may do can't change (see
+    /// [`prefs::Scripting::same_permissions`]).
+    pub script_calls: ScriptCalls,
 }
+
+/// The count behind [`Session::running_for_script`]; only the engine changes it.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ScriptCalls(u32);
 
 /// A thumbnail render ([`Session::thumbnail_job`]): (width, height, RGBA8).
 pub type ThumbnailJob = Box<dyn FnOnce() -> Option<(u32, u32, Vec<u8>)> + Send>;
@@ -498,6 +598,7 @@ impl Default for Session {
             expr: None,
             accel: None,
             accel_note: None,
+            window_adapter: None,
             expr_check: None,
             importer: None,
             exporter: None,
@@ -544,6 +645,11 @@ impl Default for Session {
             next_task_id: 1,
             learn: None,
             check_footage_on_open: false,
+            last_aep_report: None,
+            protected_aep_sources: Vec::new(),
+            footage_stamps: Default::default(),
+            footage_scan: None,
+            script_calls: ScriptCalls::default(),
         }
     }
 }
@@ -584,6 +690,22 @@ impl Session {
         let spec = commands::find(id).ok_or_else(|| EngineError::UnknownCommand(id.to_string()))?;
         commands::check_params(spec, &params)?;
         self.execute(id, params)
+    }
+
+    /// [`Session::execute`] for a command a script asked for (the JavaScript engine's
+    /// `app.run`, ScriptUI callbacks…). The command and everything it runs count as the script's:
+    /// it may not change the settings that limit scripts (Settings ▸ Scripting & Expressions ▸
+    /// Application Scripting), which only the user can, from the UI, CLI or control channel.
+    pub fn execute_for_script(&mut self, id: &str, params: Value) -> Result<Value> {
+        self.script_calls.0 = self.script_calls.0.saturating_add(1);
+        let r = self.execute(id, params);
+        self.script_calls.0 = self.script_calls.0.saturating_sub(1);
+        r
+    }
+
+    /// Whether the command running was issued by a script ([`Session::execute_for_script`]).
+    pub fn running_for_script(&self) -> bool {
+        self.script_calls.0 > 0
     }
 
     pub fn is_enabled(&self, id: &str) -> bool {
@@ -934,6 +1056,8 @@ impl Session {
         self.drop_tasks();
         p.fix_next_id();
         upgrade_effects(&mut p);
+        self.last_aep_report = None;
+        self.protected_aep_sources.clear();
         self.project = Arc::new(p);
         self.history = History::default();
         self.state = EditorState { snapping: true, view_layout: 1, ..Default::default() };
@@ -1019,6 +1143,8 @@ mod tests_face;
 mod tests_fidelity;
 #[cfg(test)]
 mod tests_frame_export;
+#[cfg(test)]
+mod tests_key_metadata_order;
 #[cfg(test)]
 mod tests_keylight;
 #[cfg(test)]
@@ -1165,3 +1291,6 @@ mod tests_paint;
 mod tests_panels;
 #[cfg(test)]
 mod tests_roto;
+
+#[cfg(test)]
+mod tests_key_time;

@@ -1,5 +1,7 @@
 # Architecture
 
+> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-10 · **Change:** minor (crate table checked against `crates/`: effect count 306, VP9 inter frames) · **Target:** Adobe After Effects 2026
+
 EffectCraft is a stack of small Rust crates. The engine knows nothing about the user interface;
 the egui frontend, the command-line tool and the MCP server all sit on top of the same `Session`
 and drive it through the same command registry.
@@ -16,7 +18,7 @@ cpal or muda. Everything in L0 to L4, the egui UI and the web app also build for
 | L0 | `time` | `Tick` (254 016 000 000 per second), rational frame rates incl. NTSC, SMPTE and drop-frame timecode |
 | L0 | `geom` | Vectors, matrices, quaternions, the layer transform (anchor, position, scale, orientation, rotation) |
 | L0 | `color` | sRGB and linear, HSL/HSV, luminance, the 38 blend modes, label colors |
-| L0 | `vp9enc` | VP9 intra-frame encoder (profile 0, 8-bit 4:2:0; lossless at quality 100) for WebM export, from the VP9 bitstream specification |
+| L0 | `vp9enc` | VP9 encoder (profile 0, 8-bit 4:2:0, key and inter frames with motion search, loop filter and rate control; lossless at quality 100) for WebM export, from the VP9 bitstream specification |
 | L0 | `opusenc` | Opus encoder: RFC 6716 SILK (NB/MB/WB), hybrid (SWB/FB) and CELT (FB) modes chosen by bitrate and application (audio / voice), 48 kHz 20 ms packets, mono/stereo, and the RFC 7845 `OpusHead`, for WebM export audio |
 | L0 | `hevcenc` | HEVC (H.265) encoder from ITU-T H.265: Main / Main 10 4:2:0, IDR + P slices (quarter-pel motion, merge/AMVP), CABAC, deblocking, bitrate or constant-QP rate control, for MP4 (`hvc1`) export |
 | L0 | `av1enc` | AV1 encoder from the AV1 bitstream specification: Main profile 8/10-bit 4:2:0, key + inter frames (quarter-pel motion), deblocking, for MP4 (`av01`) and WebM export |
@@ -27,7 +29,7 @@ cpal or muda. Everything in L0 to L4, the egui UI and the web app also build for
 | L1 | `path` | Bezier paths, path operators (trim, offset, round corners, zig zag, twist, merge…), stroking, coverage masks |
 | L2 | `project` | The document: items, compositions, layers, the property tree, render queue model, `.ecproj` serde |
 | L2 | `text` | Fonts, shaping, layout, per-glyph geometry, text animators and selectors |
-| L2 | `effects` | The effect registry (241 effects) and their CPU implementations |
+| L2 | `effects` | The effect registry (306 effects) and their CPU implementations |
 | L2 | `svg` | SVG import (W3C SVG 1.1/2 static subset: shapes, paths, transforms, `use`, CSS, gradients) and rasterisation at any scale |
 | L2 | `pdf` | PDF, PDF-compatible Illustrator (`.ai`) and EPS (PostScript subset) vector footage into the `svg` render tree: paths, fills, strokes, shadings, tiling patterns, clipping, text (embedded TrueType / CFF / Type 1 / Type 3 fonts; the bundled `text` fonts for the standard 14), images, blend modes, soft masks, optional-content layers |
 | L2 | `model` | 3D models for Advanced 3D: glTF 2.0 (`.gltf`/`.glb`) and OBJ/MTL import (meshes, PBR metallic-roughness materials and textures, node hierarchy, skins, animations), parametric primitives, extruded/bevelled outline meshes and polygon triangulation |
@@ -50,6 +52,19 @@ cpal or muda. Everything in L0 to L4, the egui UI and the web app also build for
 Allowed same-layer edges: `path → keyframe, raster`, `text → path`, `pdf → svg, text`, `effects → project, text, path, track`,
 `media / expr / export / gpu → render`, `export → media`, `lottie → format`, `host → engine, script`,
 `script → engine`.
+
+The frontend uses `craft-ui::docking` for atomic layout transactions and pointer drop targets,
+and `craft-ui::layout` for bounded split geometry and resize interactions. A small adapter
+preserves EffectCraft's saved dock tree, stacked entries, floating rectangles and dynamic
+viewer/ScriptUI identities. Tab moves, edge splits, reordering, float/redock, activation and
+close operations use the shared model. The app retains composition-tab behavior, accordion
+height allocation and ScriptUI close callbacks. Lower layers cannot depend on `craft-ui`.
+
+Viewer controls retain their native widgets inside a horizontal scroll area, so narrow panels
+keep dropdowns, exposure dragging and snapshot holds reachable. Keyboard focus scrolls the
+focused control into view. Active composition breadcrumbs use the selected-row theme color.
+The `viewer_geometry` tests inspect actual painted contrast, scroll geometry and pointer/keyboard
+reachability across the three themes.
 
 ## 2. Time
 
@@ -165,12 +180,52 @@ editing one layer re-renders only that layer. Each Render Queue job keeps its ow
 for its frames. Effects that read the clock directly are declared in
 `effects::TIME_DEPENDENT`, and a test checks every registered effect against that list.
 
+**Memory traffic bounds a frame, not cores.** An effect-heavy 1080p frame makes hundreds of
+passes over 33 MB RGBA f32 buffers; measured on 28 threads, 10 threads rendered as fast as 28 and
+two processes slowed each other by the same factor. Pixel loops are row-parallel (rayon), but
+what makes a frame faster is touching less memory, and `perf stat -e cache-misses` on an export
+is the number to watch (it repeats to 1%; wall time on a busy machine does not). What keeps the
+traffic down:
+
+- Dropped images of 1 MB and more wait in a pool for the next image of about their size
+  (`raster::pool`); a buffer the caller writes in full is taken uncleared (`Image::scratch`).
+  A 1080p buffer is above the allocator's mmap threshold, so without the pool every one is
+  mapped, paged in and unmapped.
+- A layer is quantised to the comp's bit depth as it is blended (`composite_warp_quantized`), a
+  layer with a 2D track matte composites in one pass that reads buffers landing on whole pixels
+  in place (`Renderer::composite_matted`), and an unmasked whole-frame adjustment layer at 100%
+  replaces the canvas.
+- Effects listed in `effects::QUANTIZES` round their own output, and those in
+  `effects::TAKES_SOLID_INPUT` take an unmasked solid as one colour, so the renderer neither
+  fills the solid nor passes over the result again.
+- Mask feather blurs one channel, not four (`gaussian_blur_mask`).
+- A comp several layers show at the same time renders once per frame (`prewarm_precomps`), and a
+  still precomp may take half the layer cache so it is not rendered again for every frame.
+- Exports render their first frame alone (it fills the cache with what every frame shares), then
+  at most 4 frames at a time within a quarter of the available memory (`export::batch_size`).
+  Movies stream them: a frame starts when another finishes and the encoder takes them in order
+  as they arrive (`export::pipeline::Cx::stream`), so neither the renderer nor the GPU waits
+  for the slowest frame of a batch. Measured on the project above: 94 s became 80 s, GPU busy
+  80% became 92%, and peak memory 8.6 GB became 5.4 GB. More frames in flight do not help: 3,
+  4 and 5 render at the same rate (the GPU is the limit), and 6 overran 16 GB of video memory
+  and took 220 s.
+
 The viewer's **RAM preview** (`ui-egui/src/frames.rs`) keeps finished frames keyed by project
 revision, comp, frame, scale, 3D view / region of interest and a hash of the other render
 options (Draft / Fast Previews, shadows, nested switches), so frames rendered under other
 options are never shown. When the budget (Settings ▸ Memory & CPU) is full the least recently
 shown frames go first, and frames of an older revision are dropped as soon as the project
 changes. The timeline's green bar counts the frames of exactly what the viewer shows.
+The viewer's **RAM preview** (`ui-egui/src/frames.rs`) keeps finished frames keyed by comp
+content, frame, scale, 3D view / region of interest and a hash of the other render options
+(Draft / Fast Previews, shadows, nested switches). Edits preserve unaffected comps' frames,
+and undo can reuse earlier content. During rapid edits at the same time and view, the viewer
+shows the newest completed revision while the exact requested revision renders; out-of-order
+completions cannot move it backwards. This avoids freezing until a slider or layer drag stops.
+Frames at other times or with other render options are never substituted. Obsolete queued jobs
+are dropped; running jobs finish into the cache. When the budget (Settings ▸ Memory & CPU) is
+full the least recently shown frames go first. The timeline's green bar counts cached frames
+of the current content and viewer settings.
 Resolution Auto renders the pixels the magnification needs, as in After Effects (Full above
 50 %, Half down to 33.3 %, Third down to 25 %, then Quarter). Below 100 % the viewer averages
 instead of skipping pixels (Viewer Zoom Quality More Accurate): GPU frames carry a mip chain
@@ -230,7 +285,11 @@ Nulls / Nulls Follow Points take pins as well as paths, and `puppet.follow` give
 Position expression that trails the leader by a delay. The renderer flattens nested effect
 groups into `Params` keys (`effects::flatten_params`). Commands: `paint.*`, `puppet.*`.
 
-Half, Third and Quarter resolution render proportionally fewer pixels end to end.
+Half, Third and Quarter resolution render proportionally fewer pixels end to end. Footage
+starts at the render's size where the source can make it more cheaply than the full frame
+(`FootageSource::frame_at_size`): movies in opaque 4:2:0 Y'CbCr are box-filtered to half size
+before conversion (a quarter of the conversions; the result differs from converting first only
+in blocks where colours clip) and resampled from there, as other frames are from full size.
 
 **GPU compositor** (`crates/gpu`; Project Settings ▸ Video Rendering and Effects ▸ Mercury GPU
 Acceleration, the default, or Mercury Software Only; `render.backend`). The CPU renderer is the
@@ -257,7 +316,21 @@ mattes), the GPU packs the buffers into one atlas texture and one kernel does th
 fragment sort (intersecting planes, coplanar stack order), Blinn-Phong lighting, ray-cast shadows
 against the caster planes (Shadow Diffusion, Light Transmission) and blending. Adjustment layers
 run their effect stacks on the GPU-resident comp (`Renderer::run_effects_on` with an `FxTarget`):
-runs of GPU effects stay on the device and only non-GPU effects read back and upload. Advanced 3D
+runs of GPU effects stay on the device and only non-GPU effects read back and upload. Two more
+kinds of layer keep their pixels on the device (`gpu::walk`): a precomp layer that shows its
+nested comp as it is has that comp composited by the same walk (`draw_precomp`,
+`Renderer::plain_precomp`; layers showing the same frame share it, and a comp nothing moves in
+still comes from the layer cache), and a layer whose effect stack changes every frame and runs
+on the GPU in full has it run on its input and composited from there (`resident_layer`,
+`Renderer::resident_effects`), with no readback and second upload: the input is a solid filled
+on the device, a nested comp composited there, or the CPU's masked source uploaded once. Track
+matte layers take the same path, and so do the layers of a Classic 3D run
+(`Renderer::prepare_3d_run_holding`: the CPU prepares a held layer's plane from a description of
+its buffer). A 3D track matte of a 2D layer goes through the Classic 3D compositor alone
+(`Renderer::prepare_matte_3d`; Advanced 3D: drawn by the CPU renderer, `Renderer::matte_3d`).
+`effectcraft-cli render --gpu` prints the uploads and readbacks of the job
+(`Accelerator::diagnostics`): every readback stops its frame until the device answers, so they
+are what keeps the GPU waiting. Advanced 3D
 runs render on the GPU end to end (`gpu::adv3d`, `Renderer::prepare_adv_run` /
 `Accelerator::render_3d`): each motion-blur sub-sample's scene is rasterised (`advanced3d.wgsl`),
 then compute kernels (`adv3d.wgsl`) resolve the 2×2 supersampling, average the sub-samples
@@ -667,3 +740,9 @@ The before frame times were dominated by an O(layers²) menu build per visible t
 by every panel deep-cloning the active comp each frame. Left for later: per-layer structural
 sharing (so a one-layer edit doesn't copy its comp), a binary or compact project format (pretty
 JSON parsing is now the bulk of open), and rendering 5,000-layer comps faster.
+
+## Revision history
+
+| Date | Change | Summary |
+|---|---|---|
+| 2026-10-10 | minor | Status line added; crate table checked against `crates/` (every crate listed); effect count and VP9 encoder description corrected |

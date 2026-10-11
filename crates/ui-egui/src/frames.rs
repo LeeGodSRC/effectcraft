@@ -280,8 +280,11 @@ fn comp_content_with(project: &Project, comp: ItemId, addr: impl Fn(ItemId, &Arc
     h.finish()
 }
 
-/// Hash of render options (part of [`FrameKey`] and of the disk key).
+/// Hash of render options (part of [`FrameKey`] and of the disk key). The scale counts as the
+/// key's thousandths ([`FrameKey::scale`]): a series rebuilt from the key (the cache bars) has
+/// the same options as the frames rendered at 1/3 = 0.333… (#595).
 pub fn opts_hash(o: &RenderOpts) -> u64 {
+    let o = RenderOpts { scale: (o.scale * 1000.0).round() / 1000.0, ..*o };
     let mut h = disk_cache::Hash128::default();
     h.write(format!("{o:?}").as_bytes());
     h.finish() as u64
@@ -367,6 +370,8 @@ pub struct Frames {
     pub last_ms: Arc<Mutex<f64>>,
     content_keys: ContentKeys,
     gpu_retired: Arc<AtomicBool>,
+    /// Frames start only while the system has memory for them.
+    memory: Arc<crate::frame_memory::FrameMemory>,
     /// [`comp_content`] identities by (revision, comp), with the project that keeps an identity
     /// found by [`Frames::identity`] in another project.
     identities: Mutex<HashMap<(u64, u64), Identity>>,
@@ -401,6 +406,7 @@ impl Default for Frames {
             last_ms: Arc::new(Mutex::new(0.0)),
             content_keys: Arc::default(),
             gpu_retired: Arc::default(),
+            memory: crate::frame_memory::FrameMemory::new(),
             identities: Mutex::default(),
             bases: Mutex::default(),
             keepers: Mutex::default(),
@@ -541,6 +547,42 @@ impl Frames {
         Some(img)
     }
 
+    /// Prefer the exact requested frame. While an edit renders, advance to the newest completed
+    /// revision of the same comp, time, scale, view and render options instead of freezing on the
+    /// image from before the drag. Input may arrive before the viewer draws on every UI frame,
+    /// so even a fast worker cannot always finish the *latest* revision in time.
+    ///
+    /// Never move backwards when workers finish out of order, and never substitute another time
+    /// or view while scrubbing or switching comps. The exact content lookup above also means an
+    /// undo can immediately reuse an old cache entry, regardless of its original revision.
+    pub fn get_for_viewer(&self, wanted: &FrameKey, shown: Option<&FrameKey>) -> Option<(FrameKey, FrameImage)> {
+        if let Some(img) = self.get(wanted) {
+            return Some((*wanted, img));
+        }
+        let shown = shown?;
+        if shown.comp != wanted.comp || shown.frame != wanted.frame || shown.view != wanted.view || shown.revision >= wanted.revision {
+            return None;
+        }
+        let mut c = self.cache.lock().ok()?;
+        let newest = c
+            .map
+            .keys()
+            .filter(|k| {
+                k.revision > shown.revision
+                    && k.revision < wanted.revision
+                    && k.comp == wanted.comp
+                    && k.frame == wanted.frame
+                    && k.scale == wanted.scale
+                    && k.view == wanted.view
+                    && k.opts == wanted.opts
+            })
+            .max_by_key(|k| k.revision)
+            .copied()?;
+        let img = c.map.get(&newest).cloned()?;
+        c.touch(&newest);
+        Some((newest, img))
+    }
+
     /// The [`comp_content`] identity of `comp` in `project` at `revision` (taken once per
     /// revision). The project is kept while frames of that identity are cached or rendering, so
     /// the comp addresses it hashes can't be reused by other comps meanwhile.
@@ -665,6 +707,12 @@ impl Frames {
             c.bytes = 0;
             c.gpu_bytes = 0;
         }
+        // Disk keys hash the footage files' size and time, but are remembered per revision; a
+        // file reloaded from disk without a new revision (a re-rendered image sequence) must be
+        // keyed again, or the disk cache serves the frames from before.
+        if let Ok(mut k) = self.content_keys.lock() {
+            k.clear();
+        }
     }
 
     /// Queue a prefetch frame (no-op if cached or already queued/rendering).
@@ -698,8 +746,9 @@ impl Frames {
             // Only the newest viewer frame is urgent. The comp's earlier viewer frames that
             // haven't started are dropped (scrubbing: rendering every frame the pointer passed
             // would hold the workers the frame under it needs); frames already rendering finish
-            // into the cache, and the viewer shows its last frame until the new one is in
-            // (#284). Other comps' viewer frames become prefetch.
+            // into the cache. During edits the viewer advances through compatible completed
+            // revisions; scrubbing holds its last frame until the requested time is in (#284).
+            // Other comps' viewer frames become prefetch.
             q.jobs.retain(|j| {
                 let superseded = j.urgent && j.key != key && j.key.comp == key.comp;
                 if superseded {
@@ -722,10 +771,8 @@ impl Frames {
         #[cfg(not(target_arch = "wasm32"))]
         if self.remote.is_none() {
             let w = self.worker();
-            // One spawn per job; each spawn renders whichever queued job matters most right now.
-            let job = move || {
-                w.run_next();
-            };
+            // One spawn per job; each spawn renders whichever queued jobs matter most right now.
+            let job = move || w.drain();
             match &self.pool {
                 Some(pool) => pool.spawn(job),
                 None => rayon::spawn(job),
@@ -747,6 +794,7 @@ impl Frames {
             last: self.last_ms.clone(),
             content_keys: self.content_keys.clone(),
             gpu_retired: self.gpu_retired.clone(),
+            memory: self.memory.clone(),
         }
     }
 
@@ -876,12 +924,50 @@ struct Worker {
     last: Arc<Mutex<f64>>,
     content_keys: ContentKeys,
     gpu_retired: Arc<AtomicBool>,
+    memory: Arc<crate::frame_memory::FrameMemory>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+thread_local! {
+    /// This pool thread is inside [`Worker::drain`] (rendering a frame).
+    static DRAINING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Clears [`DRAINING`] when the drain ends, even by a panic.
+#[cfg(not(target_arch = "wasm32"))]
+struct Draining;
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for Draining {
+    fn drop(&mut self) {
+        DRAINING.set(false);
+    }
 }
 
 impl Worker {
+    /// Render queued jobs, most important first, until the queue is empty.
+    ///
+    /// A pool thread waiting inside a render (on a parallel loop's join) runs other pool work
+    /// meanwhile, including the spawns of newer requests: each would start a whole frame render
+    /// on top of the one waiting, with all of its buffers. Dragging a layer asks for a new frame
+    /// every UI frame, so renders piled up on every thread until memory ran out (#647). A spawn
+    /// that lands inside a render returns at once instead; the render below it takes the queued
+    /// jobs when it is done, so each thread renders one frame at a time.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn drain(&self) {
+        if DRAINING.get() {
+            return;
+        }
+        DRAINING.set(true);
+        let _reset = Draining;
+        while self.run_next() {}
+    }
+
     /// Render the queued job that matters most right now. `false` when the queue was empty.
     fn run_next(&self) -> bool {
         let Worker { queue, content_keys, .. } = self;
+        // Held until this frame is done: frames start only while the system has memory for them.
+        let _memory = self.memory.admit();
         let job = {
             let Ok(mut q) = queue.lock() else { return false };
             let Some(i) = Queue::best(&q.jobs) else { return false };
@@ -982,6 +1068,7 @@ impl Worker {
             return None;
         }
         let g = job.src.gpu.as_ref()?;
+        let _slot = g.context().admit_frame()?;
         let mut r = Renderer::new(&job.src.project, job.src.footage.as_ref(), job.opts);
         r.expr = job.src.expr.as_deref();
         r.cache = Some(&job.src.layer_cache);
@@ -1004,7 +1091,12 @@ impl Worker {
         // A failed GPU attempt may have populated intermediate entries before its scope
         // reported failure. The CPU retry must compute its own pixels from the snapshot.
         r.cache = gpu_allowed.then_some(job.src.layer_cache.as_ref());
-        let gpu = job.src.gpu.as_ref().filter(|_| gpu_allowed);
+        // Frame threads start many frames at once and a heavy comp's frame holds gigabytes of
+        // working textures: the compositor admits what its video-memory budget has room for
+        // and the rest render on the CPU, instead of exhausting video memory together (the
+        // driver then fails command submission and the device, and the window, is lost).
+        let slot = job.src.gpu.as_ref().filter(|_| gpu_allowed).and_then(|g| g.context().admit_frame());
+        let gpu = job.src.gpu.as_ref().filter(|_| slot.is_some());
         r.accel = gpu.map(|g| g as &dyn effectcraft_engine::render::Accelerator);
         // The GPU leaves the frame in a texture for the viewer; otherwise (Software Only, no
         // adapter, or a frame the GPU cannot finish here) the CPU renders it.
@@ -1129,6 +1221,50 @@ mod tests {
         assert!(frames.queue.lock().unwrap().running.is_empty());
     }
 
+    /// A frame the GPU compositor has no room for renders on the CPU, without touching the
+    /// device: sixteen frame threads each starting a heavy comp's frame on the GPU exhausted
+    /// video memory, which lost the device and with it the window.
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn a_frame_the_gpu_has_no_room_for_renders_on_the_cpu() {
+        use effectcraft_engine::Session;
+        use serde_json::json;
+        let Some(gpu) = Gpu::headless() else {
+            eprintln!("no GPU adapter: skipping");
+            return;
+        };
+        let mut s = Session::default();
+        let cid = ItemId(s.execute("comp.new", json!({"name": "A", "width": 16, "height": 16, "duration": 1})).unwrap()["comp"].as_u64().unwrap());
+        s.execute("layer.newSolid", json!({"comp": cid.0, "color": "#ff0000"})).unwrap();
+        let src = RenderSource {
+            project: s.project.clone(),
+            footage: Arc::new(effectcraft_engine::render::NoFootage),
+            expr: None,
+            layer_cache: Arc::default(),
+            gpu: Some(gpu.clone()),
+            gpu_display: false,
+            disk: None,
+        };
+        let frames = Frames::default();
+        let worker = frames.worker();
+        let opts = RenderOpts { backend: effectcraft_engine::render::Backend::Gpu, ..Default::default() };
+        let job = Job { key: key(1, 0, 0), src, comp: cid, t: Tick::ZERO, opts, urgent: false, seq: 0 };
+        let uploads = || gpu.context().transfer_stats().uploads + gpu.context().transfer_stats().readbacks;
+        // Room: the GPU composites (an upload and a readback).
+        let FrameImage::Cpu(on_gpu) = worker.render_job(&job, true) else { panic!("read back") };
+        let used = uploads();
+        assert!(used > 0, "the GPU composited the frame");
+        // No room (other frames hold the whole budget): the same pixels from the CPU.
+        let held: Vec<_> = (0..16).map_while(|_| gpu.context().admit_frame()).collect();
+        assert!(gpu.context().admit_frame().is_none());
+        let FrameImage::Cpu(on_cpu) = worker.render_job(&job, true) else { panic!("a CPU frame") };
+        assert_eq!(uploads(), used, "the device was not used");
+        assert_eq!(on_cpu.pixels, on_gpu.pixels);
+        drop(held);
+        let _ = worker.render_job(&job, true);
+        assert!(uploads() > used, "room again: back on the GPU");
+    }
+
     fn key(content: u64, frame: i64, opts: u64) -> FrameKey {
         FrameKey { revision: content, content, comp: 1, frame, scale: 1000, view: 0, opts }
     }
@@ -1186,6 +1322,80 @@ mod tests {
         assert!(footage.0.load(Ordering::SeqCst) > 0, "the render reached the footage");
         assert_eq!(f.inflight(), 0, "released");
         assert!(!f.is_cached(&key));
+    }
+
+    /// #647: a pool thread waiting inside a render (on a parallel loop) never starts another
+    /// frame render on top of it. Dragging a layer queues a frame every UI frame; renders used to
+    /// nest on every thread, each holding its buffers, until memory ran out.
+    #[test]
+    fn a_waiting_render_never_starts_another_on_its_thread() {
+        use effectcraft_engine::Session;
+        use effectcraft_engine::project::{Footage, FootageKind};
+        use effectcraft_engine::render::Image;
+        use effectcraft_engine::time::FrameRate;
+        use serde_json::json;
+        use std::cell::Cell;
+        use std::sync::atomic::AtomicUsize;
+        thread_local! {
+            static DEPTH: Cell<usize> = const { Cell::new(0) };
+        }
+        /// A decoder that works in parallel, as the renderer does: its thread joins the loop and
+        /// may wait for the parts other threads took.
+        #[derive(Default)]
+        struct Parallel {
+            calls: AtomicUsize,
+            deepest: AtomicUsize,
+        }
+        impl FootageSource for Parallel {
+            fn frame(&self, _: ItemId, _: &Footage, _: Tick) -> Option<Arc<Image>> {
+                let d = DEPTH.get() + 1;
+                DEPTH.set(d);
+                self.deepest.fetch_max(d, Ordering::SeqCst);
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                (0..64).into_par_iter().for_each(|_| std::thread::sleep(std::time::Duration::from_millis(1)));
+                DEPTH.set(d - 1);
+                Some(Arc::new(Image::new(4, 4)))
+            }
+        }
+        let mut s = Session::default();
+        let cid = ItemId(s.execute("comp.new", json!({"name": "A", "width": 8, "height": 8, "duration": 10})).unwrap()["comp"].as_u64().unwrap());
+        let clip = Footage {
+            kind: FootageKind::Video,
+            width: 4,
+            height: 4,
+            has_video: true,
+            frame_rate: FrameRate::FPS_30,
+            duration: Tick::from_seconds_f64(10.0),
+            ..Default::default()
+        };
+        let item = Arc::make_mut(&mut s.project).add_item("clip.mov", Default::default(), None, ItemKind::Footage(clip));
+        s.execute("layer.addItem", json!({"item": item.0})).unwrap();
+        let footage = Arc::new(Parallel::default());
+        let src = RenderSource {
+            project: s.project.clone(),
+            footage: footage.clone(),
+            expr: None,
+            layer_cache: Arc::default(),
+            gpu: None,
+            gpu_display: false,
+            disk: None,
+        };
+        let f = Frames::default();
+        let content = f.content_of(&s.project, s.revision, cid);
+        let frames = 60;
+        for frame in 0..frames {
+            let key = FrameKey { revision: s.revision, content, comp: cid.0, frame, scale: 1000, view: 0, opts: 0 };
+            f.request(&src, key, cid, FrameRate::FPS_30.tick_of(frame), RenderOpts::default());
+        }
+        for _ in 0..4000 {
+            if f.inflight() == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(f.inflight(), 0, "every queued frame rendered");
+        assert!(footage.calls.load(Ordering::SeqCst) >= frames as usize);
+        assert_eq!(footage.deepest.load(Ordering::SeqCst), 1, "renders nested on a waiting thread");
     }
 
     /// #284: scrubbing asks for a viewer frame at every step; a newer one drops the comp's viewer
@@ -1265,6 +1475,53 @@ mod tests {
         // A later revision with the same content finds the frame (an edit elsewhere, an undo).
         assert!(f.is_cached(&FrameKey { revision: 99, ..key(1, 0, 0) }));
         assert!(!f.is_cached(&key(3, 0, 0)));
+    }
+
+    #[test]
+    fn live_edits_present_the_newest_completed_revision_without_going_backwards() {
+        let f = Frames::default();
+        let shown = key(1, 0, 0);
+        let newest = key(3, 0, 0);
+        let wanted = key(5, 0, 0);
+        insert(&f, shown);
+        insert(&f, newest);
+        insert(&f, key(2, 0, 0)); // Older worker finishes after the newer one.
+        let displayed = f.get_for_viewer(&wanted, Some(&shown)).unwrap().0;
+        assert_eq!(displayed, newest);
+        assert!(f.get_for_viewer(&wanted, Some(&displayed)).is_none(), "never replay an older completion");
+        insert(&f, wanted);
+        assert_eq!(f.get_for_viewer(&wanted, Some(&displayed)).unwrap().0, wanted, "settle on the exact final edit");
+        // Undo reuses the content of an earlier revision immediately.
+        let undo = FrameKey { revision: 6, ..shown };
+        let reused = f.get_for_viewer(&undo, Some(&wanted)).unwrap().0;
+        assert_eq!(reused.content, shown.content);
+        assert_eq!(reused.revision, undo.revision);
+    }
+
+    #[test]
+    fn live_edits_do_not_substitute_other_times_views_or_render_settings() {
+        let f = Frames::default();
+        let shown = key(1, 0, 0);
+        let wanted = key(3, 0, 0);
+        let done = key(2, 0, 0);
+        for mismatch in [
+            FrameKey { comp: 9, ..done },
+            FrameKey { frame: 1, ..done },
+            FrameKey { scale: 500, ..done },
+            FrameKey { view: 1, ..done },
+            FrameKey { opts: 1, ..done },
+            FrameKey { revision: 4, ..done },
+        ] {
+            f.clear();
+            insert(&f, mismatch);
+            assert!(f.get_for_viewer(&wanted, Some(&shown)).is_none(), "wrong candidate: {mismatch:?}");
+        }
+        f.clear();
+        insert(&f, done);
+        assert!(f.get_for_viewer(&wanted, None).is_none(), "no stale content on opening a viewer");
+        assert!(f.get_for_viewer(&wanted, Some(&FrameKey { comp: 9, ..shown })).is_none());
+        assert!(f.get_for_viewer(&wanted, Some(&FrameKey { frame: 1, ..shown })).is_none());
+        assert!(f.get_for_viewer(&wanted, Some(&FrameKey { view: 1, ..shown })).is_none());
     }
 
     #[test]
