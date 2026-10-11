@@ -362,9 +362,22 @@ pub(crate) async fn movie(job: &Cx<'_>, comp: &Comp, w: u32, h: u32, st: &mut St
         }
         Ok(ps)
     }
+    // With worker threads the frames stream instead: one starts as another finishes, and this
+    // thread encodes them in order as they arrive (audio written per batch as below).
+    let streamed = job.streams();
+    if streamed {
+        job.stream(comp, first_end, total, batch, render, |k, px| {
+            st.advance(1)?;
+            write_video(&mut mux, venc.encode(&px, k)?)?;
+            if (k + 1 - first_end).is_multiple_of(batch) || k + 1 == total {
+                write_audio_until(&mut mux, frame_end_time(k + 1), &mut cursor)?;
+            }
+            Ok(())
+        })?;
+    }
     // Rendered frames `[a, b)` not encoded yet.
     let mut waiting: Option<(Vec<Vec<u8>>, u64, u64)> = None;
-    let mut i = first_end;
+    let mut i = if streamed { total } else { first_end };
     loop {
         let end = (i + batch).min(total);
         let ks: Vec<u64> = (i..end).collect();

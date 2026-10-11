@@ -151,6 +151,99 @@ impl<'a> Cx<'a> {
         out
     }
 
+    /// Whether [`Cx::stream`] can run here: worker threads to render on while this one takes
+    /// the frames (not the browser, not a caller that is itself a pool worker, not deferred
+    /// readbacks, which arrive on this thread).
+    pub fn streams(&self) -> bool {
+        cfg!(not(target_arch = "wasm32")) && !self.deferred() && rayon::current_thread_index().is_none()
+    }
+
+    /// Output frames `from..total`, each mapped by `f` and handed to `sink` in order, with
+    /// `window` frames rendering at any time: a frame starts when another finishes, so the
+    /// renderer (and the GPU behind it) is not left waiting for the slowest frame of a batch
+    /// or for `sink` (the encoder). At most `2 × window` frames are rendered ahead of `sink`.
+    /// Stops at `sink`'s first error. Call only where [`Cx::streams`].
+    pub fn stream<T: Send>(
+        &self,
+        comp: &Comp,
+        from: u64,
+        total: u64,
+        window: u64,
+        f: impl Fn(u64, Image) -> T + Sync,
+        mut sink: impl FnMut(u64, T) -> crate::Result<()>,
+    ) -> crate::Result<()> {
+        struct Queue<T> {
+            next: u64,
+            taken: u64,
+            done: std::collections::BTreeMap<u64, T>,
+            stop: bool,
+        }
+        /// Stops the queue when a worker leaves without having said so (it panicked): the
+        /// taker must not wait for its frame.
+        struct Leave<'q, T>(&'q (Mutex<Queue<T>>, std::sync::Condvar));
+        impl<T> Drop for Leave<'_, T> {
+            fn drop(&mut self) {
+                if std::thread::panicking() {
+                    self.0.0.lock().unwrap_or_else(|e| e.into_inner()).stop = true;
+                    self.0.1.notify_all();
+                }
+            }
+        }
+        let window = window.max(1);
+        let ahead = window * 2;
+        let q = (Mutex::new(Queue { next: from, taken: from, done: std::collections::BTreeMap::new(), stop: false }), std::sync::Condvar::new());
+        let (q, f) = (&q, &f);
+        rayon::in_place_scope(|s| {
+            for _ in 0..window.min(total.saturating_sub(from)) {
+                s.spawn(move |_| {
+                    let _leave = Leave(q);
+                    loop {
+                        let k = {
+                            let mut g = q.0.lock().unwrap_or_else(|e| e.into_inner());
+                            while !g.stop && g.next < total && g.next >= g.taken + ahead {
+                                g = q.1.wait(g).unwrap_or_else(|e| e.into_inner());
+                            }
+                            if g.stop || g.next >= total {
+                                return;
+                            }
+                            g.next += 1;
+                            g.next - 1
+                        };
+                        let t = f(k, self.frame(comp, k));
+                        q.0.lock().unwrap_or_else(|e| e.into_inner()).done.insert(k, t);
+                        q.1.notify_all();
+                    }
+                });
+            }
+            let mut result = Ok(());
+            for k in from..total {
+                let t = {
+                    let mut g = q.0.lock().unwrap_or_else(|e| e.into_inner());
+                    loop {
+                        if let Some(t) = g.done.remove(&k) {
+                            g.taken = k + 1;
+                            break Some(t);
+                        }
+                        if g.stop {
+                            break None;
+                        }
+                        g = q.1.wait(g).unwrap_or_else(|e| e.into_inner());
+                    }
+                };
+                q.1.notify_all();
+                // (A worker that panicked: the scope raises it again once the others are done.)
+                let Some(t) = t else { break };
+                result = sink(k, t);
+                if result.is_err() {
+                    break;
+                }
+            }
+            q.0.lock().unwrap_or_else(|e| e.into_inner()).stop = true;
+            q.1.notify_all();
+            result
+        })
+    }
+
     /// Frames rendered at the same time ([`crate::batch_size`]).
     pub fn batch(&self) -> u64 {
         let (w, h) = self.comp().map_or((1, 1), |c| (c.width, c.height));

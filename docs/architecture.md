@@ -187,8 +187,13 @@ traffic down:
 - A comp several layers show at the same time renders once per frame (`prewarm_precomps`), and a
   still precomp may take half the layer cache so it is not rendered again for every frame.
 - Exports render their first frame alone (it fills the cache with what every frame shares), then
-  at most 4 frames at a time within a quarter of the available memory, and encode a batch while
-  the next one renders (`export::batch_size`, `export::encode::movie`).
+  at most 4 frames at a time within a quarter of the available memory (`export::batch_size`).
+  Movies stream them: a frame starts when another finishes and the encoder takes them in order
+  as they arrive (`export::pipeline::Cx::stream`), so neither the renderer nor the GPU waits
+  for the slowest frame of a batch. Measured on the project above: 94 s became 80 s, GPU busy
+  80% became 92%, and peak memory 8.6 GB became 5.4 GB. More frames in flight do not help: 3,
+  4 and 5 render at the same rate (the GPU is the limit), and 6 overran 16 GB of video memory
+  and took 220 s.
 
 The viewer's **RAM preview** (`ui-egui/src/frames.rs`) keeps finished frames keyed by project
 revision, comp, frame, scale, 3D view / region of interest and a hash of the other render
