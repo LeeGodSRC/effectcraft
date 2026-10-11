@@ -317,11 +317,28 @@ fn draw_precomp(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas:
     if e.g.deferred.is_some() || r.pipe().to_blend().is_some() || styles::active(ctx, layer) {
         return None;
     }
-    let (sub, item, t, key) = r.plain_precomp(ctx, layer)?;
+    if layer.switches.effects && layer.effects().is_some_and(|fx| fx.groups().any(|g| g.enabled)) {
+        return None;
+    }
+    let (sub, item, t, key) = r.masked_precomp(ctx, layer)?;
     let img = nested_frame(e, &sub, item, t, key)?;
+    let img = masked(e, r, ctx, layer, img, sub.opts.scale)?;
     // The frame as a layer buffer: its size and scale are all the placement reads.
     let head = Arc::new(Buf { img: Image { width: img.width, height: img.height, data: Vec::new() }, offset: [0.0; 2], scale: sub.opts.scale });
     Some(composite_layer(e, r, ctx, layer, &head, Some(img), canvas, opacity))
+}
+
+/// A precomp layer's nested frame through the layer's masks (`Renderer::precomp_coverage`,
+/// uploaded once while nothing animates them), on the 8/16 bpc grid again as on the CPU.
+/// `None`: the coverage could not be uploaded (the caller takes the CPU renderer's pixels).
+fn masked(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, img: GpuImage, scale: f64) -> Option<GpuImage> {
+    let Some(cov) = r.precomp_coverage(ctx, layer, img.width, img.height, scale) else { return Some(img) };
+    let cov = e.g.upload_buf(&cov)?;
+    let out = ops::matte(e, &img, &cov, effectcraft_project::MatteKind::Alpha);
+    Some(match r.pipe().levels {
+        Some(l) => ops::quantize(e, &out, l),
+        None => out,
+    })
 }
 
 /// A nested comp's frame composited here, once per top-level frame (`key`:
@@ -351,9 +368,10 @@ fn resident_layer(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer) -> Op
     // renderer (uploaded once while the layer cache keeps it).
     let (src, offset, scale) = if let Some((px, w, h)) = r.plain_solid(ctx, layer).filter(|(_, w, h)| e.g.fits(*w, *h)) {
         (e.solid(w, h, px), [origin[0] * r.opts.scale, origin[1] * r.opts.scale], r.opts.scale)
-    } else if let Some((sub, item, t, key)) = r.precomp_input(ctx, layer) {
+    } else if let Some((sub, item, t, key)) = r.masked_precomp(ctx, layer) {
         // A precomp layer with effects: its nested comp is composited here too.
         let img = nested_frame(e, &sub, item, t, key)?;
+        let img = masked(e, r, ctx, layer, img, sub.opts.scale)?;
         (img, [origin[0] * sub.opts.scale, origin[1] * sub.opts.scale], sub.opts.scale)
     } else {
         let input = r.layer_input(ctx, layer, 0)?;

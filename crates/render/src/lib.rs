@@ -1344,10 +1344,58 @@ impl<'a> Renderer<'a> {
     /// is then the input of its effect stack ([`Self::resident_effects`]), not the layer's
     /// pixels.
     pub fn precomp_input(&self, ctx: &EvalCtx, layer: &Layer) -> Option<(Renderer<'a>, ItemId, Tick, u64)> {
-        let LayerSource::Comp { item } = &layer.source else { return None };
         if layer.masks().is_some_and(|m| !m.children.is_empty()) {
             return None;
         }
+        self.precomp_frame(ctx, layer)
+    }
+
+    /// [`Self::precomp_input`] for a precomp layer that may have masks as well: the compositor
+    /// multiplies the nested frame by [`Self::precomp_coverage`]. `None` also when the masks
+    /// are motion blurred (the CPU renderer averages the sub-samples).
+    pub fn masked_precomp(&self, ctx: &EvalCtx, layer: &Layer) -> Option<(Renderer<'a>, ItemId, Tick, u64)> {
+        if self.content_times(ctx, layer).is_some() {
+            return None;
+        }
+        self.precomp_frame(ctx, layer)
+    }
+
+    /// What a precomp layer's masks leave of its nested frame (`width` × `height` at `scale`):
+    /// white through the masks, for a compositor that holds the frame itself
+    /// ([`Self::masked_precomp`]) to multiply it by. `None` when no mask applies. Cached like an
+    /// adjustment layer's footprint, so masks nothing animates are drawn and uploaded once.
+    pub fn precomp_coverage(&self, ctx: &EvalCtx, layer: &Layer, width: u32, height: u32, scale: f64) -> Option<Arc<Buf>> {
+        if !layer.masks().is_some_and(|m| !m.children.is_empty()) {
+            return None;
+        }
+        let key = self
+            .cache
+            .and_then(|_| cache::footprint_key(ctx, layer, scale, self.opts.draft, self.mb_on(ctx, layer)))
+            .map(|k| cache::derive(cache::derive(k, 0x6d61_736b), (width as u64) << 32 | height as u64));
+        if let (Some(c), Some(k)) = (self.cache, key)
+            && let Some(b) = c.get(k)
+        {
+            return (!b.img.is_empty()).then_some(b);
+        }
+        let mut cov = Buf { img: Image::filled(width, height, [1.0; 4]), offset: [0.0; 2], scale };
+        // (No mask applies: remembered as an empty buffer.)
+        if !masks::apply(ctx, layer, &mut cov, self.mask_blur(ctx, layer)) {
+            cov.img = Image::new(0, 0);
+        }
+        let cov = Arc::new(cov);
+        if let (Some(c), Some(k)) = (self.cache, key) {
+            if !self.within_still && !layer.masks().is_some_and(cache::animated) {
+                c.insert_stable(k, cov.clone());
+            } else {
+                c.insert(k, cov.clone());
+            }
+        }
+        (!cov.img.is_empty()).then_some(cov)
+    }
+
+    /// The nested frame a precomp layer shows ([`Self::precomp_input`], whatever its masks).
+    fn precomp_frame(&self, ctx: &EvalCtx, layer: &Layer) -> Option<(Renderer<'a>, ItemId, Tick, u64)> {
+        let LayerSource::Comp { item } = &layer.source else { return None };
         if self.project.comp_contains(*item, ctx.comp_id) || self.proxy_for(*item).is_some() || !essential_overrides(ctx, layer).is_empty() {
             return None;
         }
@@ -2507,7 +2555,7 @@ impl<'a> Renderer<'a> {
             _ => false,
         };
         // (A nested comp that moves changes the input every frame, whatever the effects do.)
-        if !stack.all(runs_there) || !(cache::animated(fx) || cache::time_dependent(layer) || self.precomp_input(ctx, layer).is_some()) {
+        if !stack.all(runs_there) || !(cache::animated(fx) || cache::time_dependent(layer) || self.masked_precomp(ctx, layer).is_some()) {
             return None;
         }
         Some(ctx.effect_bounds(layer).1)
@@ -2560,7 +2608,13 @@ impl<'a> Renderer<'a> {
         let _ = masks::apply(ctx, layer, &mut foot, self.mask_blur(ctx, layer));
         let foot = Arc::new(foot);
         if let (Some(c), Some(k)) = (self.cache, key) {
-            c.insert(k, foot.clone());
+            // A footprint nothing animates serves every frame: kept like a still layer's buffer
+            // (else the buffers of one frame push it out and it is built and uploaded again).
+            if !self.within_still && !layer.masks().is_some_and(cache::animated) && self.content_times(ctx, layer).is_none() {
+                c.insert_stable(k, foot.clone());
+            } else {
+                c.insert(k, foot.clone());
+            }
         }
         Some(foot)
     }

@@ -424,6 +424,37 @@ fn layer_styles_collapsed_precomps_and_cpu_fallbacks() {
     }
 }
 
+/// A precomp layer with masks keeps its nested frame on the device: the frame is multiplied by
+/// the masks' coverage there (with and without an effect stack after the masks).
+#[test]
+fn masked_precomp_layers_match_the_cpu() {
+    for depth in [BitDepth::Bpc8, BitDepth::Bpc32] {
+        for blur in [false, true] {
+            let mut s = Scene::new(depth);
+            let inner = Comp::new(60, 40, FrameRate::FPS_30, Tick::from_seconds_f64(2.0));
+            let inner_id = s.p.add_item("Inner", Label::Sandstone, None, ItemKind::Comp(inner.clone().into()));
+            let a = s.footage(60, 40);
+            let mut b = s.solid([0.2, 0.7, 0.4], 30, 20);
+            b.blend_mode = BlendMode::Difference;
+            s.p.comp_mut(inner_id).unwrap().layers = vec![b, a];
+            let bg = s.footage(97, 61);
+            s.push(bg);
+            let mut pre = build::layer(&mut s.p, &s.comp, "Inner", LayerSource::Comp { item: inner_id }, (60, 40), None);
+            let mut next = s.p.next_id;
+            let m = build::mask(&mut Ids(&mut next), "Mask 1", ShapePath::ellipse([30.0, 20.0], 44.0, 30.0), MaskMode::Add, [255, 255, 0]);
+            s.p.next_id = next;
+            pre.props.sub_mut("masks").unwrap().children.push(m.into());
+            set(&mut pre, "transform/rotation", Value::Scalar(15.0));
+            set(&mut pre, "transform/opacity", Value::Scalar(80.0));
+            if blur {
+                s.effect(&mut pre, "ec.blur.gaussian", &[("blurriness", Value::Scalar(3.0))]);
+            }
+            s.push(pre);
+            check(&format!("masked precomp {depth:?} blur {blur}"), compare_at(&s, opts(), Tick::ZERO), 0.0);
+        }
+    }
+}
+
 /// The effect alone on a buffer: GPU kernels vs the CPU effect (32-bit float), including the
 /// buffer geometry (padding, offset).
 pub(crate) fn effect_direct(id: &str, vals: &[(&str, Value)], adjustment: bool) {

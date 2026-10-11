@@ -167,7 +167,13 @@ impl LayerCache {
                 // Disk cache: a hit comes back into memory.
                 let (dc, dk) = self.disk_key(key)?;
                 let buf = dc.get_layer(dk)?;
-                self.insert_mem(key, buf.clone(), false);
+                // A buffer too large for a one-frame entry is kept like one every frame uses,
+                // whatever share of the budget it takes: dropped, each frame (and each layer
+                // showing it) would read and unpack it from disk again, which is all a preview
+                // of such a comp then did (minutes a frame, once the budget had been reduced).
+                let bytes = buf.img.data.len() * std::mem::size_of::<effectcraft_raster::Px>();
+                let large = self.inner.lock().is_ok_and(|g| bytes > g.budget / 4);
+                self.insert_sized(key, buf.clone(), large, if large { 1 } else { 4 });
                 Some(buf)
             }
         }
@@ -203,12 +209,17 @@ impl LayerCache {
     }
 
     fn insert_mem(&self, key: u64, buf: Arc<Buf>, stable: bool) {
-        let bytes = buf.img.data.len() * std::mem::size_of::<effectcraft_raster::Px>();
-        let Ok(mut g) = self.inner.lock() else { return };
         // One buffer may not crowd out the rest. A buffer every frame uses (an oversized precomp
         // nothing moves in) is worth more of the budget than one a single frame does: dropped,
         // it would be rendered again for every frame.
-        if bytes > g.budget / if stable { 2 } else { 4 } {
+        self.insert_sized(key, buf, stable, if stable { 2 } else { 4 });
+    }
+
+    /// [`Self::insert_mem`] of a buffer that may take up to the budget over `share`.
+    fn insert_sized(&self, key: u64, buf: Arc<Buf>, stable: bool, share: usize) {
+        let bytes = buf.img.data.len() * std::mem::size_of::<effectcraft_raster::Px>();
+        let Ok(mut g) = self.inner.lock() else { return };
+        if bytes > g.budget / share.max(1) {
             return;
         }
         g.clock += 1;
@@ -552,8 +563,10 @@ fn has_expression(g: &PropGroup) -> bool {
 
 /// Cache key for an adjustment layer's footprint (its source through its masks, see
 /// `Renderer::adjustment_footprint`): the GPU compositor then uploads it once, not every frame.
+/// The layer's effects are not part of it (they run on the comp below), so animating them
+/// keeps the footprint.
 pub fn footprint_key(ctx: &EvalCtx, layer: &Layer, scale: f64, draft: bool, blur: bool) -> Option<u64> {
-    Some(derive(key_any(ctx, layer, scale, draft, blur, false, None)?, 0xf007_9417))
+    Some(derive(key_any(ctx, layer, scale, draft, blur, false, Some(0))?, 0xf007_9417))
 }
 
 fn key_with(ctx: &EvalCtx, layer: &Layer, scale: f64, draft: bool, blur: bool, footage: bool) -> Option<u64> {
@@ -871,4 +884,41 @@ pub fn derive(key: u64, i: u64) -> u64 {
     let mut h = KeyHasher(key);
     i.hash(&mut h);
     h.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A store that has every key and counts the reads.
+    struct Counting(AtomicUsize, u32);
+
+    impl LayerStore for Counting {
+        fn get_layer(&self, _key: u128) -> Option<Arc<Buf>> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Some(Arc::new(Buf { img: effectcraft_raster::Image::new(self.1, self.1), offset: [0.0; 2], scale: 1.0 }))
+        }
+        fn put_layer(&self, _key: u128, _buf: &Buf) {}
+    }
+
+    /// A buffer read from the disk store that is too large for a one-frame entry stays in
+    /// memory (as the buffers every frame uses do): it was dropped, so every frame read and
+    /// unpacked it again and a preview spent its time there.
+    #[test]
+    fn a_large_buffer_from_the_store_is_read_once() {
+        // 40 × 40 × 16 bytes: over half of the budget.
+        let cache = LayerCache::new(40_000);
+        let store = Arc::new(Counting(AtomicUsize::new(0), 40));
+        cache.set_store(Some((store.clone(), 7)));
+        assert!(cache.get(1).is_some());
+        assert!(cache.get(1).is_some());
+        assert_eq!(store.0.load(Ordering::Relaxed), 1);
+        // (One over the whole budget cannot be kept.)
+        let big = Arc::new(Counting(AtomicUsize::new(0), 64));
+        cache.set_store(Some((big.clone(), 7)));
+        assert!(cache.get(2).is_some());
+        assert!(cache.get(2).is_some());
+        assert_eq!(big.0.load(Ordering::Relaxed), 2);
+    }
 }
